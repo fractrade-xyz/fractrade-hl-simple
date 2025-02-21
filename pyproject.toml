@@ -1,15 +1,15 @@
 [tool.poetry]
 name = "fractrade-hl-simple"
-version = "0.1.0"
+version = "0.1.2"
 description = "A simple API wrapper for automated trading on Hyperliquid DEX with Python"
 authors = ["crjameson <93468664+crjameson@users.noreply.github.com>"]
 license = "MIT"
 readme = "README.md"
 packages = [{include = "fractrade_hl_simple", from = "src"}]
+homepage = "https://fractrade.xyz"
 repository = "https://github.com/fractrade-xyz/fractrade-hl-simple"
-documentation = "https://github.com/yourusername/fractrade-hl-simple"
+documentation = "https://github.com/fractrade-xyz/fractrade-hl-simple"
 keywords = ["hyperliquid", "trading", "crypto", "api", "defi"]
-license = "MIT"
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Intended Audience :: Developers",

@@ -83,6 +83,71 @@ order = client.sell("BTC", size=0.001)  # Market sell 0.001 BTC
 print(f"Order placed: {order.order_id}")
 ```
 
+### Stop Loss and Take Profit
+
+For Long Positions:
+```python
+# When you have a long position (bought BTC)
+current_price = client.get_price("BTC")
+
+# Place stop loss 5% below entry (sell when price drops)
+stop_price = current_price * 0.95
+sl_order = client.stop_loss("BTC", size=0.001, stop_price=stop_price)  # is_buy=False by default for long positions
+
+# Place take profit 10% above entry (sell when price rises)
+take_profit_price = current_price * 1.10
+tp_order = client.take_profit("BTC", size=0.001, take_profit_price=take_profit_price)  # is_buy=False by default for long positions
+```
+
+For Short Positions:
+```python
+# When you have a short position (sold BTC)
+current_price = client.get_price("BTC")
+
+# Place stop loss 5% above entry (buy when price rises)
+stop_price = current_price * 1.05
+sl_order = client.stop_loss("BTC", size=0.001, stop_price=stop_price, is_buy=True)  # Must set is_buy=True for short positions
+
+# Place take profit 10% below entry (buy when price drops)
+take_profit_price = current_price * 0.90
+tp_order = client.take_profit("BTC", size=0.001, take_profit_price=take_profit_price, is_buy=True)  # Must set is_buy=True for short positions
+```
+
+The `is_buy` parameter determines whether the TP/SL order will buy or sell when triggered:
+- For long positions: use `is_buy=False` (default) to sell when triggered
+- For short positions: use `is_buy=True` to buy when triggered
+
+### Open Position with TP/SL
+
+Alternatively, you can use the convenience methods that handle both entry and TP/SL orders:
+
+Long Position:
+```python
+current_price = client.get_price("BTC")
+position = client.open_long_position(
+    symbol="BTC",
+    size=0.001,
+    stop_loss_price=current_price * 0.95,  # 5% below entry
+    take_profit_price=current_price * 1.10  # 10% above entry
+)
+print(f"Entry order: {position['entry'].order_id}")
+print(f"Stop loss: {position['stop_loss'].order_id}")
+print(f"Take profit: {position['take_profit'].order_id}")
+```
+
+Short Position:
+```python
+current_price = client.get_price("BTC")
+position = client.open_short_position(
+    symbol="BTC",
+    size=0.001,
+    stop_loss_price=current_price * 1.05,  # 5% above entry
+    take_profit_price=current_price * 0.90  # 10% below entry
+)
+```
+
+These methods automatically set the correct `is_buy` parameter for TP/SL orders based on the position direction.
+
 ### Close Position
 ```python
 close_order = client.close("BTC")

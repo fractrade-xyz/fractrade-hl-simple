@@ -357,24 +357,24 @@ class HyperliquidClient:
         symbol: str,
         size: float,
         stop_price: float,
-        is_buy: bool,
+        is_buy: bool = False  # Default to sell (for long positions)
     ) -> Order:
         """Place a stop loss order.
         
         Args:
             symbol (str): Trading pair symbol (e.g., "BTC")
             size (float): Order size in base currency
-            stop_price (float): Price at which the stop loss will trigger
-            is_buy (bool): True for long stop loss (buying), False for short stop loss (selling)
-        
-        Returns:
-            Order: Order response from the exchange
-            
-        Raises:
-            ValueError: If the order placement fails or returns an error
+            stop_price (float): Stop loss price level
+            is_buy (bool): True for shorts' SL, False for longs' SL (default)
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+        # Get current position to determine direction
+        positions = self.get_positions()
+        position = next((p for p in positions if p.symbol == symbol), None)
+        if not position:
+            raise ValueError(f"No position found for {symbol}")
+        
+        # Validate and format size and price using the same logic as limit orders
+        size, stop_price = self._validate_and_format_order(symbol, size, stop_price)
 
         order_type = {
             "trigger": {
@@ -387,46 +387,61 @@ class HyperliquidClient:
         response = self.exchange.order(
             name=symbol,
             is_buy=is_buy,
-            sz=float(size),
-            limit_px=float(stop_price),
+            sz=size,
+            limit_px=stop_price,
             reduce_only=True,
             order_type=order_type
         )
         
-        # Error handling
+        # Error handling and response formatting
         if isinstance(response, dict):
             if response.get("status") != "ok":
                 raise ValueError(f"Failed to place stop loss order: {response}")
             
-            status = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-            if "error" in status:
-                raise ValueError(f"Stop loss order error: {status['error']}")
+            statuses = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+            if "error" in statuses:
+                raise ValueError(f"Stop loss order error: {statuses['error']}")
+            
+            # Format response data
+            if "resting" in statuses:
+                order_data = {
+                    "order_id": str(statuses["resting"]["oid"]),
+                    "symbol": symbol,
+                    "is_buy": is_buy,
+                    "size": str(size),
+                    "order_type": order_type,
+                    "reduce_only": True,
+                    "status": "open",
+                    "time_in_force": "Gtc",
+                    "created_at": int(time.time() * 1000),
+                    "limit_price": str(stop_price)
+                }
+                return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
         
-        return from_dict(data_class=Order, data=response, config=DACITE_CONFIG)
+        raise ValueError("Unexpected response format")
 
     def take_profit(
         self,
         symbol: str,
         size: float,
         take_profit_price: float,
-        is_buy: bool,
+        is_buy: bool = False  # Default to sell (for long positions)
     ) -> Order:
         """Place a take profit order.
         
         Args:
             symbol (str): Trading pair symbol (e.g., "BTC")
             size (float): Order size in base currency
-            take_profit_price (float): Price at which the take profit will trigger
-            is_buy (bool): True for long take profit (buying), False for short take profit (selling)
-        
-        Returns:
-            Order: Order response from the exchange
-            
-        Raises:
-            ValueError: If the order placement fails or returns an error
+            take_profit_price (float): Take profit price level
+            is_buy (bool): True for shorts' TP, False for longs' TP (default)
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+        positions = self.get_positions()
+        position = next((p for p in positions if p.symbol == symbol), None)
+        if not position:
+            raise ValueError(f"No position found for {symbol}")
+        
+        # Validate and format size and price using the same logic as limit orders
+        size, take_profit_price = self._validate_and_format_order(symbol, size, take_profit_price)
 
         order_type = {
             "trigger": {
@@ -439,22 +454,38 @@ class HyperliquidClient:
         response = self.exchange.order(
             name=symbol,
             is_buy=is_buy,
-            sz=float(size),
-            limit_px=float(take_profit_price),
+            sz=size,
+            limit_px=take_profit_price,
             reduce_only=True,
             order_type=order_type
         )
         
-        # Error handling
+        # Error handling and response formatting
         if isinstance(response, dict):
             if response.get("status") != "ok":
                 raise ValueError(f"Failed to place take profit order: {response}")
             
-            status = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-            if "error" in status:
-                raise ValueError(f"Take profit order error: {status['error']}")
+            statuses = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+            if "error" in statuses:
+                raise ValueError(f"Take profit order error: {statuses['error']}")
+            
+            # Format response data
+            if "resting" in statuses:
+                order_data = {
+                    "order_id": str(statuses["resting"]["oid"]),
+                    "symbol": symbol,
+                    "is_buy": is_buy,
+                    "size": str(size),
+                    "order_type": order_type,
+                    "reduce_only": True,
+                    "status": "open",
+                    "time_in_force": "Gtc",
+                    "created_at": int(time.time() * 1000),
+                    "limit_price": str(take_profit_price)
+                }
+                return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
         
-        return from_dict(data_class=Order, data=response, config=DACITE_CONFIG)
+        raise ValueError("Unexpected response format")
 
     def open_long_position(
         self,
@@ -482,12 +513,12 @@ class HyperliquidClient:
         if stop_loss_price:
             if stop_loss_price >= (limit_price or current_price):
                 raise ValueError("Stop loss price must be below entry price for longs")
-            orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price, is_buy=False)
+            orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price)
         
         if take_profit_price:
             if take_profit_price <= (limit_price or current_price):
                 raise ValueError("Take profit price must be above entry price for longs")
-            orders["take_profit"] = self.take_profit(symbol, size, take_profit_price, is_buy=False)
+            orders["take_profit"] = self.take_profit(symbol, size, take_profit_price)
         
         return orders
 
@@ -517,12 +548,12 @@ class HyperliquidClient:
         if stop_loss_price:
             if stop_loss_price <= (limit_price or current_price):
                 raise ValueError("Stop loss price must be above entry price for shorts")
-            orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price, is_buy=True)
+            orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price)
         
         if take_profit_price:
             if take_profit_price >= (limit_price or current_price):
                 raise ValueError("Take profit price must be below entry price for shorts")
-            orders["take_profit"] = self.take_profit(symbol, size, take_profit_price, is_buy=True)
+            orders["take_profit"] = self.take_profit(symbol, size, take_profit_price)
         
         return orders
 

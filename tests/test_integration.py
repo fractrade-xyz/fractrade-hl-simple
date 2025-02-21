@@ -155,3 +155,60 @@ def test_buy_sell_market(client):
                 client.close(symbol)
         except Exception as e:
             print(f"Cleanup error: {e}")
+
+def test_position_with_tp_sl(client):
+    """Test opening a position with take profit and stop loss orders."""
+    symbol = "BTC"
+    size = 0.001  # Minimum size for BTC
+    
+    try:
+        # Get current price
+        price = client.get_price(symbol)
+        print(f"Current {symbol} price: ${price:,.2f}")
+        
+        # Open market long position
+        entry_order = client.buy(symbol, size)
+        assert entry_order.symbol == symbol
+        assert float(entry_order.size) == size
+        assert entry_order.is_buy is True
+        
+        time.sleep(2)  # Wait for position to be reflected
+        
+        # Verify position was created
+        positions = client.get_positions()
+        position = next((p for p in positions if p.symbol == symbol), None)
+        assert position is not None
+        assert float(position.size) == size
+        
+        # Set take profit (10% above entry)
+        tp_price = float(position.entry_price) * 1.10
+        tp_order = client.take_profit(symbol, size, tp_price, is_buy=False)
+        assert tp_order.symbol == symbol
+        assert float(tp_order.size) == size
+        assert tp_order.is_buy is False
+        
+        # Set stop loss (5% below entry)
+        sl_price = float(position.entry_price) * 0.95
+        sl_order = client.stop_loss(symbol, size, sl_price, is_buy=False)
+        assert sl_order.symbol == symbol
+        assert float(sl_order.size) == size
+        assert sl_order.is_buy is False
+        
+        time.sleep(2)
+        
+        # Cleanup
+        client.cancel_all_orders(symbol)
+        client.close(symbol)
+        
+        # Verify position was closed
+        positions = client.get_positions()
+        position = next((p for p in positions if p.symbol == symbol), None)
+        assert position is None or float(position.size) == 0
+        
+    finally:
+        # Ensure cleanup in case of test failure
+        try:
+            client.cancel_all_orders(symbol)
+            client.close(symbol)
+        except Exception as e:
+            print(f"Cleanup error: {e}")
