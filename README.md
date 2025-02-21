@@ -34,6 +34,60 @@ from fractrade_hl_simple import HyperliquidClient
 client = HyperliquidClient()
 ```
 
+## Authentication Modes
+
+The client can operate in three modes:
+
+### 1. Authenticated with Environment Variables (Default)
+```python
+from fractrade_hl_simple import HyperliquidClient
+
+# Automatically loads credentials from .env
+client = HyperliquidClient()
+```
+
+### 2. Authenticated with Explicit Account
+```python
+from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
+
+account = HyperliquidAccount(
+    private_key="your_private_key",
+    env="mainnet",
+    public_address="your_public_address"
+)
+client = HyperliquidClient(account=account)
+```
+
+### 3. Unauthenticated Mode
+If no credentials are available, the client falls back to unauthenticated mode:
+```python
+# No .env file, no account provided
+client = HyperliquidClient()  # Works for public endpoints only
+```
+
+### Public vs Private Endpoints
+
+Some methods can be used without authentication:
+```python
+# These work without authentication
+prices = client.get_price("BTC")
+balance = client.get_perp_balance("0x123...")  # Requires address
+state = client.get_user_state("0x123...")      # Requires address
+market_info = client.get_market_info()
+```
+
+Methods that require authentication:
+```python
+# These require authentication
+client.buy("BTC", 0.001)
+client.sell("BTC", 0.001)
+client.cancel_all()
+client.get_positions()
+balance = client.get_perp_balance()  # Without address requires auth
+```
+
+The client will automatically warn you when running in unauthenticated mode and help you understand which methods are available.
+
 ## Basic Usage
 
 ### Get Market Prices

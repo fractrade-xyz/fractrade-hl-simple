@@ -24,24 +24,41 @@ from decimal import Decimal
 
 class HyperliquidClient:
     def __init__(self, account: Optional[HyperliquidAccount] = None):
-        if account is None:
-            # Check if required environment variables exist
-            required_vars = ['HYPERLIQUID_ENV', 'HYPERLIQUID_PUBLIC_ADDRESS', 'HYPERLIQUID_PRIVATE_KEY']
-            missing_vars = [var for var in required_vars if os.getenv(var) is None]
-            
-            if missing_vars:
-                warning_msg = (
-                    f"Missing required environment variables: {', '.join(missing_vars)}\n"
-                    "Please create a .env file in your project root with the following variables:\n"
-                    "HYPERLIQUID_ENV=mainnet|testnet\n"
-                    "HYPERLIQUID_PUBLIC_ADDRESS=your_public_address\n"
-                    "HYPERLIQUID_PRIVATE_KEY=your_private_key"
-                )
-                raise ValueError(warning_msg)
-                
-            account = HyperliquidAccount.from_env()
+        """Initialize HyperliquidClient.
         
-        # Validate account regardless of how it was created
+        If account is provided, uses those credentials.
+        If not, tries to load from environment variables.
+        Falls back to unauthenticated mode if no credentials are available.
+        """
+        # Default to mainnet for unauthenticated client
+        self.env = "mainnet"
+        self.base_url = constants.MAINNET_API_URL
+        self.info = Info(self.base_url, skip_ws=True)
+        
+        # Initialize market specs
+        try:
+            self.market_specs = self._fetch_market_specs()
+        except Exception as e:
+            logging.warning(f"Failed to fetch market specs: {e}. Using default specs.")
+            self.market_specs = MARKET_SPECS
+
+        # Try to set up authenticated client
+        try:
+            if account is not None:
+                self._setup_authenticated_client(account)
+            else:
+                # Try loading from environment
+                env_account = HyperliquidAccount.from_env()
+                self._setup_authenticated_client(env_account)
+        except (ValueError, KeyError, TypeError) as e:
+            # If authentication fails, log warning and continue in unauthenticated mode
+            logging.warning(
+                f"Running in unauthenticated mode. Only public endpoints available. Error: {str(e)}"
+            )
+
+    def _setup_authenticated_client(self, account: HyperliquidAccount):
+        """Set up authenticated client with account details."""
+        # Validate account
         if not isinstance(account, HyperliquidAccount):
             raise TypeError("account must be an instance of HyperliquidAccount")
         
@@ -54,21 +71,19 @@ class HyperliquidClient:
         if not account.private_key:
             raise ValueError("private_key is required")
 
+        # Set up authenticated client
         self.account = account
         self.exchange_account = eth_account.Account.from_key(account.private_key)
-
-        self.public_address = os.getenv("HYPERLIQUID_PUBLIC_ADDRESS")
+        self.public_address = account.public_address
         
-        self.base_url = constants.TESTNET_API_URL if account.env == "testnet" else constants.MAINNET_API_URL
-        self.info = Info(self.base_url, skip_ws=True)
+        # Update URL if needed
+        if account.env == "testnet":
+            self.env = "testnet"
+            self.base_url = constants.TESTNET_API_URL
+            self.info = Info(self.base_url, skip_ws=True)
+        
+        # Initialize exchange
         self.exchange = Exchange(self.exchange_account, self.base_url)
-        
-        # Initialize market specs from API, fallback to defaults if failed
-        try:
-            self.market_specs = self._fetch_market_specs()
-        except Exception as e:
-            logging.warning(f"Failed to fetch market specs: {e}. Using default specs.")
-            self.market_specs = MARKET_SPECS
 
     def is_authenticated(self) -> bool:
         """Check if the client is authenticated with valid credentials.
@@ -85,10 +100,11 @@ class HyperliquidClient:
 
     def get_user_state(self, address: Optional[str] = None) -> UserState:
         """Get the state of any user by their address."""
+        if address is None and not self.is_authenticated():
+            raise ValueError("Address required when client is not authenticated")
+            
         if address is None:
             address = self.public_address
-            if not address:
-                raise ValueError("No address provided and no public_address set")
             
         # Add address validation
         if not address.startswith("0x") or len(address) != 42:
@@ -634,19 +650,7 @@ class HyperliquidClient:
             logging.warning(f"Failed to get open orders: {str(e)}")
 
     def get_price(self, symbol: Optional[str] = None) -> Union[float, Dict[str, float]]:
-        """Get current mid price(s) from the exchange.
-        
-        Args:
-            symbol (Optional[str]): Trading pair symbol (e.g., "BTC"). 
-                                  If None, returns prices for all symbols.
-        
-        Returns:
-            Union[float, Dict[str, float]]: If symbol is provided, returns price as float.
-                                           If symbol is None, returns dict of all prices.
-        
-        Raises:
-            ValueError: If the specified symbol is not found
-        """
+        """Get current price(s). No authentication required."""
         response = self.info.all_mids()
         
         # Convert all prices to float
@@ -660,10 +664,12 @@ class HyperliquidClient:
         return prices
 
     def get_perp_balance(self, address: Optional[str] = None) -> Decimal:
+        """Get perpetual balance for an address."""
+        if address is None and not self.is_authenticated():
+            raise ValueError("Address required when client is not authenticated")
+            
         if address is None:
             address = self.public_address
-            if not address:
-                raise ValueError("No address provided and no public_address set")
             
         state = self.get_user_state(address)
         return state.margin_summary.account_value

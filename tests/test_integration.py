@@ -1,12 +1,14 @@
 import pytest
 from decimal import Decimal
-from fractrade_hl_simple import HyperliquidClient
+from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
 import time
 
 
 @pytest.fixture
 def client():
-    return HyperliquidClient()
+    # Create authenticated client from .env for integration tests
+    account = HyperliquidAccount.from_env()
+    return HyperliquidClient(account=account)
 
 @pytest.fixture
 def test_params():
