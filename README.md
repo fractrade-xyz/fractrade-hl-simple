@@ -4,17 +4,27 @@ A simple Python wrapper for the Hyperliquid DEX API, focusing on perpetual futur
 
 ⚠️ **Warning**: This is an early version of the library. Use with caution and test thoroughly before trading with real funds. Not all features are available yet. 
 
-## Installation
+## Installation & Updates
 
 Using pip:
 ```bash
+# Install
 pip install fractrade-hl-simple
+
+# Update to latest version
+pip install --upgrade fractrade-hl-simple
 ```
 
 Using poetry:
 ```bash
+# Install
 poetry add fractrade-hl-simple
+
+# Update to latest version
+poetry update fractrade-hl-simple
 ```
+
+⚠️ **Note**: This library is under active development. We recommend updating regularly to get the latest features and fixes.
 
 ## Setup
 
