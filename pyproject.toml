@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fractrade-hl-simple"
-version = "0.1.3"
+version = "0.1.4"
 description = "A simple API wrapper for automated trading on Hyperliquid DEX with Python"
 authors = ["crjameson <93468664+crjameson@users.noreply.github.com>"]
 license = "MIT"
@@ -29,7 +29,7 @@ eip712-structs-ng = "^2.0.1"
 python-dotenv = "^1.0.1"
 eth-account = ">=0.10.0,<0.14.0"
 eth-utils = ">=2.1.0,<6.0.0"
-hyperliquid-python-sdk = "^0.9.0"
+hyperliquid-python-sdk = ">=0.10.0"
 dacite = "^1.9.1"
 rich = "^13.9.4"
 
