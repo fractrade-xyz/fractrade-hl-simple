@@ -5,6 +5,7 @@ import os
 from dotenv import load_dotenv
 from decimal import Decimal
 from dacite import Config as DaciteConfig
+import eth_account
 
 # Load environment variables from .env file
 load_dotenv()
@@ -12,8 +13,37 @@ load_dotenv()
 @dataclass(slots=True, kw_only=True)
 class HyperliquidAccount:
     private_key: str
-    env: str = "testnet"
     public_address: Optional[str] = None
+    
+    @classmethod
+    def from_key(cls, private_key: str, public_address: Optional[str] = None) -> "HyperliquidAccount":
+        """Create a HyperliquidAccount from a private key.
+        
+        Args:
+            private_key (str): The private key to use
+            
+        Returns:
+            HyperliquidAccount: The account instance
+            
+        Raises:
+            ValueError: If the private key is invalid
+        """
+        if not private_key:
+            raise ValueError("private_key is required")
+            
+        # Get public address from private key
+        # if public address is provided, use it, public and private key dont need to match when its an api wallet
+        if public_address is None:
+            try:
+                account = eth_account.Account.from_key(private_key)
+                public_address = account.address
+            except Exception as e:
+                raise ValueError(f"Invalid private key: {str(e)}")
+            
+        return cls(
+            private_key=private_key,
+            public_address=public_address
+        )
     
     @classmethod
     def from_env(cls) -> "HyperliquidAccount":
@@ -21,17 +51,12 @@ class HyperliquidAccount:
         if not private_key:
             raise ValueError("HYPERLIQUID_PRIVATE_KEY environment variable is required")
             
-        env = os.getenv("HYPERLIQUID_ENV", "testnet")
-        if env not in ["mainnet", "testnet"]:
-            raise ValueError("HYPERLIQUID_ENV must be either 'mainnet' or 'testnet'")
-            
         public_address = os.getenv("HYPERLIQUID_PUBLIC_ADDRESS")
         if not public_address:
             raise ValueError("HYPERLIQUID_PUBLIC_ADDRESS environment variable is required")
             
         return cls(
-            private_key=private_key, 
-            env=env,
+            private_key=private_key,
             public_address=public_address
         )
     
@@ -39,7 +64,7 @@ class HyperliquidAccount:
         return {"private_key": self.private_key}
         
     def __str__(self) -> str:
-        return f"HyperliquidAccount(env={self.env}, public_address={self.public_address})"
+        return f"HyperliquidAccount(public_address={self.public_address})"
 
 @dataclass(slots=True, kw_only=True)
 class Leverage:
