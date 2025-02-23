@@ -23,16 +23,23 @@ from decimal import Decimal
 
 
 class HyperliquidClient:
-    def __init__(self, account: Optional[HyperliquidAccount] = None):
+    def __init__(self, account: Optional[HyperliquidAccount] = None, env: str = "mainnet"):
         """Initialize HyperliquidClient.
         
-        If account is provided, uses those credentials.
-        If not, tries to load from environment variables.
-        Falls back to unauthenticated mode if no credentials are available.
+        Args:
+            account (Optional[HyperliquidAccount]): Account credentials. If None, tries to load from environment.
+            env (str): The environment to use, either "mainnet" or "testnet". Defaults to "mainnet".
+            
+        Raises:
+            ValueError: If env is not 'mainnet' or 'testnet'
         """
-        # Default to mainnet for unauthenticated client
-        self.env = "mainnet"
-        self.base_url = constants.MAINNET_API_URL
+        # Validate environment
+        if env not in ["mainnet", "testnet"]:
+            raise ValueError("env must be either 'mainnet' or 'testnet'")
+            
+        # Set up environment
+        self.env = env
+        self.base_url = constants.TESTNET_API_URL if env == "testnet" else constants.MAINNET_API_URL
         self.info = Info(self.base_url, skip_ws=True)
         
         # Initialize market specs
@@ -62,9 +69,6 @@ class HyperliquidClient:
         if not isinstance(account, HyperliquidAccount):
             raise TypeError("account must be an instance of HyperliquidAccount")
         
-        if account.env not in ["mainnet", "testnet"]:
-            raise ValueError("env must be either 'mainnet' or 'testnet'")
-
         if not account.public_address:
             raise ValueError("public_address is required")
         
@@ -75,12 +79,6 @@ class HyperliquidClient:
         self.account = account
         self.exchange_account = eth_account.Account.from_key(account.private_key)
         self.public_address = account.public_address
-        
-        # Update URL if needed
-        if account.env == "testnet":
-            self.env = "testnet"
-            self.base_url = constants.TESTNET_API_URL
-            self.info = Info(self.base_url, skip_ws=True)
         
         # Initialize exchange
         self.exchange = Exchange(self.exchange_account, self.base_url)
