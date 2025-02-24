@@ -131,6 +131,7 @@ class Order:
     filled_size: Decimal = Decimal(0)
     average_fill_price: Optional[Decimal] = None
     limit_price: Optional[Decimal] = None
+    trigger_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
     
     @property

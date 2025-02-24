@@ -370,7 +370,7 @@ class HyperliquidClient:
         self,
         symbol: str,
         size: float,
-        stop_price: float,
+        trigger_price: float, # better to name this trigger_price to later have not only stop market orders but also stop limit orders
         is_buy: bool = False  # Default to sell (for long positions)
     ) -> Order:
         """Place a stop loss order.
@@ -388,11 +388,11 @@ class HyperliquidClient:
             raise ValueError(f"No position found for {symbol}")
         
         # Validate and format size and price using the same logic as limit orders
-        size, stop_price = self._validate_and_format_order(symbol, size, stop_price)
+        size, trigger_price = self._validate_and_format_order(symbol, size, trigger_price)
 
         order_type = {
             "trigger": {
-                "triggerPx": stop_price,
+                "triggerPx": trigger_price,
                 "isMarket": True,
                 "tpsl": "sl"
             }
@@ -402,7 +402,7 @@ class HyperliquidClient:
             name=symbol,
             is_buy=is_buy,
             sz=size,
-            limit_px=stop_price,
+            limit_px=trigger_price,
             reduce_only=True,
             order_type=order_type
         )
@@ -428,7 +428,7 @@ class HyperliquidClient:
                     "status": "open",
                     "time_in_force": "Gtc",
                     "created_at": int(time.time() * 1000),
-                    "limit_price": str(stop_price)
+                    "trigger_price": str(trigger_price)
                 }
                 return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
         
@@ -438,7 +438,7 @@ class HyperliquidClient:
         self,
         symbol: str,
         size: float,
-        take_profit_price: float,
+        trigger_price: float,
         is_buy: bool = False  # Default to sell (for long positions)
     ) -> Order:
         """Place a take profit order.
@@ -455,11 +455,11 @@ class HyperliquidClient:
             raise ValueError(f"No position found for {symbol}")
         
         # Validate and format size and price using the same logic as limit orders
-        size, take_profit_price = self._validate_and_format_order(symbol, size, take_profit_price)
+        size, trigger_price = self._validate_and_format_order(symbol, size, trigger_price)
 
         order_type = {
             "trigger": {
-                "triggerPx": take_profit_price,
+                "triggerPx": trigger_price,
                 "isMarket": True,
                 "tpsl": "tp"
             }
@@ -469,7 +469,7 @@ class HyperliquidClient:
             name=symbol,
             is_buy=is_buy,
             sz=size,
-            limit_px=take_profit_price,
+            limit_px=trigger_price,
             reduce_only=True,
             order_type=order_type
         )
@@ -495,7 +495,7 @@ class HyperliquidClient:
                     "status": "open",
                     "time_in_force": "Gtc",
                     "created_at": int(time.time() * 1000),
-                    "limit_price": str(take_profit_price)
+                    "trigger_price": str(trigger_price)
                 }
                 return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
         
