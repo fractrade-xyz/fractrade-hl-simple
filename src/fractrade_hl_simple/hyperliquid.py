@@ -186,7 +186,9 @@ class HyperliquidClient:
             min_size = specs["min_size"]
             
             if size < min_size:
-                raise ValueError(f"Size must be at least {min_size} for {symbol}")
+                pass
+            # raise ValueError(f"Size must be at least {min_size} for {symbol}")
+            #TODO. we probably dont want to handle this our selfs but just pass the HL error here
 
         # Round size based on szDecimals
         size = round(float(size), size_decimals)
