@@ -13,6 +13,7 @@ from .api import (
     open_long_position,
     open_short_position,
     cancel_all_orders,
+    get_open_orders,
 )
 
 __all__ = [
@@ -30,4 +31,5 @@ __all__ = [
     'open_long_position',
     'open_short_position',
     'cancel_all_orders',
+    'get_open_orders',
 ]

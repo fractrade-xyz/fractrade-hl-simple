@@ -133,6 +133,7 @@ class Order:
     limit_price: Optional[Decimal] = None
     trigger_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
+    type: str = "unknown"  # Can be "limit", "market", "take_profit", "stop_loss"
     
     @property
     def remaining_size(self) -> Decimal:

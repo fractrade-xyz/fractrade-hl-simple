@@ -20,6 +20,7 @@ from dacite import from_dict, Config as DaciteConfig
 import eth_account
 import logging
 from decimal import Decimal
+import threading
 
 
 class HyperliquidClient:
@@ -647,6 +648,110 @@ class HyperliquidClient:
         except Exception as e:
             logging.warning(f"Failed to get open orders: {str(e)}")
 
+    def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
+        """Get all open orders for the authenticated user.
+        
+        Args:
+            symbol (Optional[str]): If provided, only returns orders for this symbol
+            
+        Returns:
+            List[Order]: List of open orders
+            
+        Raises:
+            RuntimeError: If client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+            
+        try:
+            # Get open orders from the API using frontend_open_orders for more details
+            print(f"Calling frontend_open_orders for address: {self.account.public_address}")
+            open_orders_response = self.info.frontend_open_orders(self.account.public_address)
+            print(f"Raw frontend_open_orders response: {open_orders_response}")
+            
+            # Filter by symbol if provided
+            if symbol:
+                print(f"Filtering orders for symbol: {symbol}")
+                open_orders_response = [order for order in open_orders_response if order["coin"] == symbol]
+                print(f"After filtering, found {len(open_orders_response)} orders")
+            
+            # Convert API response to our Order model
+            orders = []
+            for order_data in open_orders_response:
+                try:
+                    # Determine order type (limit, market, trigger)
+                    order_type = {}
+                    order_type_str = "unknown"
+                    
+                    # Check if it's a trigger order (stop loss or take profit)
+                    if order_data.get("isTrigger", False):
+                        tpsl = None
+                        # Determine if it's a take profit or stop loss based on orderType
+                        if "Take Profit" in order_data.get("orderType", ""):
+                            tpsl = "tp"
+                            order_type_str = "take_profit"
+                        elif "Stop" in order_data.get("orderType", ""):
+                            tpsl = "sl"
+                            order_type_str = "stop_loss"
+                            
+                        order_type["trigger"] = {
+                            "triggerPx": order_data.get("triggerPx"),
+                            "isMarket": True,
+                            "tpsl": tpsl
+                        }
+                    # Otherwise it's a limit order
+                    else:
+                        order_type["limit"] = {
+                            "tif": order_data.get("tif", "Gtc"),
+                            "px": order_data.get("limitPx")
+                        }
+                        order_type_str = "limit"
+                    
+                    # Map side to is_buy (A = Ask/Sell, B = Bid/Buy)
+                    is_buy = order_data.get("side") == "B"
+                    
+                    # Create order object
+                    order_dict = {
+                        "order_id": str(order_data.get("oid", "")),
+                        "symbol": order_data.get("coin", ""),
+                        "is_buy": is_buy,
+                        "size": Decimal(str(order_data.get("sz", 0))),
+                        "order_type": order_type,
+                        "reduce_only": order_data.get("reduceOnly", False),
+                        "status": "open",  # All orders returned are open
+                        "time_in_force": order_data.get("tif", "Gtc") or "Gtc",  # Use "Gtc" as default if tif is None
+                        "created_at": order_data.get("timestamp", 0),
+                        "filled_size": Decimal(str(order_data.get("origSz", 0))) - Decimal(str(order_data.get("sz", 0))),
+                        "type": order_type_str
+                    }
+                    
+                    # Add limit price if available
+                    if "limitPx" in order_data:
+                        order_dict["limit_price"] = Decimal(str(order_data["limitPx"]))
+                    
+                    # Add trigger price if available
+                    if "triggerPx" in order_data:
+                        order_dict["trigger_price"] = Decimal(str(order_data["triggerPx"]))
+                    
+                    # Create Order object
+                    order = from_dict(data_class=Order, data=order_dict, config=DACITE_CONFIG)
+                    orders.append(order)
+                except Exception as e:
+                    print(f"Error processing order data: {e}, order_data: {order_data}")
+                
+            return orders
+            
+        except Exception as e:
+            logging.error(f"Failed to get open orders: {str(e)}")
+            print(f"Exception in get_open_orders: {str(e)}")
+            # Try to get raw orders for debugging
+            try:
+                raw_orders = self.info.open_orders(self.account.public_address)
+                print(f"Raw open_orders response: {raw_orders}")
+            except Exception as e2:
+                print(f"Failed to get raw orders: {str(e2)}")
+            return []
+
     def get_price(self, symbol: Optional[str] = None) -> Union[float, Dict[str, float]]:
         """Get current price(s). No authentication required."""
         response = self.info.all_mids()
@@ -732,5 +837,473 @@ class HyperliquidClient:
             }
         
         return specs
+
+    def get_stop_loss_price(self, symbol: str) -> Optional[Decimal]:
+        """Get the stop loss price for a specific symbol.
+        
+        Args:
+            symbol (str): Trading pair symbol (e.g., "BTC")
+            
+        Returns:
+            Optional[Decimal]: The stop loss price if a stop loss order exists, None otherwise
+            
+        Raises:
+            RuntimeError: If client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+            
+        # Get all open orders for the symbol
+        open_orders = self.get_open_orders(symbol)
+        
+        # Filter for stop loss orders
+        sl_orders = [order for order in open_orders if order.type == "stop_loss"]
+        
+        if not sl_orders:
+            return None
+            
+        # Return the price of the first stop loss order
+        # If there are multiple stop loss orders, this returns the first one
+        return sl_orders[0].trigger_price
+    
+    def get_take_profit_price(self, symbol: str) -> Optional[Decimal]:
+        """Get the take profit price for a given symbol.
+        
+        Args:
+            symbol (str): The trading symbol to check
+            
+        Returns:
+            Optional[Decimal]: The trigger price of the first take profit order found, or None if no take profit order exists
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to get take profit price")
+            
+        orders = self.get_open_orders(symbol)
+        tp_orders = [order for order in orders if order.type == "take_profit"]
+        
+        if not tp_orders:
+            return None
+            
+        return tp_orders[0].trigger_price
+        
+    def has_position(self, symbol: str) -> bool:
+        """Check if the user has an open position for the given symbol.
+        
+        Args:
+            symbol (str): The trading symbol to check
+            
+        Returns:
+            bool: True if a position exists, False otherwise
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to check positions")
+            
+        positions = self.get_positions()
+        return any(p.symbol == symbol and p.size != 0 for p in positions)
+    
+    def get_position_size(self, symbol: str) -> Optional[Decimal]:
+        """Get the size of a position for a given symbol.
+        
+        Args:
+            symbol: The trading symbol (e.g., "BTC")
+            
+        Returns:
+            The position size as a Decimal, or None if no position exists
+        """
+        positions = self.get_positions()
+        position = next((p for p in positions if p.symbol == symbol), None)
+        if position is None:
+            return None
+        return position.size
+        
+    def get_position_direction(self, symbol: str) -> Optional[str]:
+        """Get the direction of a position for a given symbol.
+        
+        Args:
+            symbol: The trading symbol (e.g., "BTC")
+            
+        Returns:
+            "long" if position size is positive, "short" if negative, None if no position exists
+        """
+        position_size = self.get_position_size(symbol)
+        if position_size is None:
+            return None
+        return "long" if float(position_size) > 0 else "short"
+        
+    def has_active_orders(self, symbol: Optional[str] = None) -> bool:
+        """Check if there are any active orders for the given symbol.
+        
+        Args:
+            symbol (Optional[str]): The trading symbol to check
+            
+        Returns:
+            bool: True if there are active orders, False otherwise
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to check active orders")
+            
+        orders = self.get_open_orders(symbol)
+        return len(orders) > 0
+        
+    def calculate_position_size(self, symbol: str, risk_amount: Decimal, stop_loss_price: Decimal) -> Decimal:
+        """Calculate the optimal position size based on risk management.
+        
+        Args:
+            symbol (str): The trading symbol
+            risk_amount (Decimal): The amount to risk in USD
+            stop_loss_price (Decimal): The stop loss price level
+            
+        Returns:
+            Decimal: The calculated position size
+            
+        Raises:
+            ValueError: If the stop loss price is invalid
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to calculate position size")
+            
+        # Get current price
+        current_price = Decimal(str(self.get_price(symbol)))
+        
+        # Calculate risk per unit
+        if current_price > stop_loss_price:  # Long position
+            risk_per_unit = current_price - stop_loss_price
+        elif current_price < stop_loss_price:  # Short position
+            risk_per_unit = stop_loss_price - current_price
+        else:
+            raise ValueError("Stop loss price cannot be equal to current price")
+            
+        # Calculate position size
+        position_size = risk_amount / risk_per_unit
+        
+        # Get market specs for minimum size
+        if symbol in self.market_specs:
+            min_size = Decimal(str(self.market_specs[symbol]["min_size"]))
+            size_decimals = self.market_specs[symbol]["size_decimals"]
+            
+            # Round down to the nearest valid size
+            position_size = (position_size // min_size) * min_size
+            position_size = position_size.quantize(Decimal('0.' + '0' * size_decimals))
+            
+        return position_size
+        
+    def modify_order(
+        self,
+        order_id: str,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        price: float,
+        order_type: Dict,
+        reduce_only: bool = False
+    ) -> Order:
+        """Modify an existing order.
+        
+        Args:
+            order_id (str): The ID of the order to modify
+            symbol (str): Trading pair symbol (e.g., "BTC")
+            is_buy (bool): True for buy orders, False for sell orders
+            size (float): New order size
+            price (float): New price for the order
+            order_type (Dict): Order type specification
+            reduce_only (bool): Whether the order should only reduce position
+            
+        Returns:
+            Order: Updated order response
+            
+        Raises:
+            RuntimeError: If client is not authenticated
+            ValueError: If order modification fails
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+            
+        # Validate and format size and price
+        size, price = self._validate_and_format_order(symbol, size, price)
+        
+        try:
+            response = self.exchange.modify_order(
+                oid=order_id,
+                name=symbol,
+                is_buy=is_buy,
+                sz=size,
+                limit_px=price,
+                order_type=order_type,
+                reduce_only=reduce_only
+            )
+            
+            # Check for error response
+            if isinstance(response, dict):
+                if response.get("status") != "ok":
+                    raise ValueError(f"Failed to modify order: {response}")
+                
+                statuses = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
+                if "error" in statuses:
+                    raise ValueError(f"Order modification error: {statuses['error']}")
+                
+                # Format response data
+                if "resting" in statuses:
+                    # For limit orders
+                    order_data = {
+                        "order_id": str(statuses["resting"]["oid"]),
+                        "symbol": symbol,
+                        "is_buy": is_buy,
+                        "size": str(size),
+                        "order_type": order_type,
+                        "reduce_only": reduce_only,
+                        "status": "open",
+                        "time_in_force": order_type.get("limit", {}).get("tif", "Gtc") if "limit" in order_type else "Gtc",
+                        "created_at": int(time.time() * 1000),
+                        "limit_price": str(price)
+                    }
+                    
+                    # Add type field based on order_type
+                    if "trigger" in order_type:
+                        if order_type["trigger"].get("tpsl") == "tp":
+                            order_data["type"] = "take_profit"
+                            order_data["trigger_price"] = str(price)
+                        elif order_type["trigger"].get("tpsl") == "sl":
+                            order_data["type"] = "stop_loss"
+                            order_data["trigger_price"] = str(price)
+                    else:
+                        order_data["type"] = "limit"
+                    
+                    return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
+            
+            raise ValueError("Unexpected response format")
+            
+        except Exception as e:
+            raise ValueError(f"Failed to modify order: {str(e)}")
+
+    def update_stop_loss(self, symbol: str, new_price: float) -> Optional[Order]:
+        """Update the stop loss price for an existing position.
+        
+        Args:
+            symbol (str): The trading symbol
+            new_price (float): The new stop loss price
+            
+        Returns:
+            Optional[Order]: The updated stop loss order, or None if no position exists or no stop loss order found
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to update stop loss")
+        
+            
+        # Get position size
+        position_size = abs(float(self.get_position_size(symbol)))
+        
+        # Find existing stop loss orders
+        open_orders = self.get_open_orders(symbol)
+        sl_orders = [order for order in open_orders if order.type == "stop_loss"]
+        
+        if not sl_orders:
+            # No existing stop loss order, create a new one
+            position_direction = self.get_position_direction(symbol)
+            is_buy = position_direction == "short"
+            return self.stop_loss(symbol, position_size, new_price, is_buy=is_buy)
+        
+        # Use the first stop loss order
+        sl_order = sl_orders[0]
+        
+        # Create order type for stop loss
+        order_type = {
+            "trigger": {
+                "triggerPx": new_price,
+                "isMarket": True,
+                "tpsl": "sl"
+            }
+        }
+        
+        # Modify the existing stop loss order
+        try:
+            return self.modify_order(
+                order_id=sl_order.order_id,
+                symbol=symbol,
+                is_buy=sl_order.is_buy,
+                size=float(sl_order.size),
+                price=new_price,
+                order_type=order_type,
+                reduce_only=True
+            )
+        except Exception as e:
+            logging.warning(f"Failed to modify stop loss order, falling back to cancel and create: {str(e)}")
+            
+            # Fallback to cancel and create
+            for order in sl_orders:
+                try:
+                    self.exchange.cancel(symbol, order.order_id)
+                    time.sleep(0.5)  # Small delay to ensure order is cancelled
+                except Exception as e:
+                    logging.warning(f"Failed to cancel stop loss order {order.order_id}: {str(e)}")
+            
+            # Create new stop loss order
+            position_direction = self.get_position_direction(symbol)
+            is_buy = position_direction == "short"
+            return self.stop_loss(symbol, position_size, new_price, is_buy=is_buy)
+        
+    def update_take_profit(self, symbol: str, new_price: float) -> Optional[Order]:
+        """Update the take profit price for an existing position.
+        
+        Args:
+            symbol (str): The trading symbol
+            new_price (float): The new take profit price
+            
+        Returns:
+            Optional[Order]: The updated take profit order, or None if no position exists or no take profit order found
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to update take profit")
+            
+            
+        # Get position size
+        position_size = abs(float(self.get_position_size(symbol)))
+        
+        # Find existing take profit orders
+        open_orders = self.get_open_orders(symbol)
+        tp_orders = [order for order in open_orders if order.type == "take_profit"]
+        
+        if not tp_orders:
+            # No existing take profit order, create a new one
+            position_direction = self.get_position_direction(symbol)
+            is_buy = position_direction == "short"
+            return self.take_profit(symbol, position_size, new_price, is_buy=is_buy)
+        
+        # Use the first take profit order
+        tp_order = tp_orders[0]
+        
+        # Create order type for take profit
+        order_type = {
+            "trigger": {
+                "triggerPx": new_price,
+                "isMarket": True,
+                "tpsl": "tp"
+            }
+        }
+        
+        # Modify the existing take profit order
+        try:
+            return self.modify_order(
+                order_id=tp_order.order_id,
+                symbol=symbol,
+                is_buy=tp_order.is_buy,
+                size=float(tp_order.size),
+                price=new_price,
+                order_type=order_type,
+                reduce_only=True
+            )
+        except Exception as e:
+            logging.warning(f"Failed to modify take profit order, falling back to cancel and create: {str(e)}")
+            
+            # Fallback to cancel and create
+            for order in tp_orders:
+                try:
+                    self.exchange.cancel(symbol, order.order_id)
+                    time.sleep(0.5)  # Small delay to ensure order is cancelled
+                except Exception as e:
+                    logging.warning(f"Failed to cancel take profit order {order.order_id}: {str(e)}")
+            
+            # Create new take profit order
+            position_direction = self.get_position_direction(symbol)
+            is_buy = position_direction == "short"
+            return self.take_profit(symbol, position_size, new_price, is_buy=is_buy)
+        
+    def trailing_stop(self, symbol: str, trail_percent: float) -> Optional[Order]:
+        """Create a trailing stop based on the current price and trail percentage.
+        
+        This updates an existing stop loss order or creates a new one based on the current price.
+        
+        Args:
+            symbol (str): The trading symbol
+            trail_percent (float): The trailing percentage (e.g., 2.0 for 2%)
+            
+        Returns:
+            Optional[Order]: The updated stop loss order, or None if no position exists
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client must be authenticated to set trailing stop")
+            
+        # Get current price
+        current_price = self.get_price(symbol)
+        
+        # Get position direction
+        position_direction = self.get_position_direction(symbol)
+        if position_direction is None:
+            return None
+        
+        # Calculate new stop loss price based on trail percentage
+        if position_direction == "long":
+            # For long positions, stop loss is below current price
+            new_stop_price = current_price * (1 - trail_percent / 100)
+        else:
+            # For short positions, stop loss is above current price
+            new_stop_price = current_price * (1 + trail_percent / 100)
+            
+        # Update stop loss using the improved method
+        return self.update_stop_loss(symbol, new_stop_price)
+
+    def get_order_by_id(self, symbol: str, order_id: str) -> Optional[Order]:
+        """Retrieve an order by its ID.
+        
+        Args:
+            symbol (str): The trading symbol
+            order_id (str): The order ID to retrieve
+            
+        Returns:
+            Optional[Order]: The order if found, None otherwise
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client is not authenticated")
+            
+        orders = self.get_open_orders(symbol)
+        for order in orders:
+            if order.order_id == order_id:
+                return order
+        return None
+
+    def close_all_positions(self) -> Dict[str, Order]:
+        """Close all open positions.
+        
+        Returns:
+            Dict[str, Order]: A dictionary mapping symbols to close orders
+            
+        Raises:
+            RuntimeError: If the client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("Client is not authenticated")
+            
+        positions = self.get_positions()
+        results = {}
+        
+        for position in positions:
+            try:
+                close_order = self.close(position.symbol, position)
+                results[position.symbol] = close_order
+            except Exception as e:
+                logging.error(f"Failed to close position for {position.symbol}: {str(e)}")
+                
+        return results
 
 

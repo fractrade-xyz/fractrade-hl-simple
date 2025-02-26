@@ -140,3 +140,21 @@ def cancel_all_orders(symbol: Optional[str] = None,
         with get_client(account) as new_client:
             return new_client.cancel_all_orders(symbol)
     return client.cancel_all_orders(symbol)
+
+def get_open_orders(symbol: Optional[str] = None,
+                   account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                   client: Optional[HyperliquidClient] = None) -> List[Order]:
+    """Get all open orders for the authenticated user.
+    
+    Args:
+        symbol (Optional[str]): If provided, only returns orders for this symbol
+        account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials
+        client (Optional[HyperliquidClient]): Existing client instance
+        
+    Returns:
+        List[Order]: List of open orders
+    """
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_open_orders(symbol)
+    return client.get_open_orders(symbol)
