@@ -22,6 +22,9 @@ import logging
 from decimal import Decimal
 import threading
 
+# Set up logger
+logger = logging.getLogger("fractrade_hl_simple")
+logger.addHandler(logging.NullHandler())
 
 class HyperliquidClient:
     def __init__(self, account: Optional[HyperliquidAccount] = None, env: str = "mainnet"):
@@ -179,16 +182,9 @@ class HyperliquidClient:
         if symbol not in self.market_specs:
             # Use default values for unknown markets
             size_decimals = 3
-            min_size = 0.001
         else:
             specs = self.market_specs[symbol]
             size_decimals = specs["size_decimals"]
-            min_size = specs["min_size"]
-            
-            if size < min_size:
-                pass
-            # raise ValueError(f"Size must be at least {min_size} for {symbol}")
-            #TODO. we probably dont want to handle this our selfs but just pass the HL error here
 
         # Round size based on szDecimals
         size = round(float(size), size_decimals)
@@ -238,13 +234,13 @@ class HyperliquidClient:
             limit_price = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
 
         # Debug logging
-        print(f"Original limit price: {limit_price}")
+        logger.debug(f"Original limit price: {limit_price}")
         
         # Validate and format size and price
         size, limit_price = self._validate_and_format_order(symbol, size, limit_price)
         
         # Debug logging
-        print(f"Formatted limit price: {limit_price}")
+        logger.debug(f"Formatted limit price: {limit_price}")
 
         # Construct order type
         order_type = {"limit": {"tif": time_in_force}}
@@ -667,15 +663,15 @@ class HyperliquidClient:
             
         try:
             # Get open orders from the API using frontend_open_orders for more details
-            print(f"Calling frontend_open_orders for address: {self.account.public_address}")
+            logger.debug(f"Calling frontend_open_orders for address: {self.account.public_address}")
             open_orders_response = self.info.frontend_open_orders(self.account.public_address)
-            print(f"Raw frontend_open_orders response: {open_orders_response}")
+            logger.debug(f"Raw frontend_open_orders response: {open_orders_response}")
             
             # Filter by symbol if provided
             if symbol:
-                print(f"Filtering orders for symbol: {symbol}")
+                logger.debug(f"Filtering orders for symbol: {symbol}")
                 open_orders_response = [order for order in open_orders_response if order["coin"] == symbol]
-                print(f"After filtering, found {len(open_orders_response)} orders")
+                logger.debug(f"After filtering, found {len(open_orders_response)} orders")
             
             # Convert API response to our Order model
             orders = []
@@ -739,19 +735,18 @@ class HyperliquidClient:
                     order = from_dict(data_class=Order, data=order_dict, config=DACITE_CONFIG)
                     orders.append(order)
                 except Exception as e:
-                    print(f"Error processing order data: {e}, order_data: {order_data}")
+                    logger.error(f"Error processing order data: {e}, order_data: {order_data}")
                 
             return orders
             
         except Exception as e:
-            logging.error(f"Failed to get open orders: {str(e)}")
-            print(f"Exception in get_open_orders: {str(e)}")
+            logger.error(f"Failed to get open orders: {str(e)}")
             # Try to get raw orders for debugging
             try:
                 raw_orders = self.info.open_orders(self.account.public_address)
-                print(f"Raw open_orders response: {raw_orders}")
+                logger.debug(f"Raw open_orders response: {raw_orders}")
             except Exception as e2:
-                print(f"Failed to get raw orders: {str(e2)}")
+                logger.error(f"Failed to get raw orders: {str(e2)}")
             return []
 
     def get_price(self, symbol: Optional[str] = None) -> Union[float, Dict[str, float]]:
@@ -835,7 +830,6 @@ class HyperliquidClient:
         for market in response['universe']:
             specs[market['name']] = {
                 "size_decimals": market.get('szDecimals', 3),
-                "min_size": float(market.get('minSz', '0.001'))
             }
         
         return specs
@@ -988,13 +982,11 @@ class HyperliquidClient:
         # Calculate position size
         position_size = risk_amount / risk_per_unit
         
-        # Get market specs for minimum size
+        # Get market specs for size formatting
         if symbol in self.market_specs:
-            min_size = Decimal(str(self.market_specs[symbol]["min_size"]))
             size_decimals = self.market_specs[symbol]["size_decimals"]
             
-            # Round down to the nearest valid size
-            position_size = (position_size // min_size) * min_size
+            # Round to the appropriate number of decimals
             position_size = position_size.quantize(Decimal('0.' + '0' * size_decimals))
             
         return position_size
