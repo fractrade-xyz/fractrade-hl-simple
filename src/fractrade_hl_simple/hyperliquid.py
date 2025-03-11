@@ -11,7 +11,9 @@ from .models import (
     convert_api_response,
     MARKET_SPECS,
     get_current_market_specs,
-    print_market_specs_diff
+    print_market_specs_diff,
+    SpotState,
+    SpotTokenBalance
 )
 from functools import partialmethod
 import time
@@ -763,16 +765,180 @@ class HyperliquidClient:
         
         return prices
 
-    def get_perp_balance(self, address: Optional[str] = None) -> Decimal:
-        """Get perpetual balance for an address."""
+    def get_perp_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
+        """Get perpetual trading balance for an address.
+        
+        Args:
+            address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
+            simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
+            
+        Returns:
+            Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance.
+                                          If simple=False, returns a dictionary containing:
+                                          - balance: Total balance in USD
+                                          - positions: List of open positions
+                                          - margin_used: Current margin usage
+                                          - state: Full user state data
+        """
         if address is None and not self.is_authenticated():
             raise ValueError("Address required when client is not authenticated")
             
         if address is None:
             address = self.public_address
             
-        state = self.get_user_state(address)
-        return state.margin_summary.account_value
+        # Get user state which includes all necessary information
+        user_state = self.get_user_state(address)
+        
+        if simple:
+            return user_state.margin_summary.account_value
+            
+        return {
+            'balance': user_state.margin_summary.account_value,
+            'positions': [ap.position for ap in user_state.asset_positions],
+            'margin_used': user_state.margin_summary.total_margin_used,
+            'state': user_state
+        }
+
+    def get_spot_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, SpotState]:
+        """Get spot trading balance for an address.
+        
+        Args:
+            address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
+            simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
+            
+        Returns:
+            Union[Decimal, SpotState]: If simple=True (default), returns just the total balance in USD.
+                                     If simple=False, returns a SpotState object containing:
+                                     - total_balance: Total balance in USD
+                                     - tokens: Dict of token balances (SpotTokenBalance objects)
+                                     - raw_state: Original API response
+        """
+        if address is None and not self.is_authenticated():
+            raise ValueError("Address required when client is not authenticated")
+            
+        if address is None:
+            address = self.public_address
+            
+        # Get spot user state
+        response = self.info.spot_user_state(address)
+        
+        # Get current prices for all tokens
+        prices = self.get_price()
+        
+        # Process balances
+        total_balance = Decimal('0')
+        token_balances: Dict[str, SpotTokenBalance] = {}
+        
+        for balance in response.get('balances', []):
+            try:
+                token = balance.get('coin')
+                if not token:
+                    continue
+                    
+                # Get token amount
+                token_amount = Decimal(str(balance.get('total', '0')))
+                if token_amount == 0:
+                    continue
+                    
+                # Get token price
+                token_price = Decimal(str(prices.get(token, '0')))
+                
+                # Calculate USD value
+                usd_value = token_amount * token_price
+                total_balance += usd_value
+                
+                # Create SpotTokenBalance object
+                token_balances[token] = SpotTokenBalance(
+                    token=token,
+                    amount=token_amount,
+                    usd_value=usd_value,
+                    price=token_price,
+                    hold=Decimal(str(balance.get('hold', '0'))),
+                    entry_ntl=Decimal(str(balance.get('entryNtl', '0')))
+                )
+                
+            except (ValueError, TypeError) as e:
+                self.logger.warning(f"Error processing balance for token {token}: {str(e)}")
+                continue
+                
+        if simple:
+            return total_balance
+            
+        return SpotState(
+            total_balance=total_balance,
+            tokens=token_balances,
+            raw_state=response
+        )
+
+    def get_evm_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
+        """Get EVM chain balance for an address.
+        
+        Args:
+            address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
+            simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
+            
+        Returns:
+            Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance in USD.
+                                          If simple=False, returns a dictionary containing:
+                                          - balance: Total balance in USD
+                                          - state: Full EVM state data
+        """
+        if address is None and not self.is_authenticated():
+            raise ValueError("Address required when client is not authenticated")
+            
+        if address is None:
+            address = self.public_address
+            
+        # Get EVM state
+        response = self.info.evm_state(address)
+        
+        # Calculate total balance
+        total_balance = Decimal(str(response.get('totalBalance', '0')))
+        
+        if simple:
+            return total_balance
+            
+        return {
+            'balance': total_balance,
+            'state': response
+        }
+
+    def get_all_balances(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
+        """Get all balances (perp, spot, and EVM) for an address.
+        
+        Args:
+            address (Optional[str]): The address to get balances for. If None, uses authenticated user's address.
+            simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
+            
+        Returns:
+            Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance in USD.
+                                          If simple=False, returns a dictionary containing:
+                                          - total_balance: Sum of all balances in USD
+                                          - perp: Perpetual trading balance and details
+                                          - spot: Spot trading balance and details
+                                          - evm: EVM chain balance and details
+        """
+        if address is None and not self.is_authenticated():
+            raise ValueError("Address required when client is not authenticated")
+            
+        if address is None:
+            address = self.public_address
+            
+        # Get all balances
+        perp = self.get_perp_balance(address, simple=simple)
+        spot = self.get_spot_balance(address, simple=simple)
+        evm = self.get_evm_balance(address, simple=simple)
+        
+        # Calculate total balance
+        if simple:
+            return perp + spot + evm
+            
+        return {
+            'total_balance': perp['balance'] + spot['balance'] + evm['balance'],
+            'perp': perp,
+            'spot': spot,
+            'evm': evm
+        }
 
     def get_market_info(self, symbol: str = None) -> Union[Dict, List[Dict]]:
         """Get market information from the exchange.

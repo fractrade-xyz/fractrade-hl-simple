@@ -1,4 +1,4 @@
-from typing import List, TypedDict, Optional, Dict, Union, Literal
+from typing import List, TypedDict, Optional, Dict, Union, Literal, Any
 from dataclasses import dataclass
 from eip712_structs import EIP712Struct, Address, Uint, Boolean
 import os
@@ -106,11 +106,29 @@ class MarginSummary:
     total_raw_usd: Decimal
 
 @dataclass(slots=True, kw_only=True)
+class SpotTokenBalance:
+    """Represents the balance of a single token in spot trading."""
+    token: str
+    amount: Decimal
+    usd_value: Decimal
+    price: Decimal
+    hold: Decimal
+    entry_ntl: Decimal
+
+@dataclass(slots=True, kw_only=True)
+class SpotState:
+    """Represents the complete spot trading state."""
+    total_balance: Decimal
+    tokens: Dict[str, SpotTokenBalance]
+    raw_state: Dict[str, Any]  # Store the original API response
+
+@dataclass(slots=True, kw_only=True)
 class UserState:
     asset_positions: List[AssetPosition]
     margin_summary: MarginSummary
     cross_margin_summary: MarginSummary
     withdrawable: Decimal
+    spot_state: Optional[SpotState] = None  # Add spot state to UserState
 
 @dataclass(slots=True, kw_only=True)
 class OrderType:
