@@ -1,6 +1,5 @@
 from typing import List, TypedDict, Optional, Dict, Union, Literal, Any
 from dataclasses import dataclass
-from eip712_structs import EIP712Struct, Address, Uint, Boolean
 import os
 from dotenv import load_dotenv
 from decimal import Decimal

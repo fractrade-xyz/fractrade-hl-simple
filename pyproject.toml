@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fractrade-hl-simple"
-version = "0.1.11"
+version = "0.1.13"
 description = "A simple API wrapper for automated trading on Hyperliquid DEX with Python"
 authors = ["crjameson <93468664+crjameson@users.noreply.github.com>"]
 license = "MIT"

@@ -65,7 +65,7 @@ class HyperliquidClient:
                 self._setup_authenticated_client(env_account)
         except (ValueError, KeyError, TypeError) as e:
             # If authentication fails, log warning and continue in unauthenticated mode
-            logging.warning(
+            logging.debug(
                 f"Running in unauthenticated mode. Only public endpoints available. Error: {str(e)}"
             )
 

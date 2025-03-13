@@ -8,24 +8,26 @@ def print_wallet_balances(address: str):
     # Initialize client (unauthenticated is fine for balance checking)
     client = HyperliquidClient()
     
-    # Get simple balances (just the numbers)
-    perp_balance = client.get_perp_balance(address)
-    spot_balance = client.get_spot_balance(address)
-    total_balance = perp_balance + spot_balance
-    
-    print(f"=== Simple Balance Overview ===")
-    print(f"Perpetual Balance: ${perp_balance:,.2f}")
-    print(f"Spot Balance: ${spot_balance:,.2f}")
-    print(f"Total Balance: ${total_balance:,.2f}")
-    print()
-    
     # Get detailed information
     perp_state = client.get_perp_balance(address, simple=False)
     spot_state = client.get_spot_balance(address, simple=False)
     
-    print(f"=== Detailed Balance Information ===")
+    # Calculate USDC balance
+    usdc_balance = Decimal('0')
+    if spot_state.tokens and "USDC" in spot_state.tokens:
+        usdc_balance = spot_state.tokens["USDC"].amount
+    
+    # Total balance is perp + USDC
+    total_balance = perp_state['state'].margin_summary.account_value + usdc_balance
+    
+    print(f"=== Balance Overview ===")
+    print(f"Perpetual Balance: ${perp_state['state'].margin_summary.account_value:,.2f}")
+    print(f"USDC Balance: ${usdc_balance:,.2f}")
+    print(f"Total Balance: ${total_balance:,.2f}")
+    print()
+    
+    print(f"=== Detailed Information ===")
     print("\nPerpetual Trading:")
-    print(f"Total Balance: ${perp_state['state'].margin_summary.account_value:,.2f}")
     print(f"Margin Used: ${perp_state['state'].margin_summary.total_margin_used:,.2f}")
     
     # Get positions from asset_positions
@@ -43,20 +45,14 @@ def print_wallet_balances(address: str):
     else:
         print("\nNo open positions")
     
-    print("\nSpot Trading:")
-    if spot_state.tokens:
-        print("\nToken Balances:")
-        for token, balance in spot_state.tokens.items():
-            # Only show USD value for USDC
-            if token == "USDC":
-                print(f"- {token}: {float(balance.amount):,.8f} (${float(balance.amount):,.2f})")
-            else:
-                print(f"- {token}: {float(balance.amount):,.8f}")
-            
-            if balance.hold > 0:
-                print(f"  Hold: {float(balance.hold):,.8f}")
-    else:
-        print("\nNo token balances")
+    # Show USDC details if any is held
+    if usdc_balance > 0:
+        print("\nUSDC Details:")
+        usdc_token = spot_state.tokens["USDC"]
+        print(f"Total: ${float(usdc_token.amount):,.2f}")
+        if usdc_token.hold > 0:
+            print(f"Hold: ${float(usdc_token.hold):,.2f}")
+            print(f"Available: ${float(usdc_token.amount - usdc_token.hold):,.2f}")
 
 def main():
     if len(sys.argv) != 2:
