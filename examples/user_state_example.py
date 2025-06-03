@@ -1,5 +1,6 @@
 from decimal import Decimal
 import os
+import argparse
 from dotenv import load_dotenv
 from fractrade_hl_simple import HyperliquidClient
 
@@ -7,9 +8,17 @@ from fractrade_hl_simple import HyperliquidClient
 load_dotenv()
 
 def main():
+    # Set up argument parser
+    parser = argparse.ArgumentParser(description='Get Hyperliquid user state for an address')
+    parser.add_argument('--address', type=str, help='Hyperliquid address to check (optional)')
+    args = parser.parse_args()
+
     # Initialize client (automatically uses env variables)
     client = HyperliquidClient()
-    state = client.get_user_state()
+    
+    # Get state for specified address or default to authenticated user
+    address = args.address
+    state = client.get_user_state(address)
     
     # Print account summary
     print("\nAccount Summary:")
@@ -25,8 +34,8 @@ def main():
         print("\nOpen Positions:")
         for pos in state.asset_positions:
             p = pos.position
-            entry = f"${float(p.entry_px):.1f}" if p.entry_px else "N/A"
-            print(f"  {p.coin:4} {float(p.szi):+.3f} @ {entry} (PnL: ${float(p.unrealized_pnl):,.2f})")
+            entry = f"${float(p.entry_price):.1f}" if p.entry_price else "N/A"
+            print(f"  {p.symbol:4} {float(p.size):+.3f} @ {entry} (PnL: ${float(p.unrealized_pnl):,.2f})")
     else:
         print("\nNo open positions")
 
