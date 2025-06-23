@@ -112,6 +112,36 @@ for symbol, price in all_prices.items():
     print(f"{symbol}: ${price:,.2f}")
 ```
 
+### Get Funding Rates
+```python
+# Get all funding rates sorted from highest positive to lowest negative
+funding_rates = client.get_funding_rates()
+for rate_data in funding_rates:
+    symbol = rate_data['symbol']
+    rate = rate_data['funding_rate']
+    print(f"{symbol}: {rate*100:.4f}%")
+
+# Get funding rate for specific symbol
+btc_rate = client.get_funding_rates("BTC")
+print(f"BTC funding rate: {btc_rate*100:.4f}%")
+```
+
+### Using the API Module (No Client Required)
+You can also use the API module functions directly without creating a client:
+
+```python
+from fractrade_hl_simple.api import get_funding_rates
+
+# Get all funding rates
+funding_rates = get_funding_rates()
+for rate_data in funding_rates:
+    print(f"{rate_data['symbol']}: {rate_data['funding_rate']*100:.4f}%")
+
+# Get specific symbol funding rate
+btc_rate = get_funding_rates("BTC")
+print(f"BTC funding rate: {btc_rate*100:.4f}%")
+```
+
 ### Check Account Balance
 ```python
 balance = client.get_perp_balance()

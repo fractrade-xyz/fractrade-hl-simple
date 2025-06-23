@@ -1,4 +1,4 @@
-from typing import Optional, Dict, List, Union, Literal, Tuple
+from typing import Optional, Dict, List, Union, Literal, Tuple, Any
 from decimal import Decimal
 import os
 from contextlib import contextmanager
@@ -158,3 +158,24 @@ def get_open_orders(symbol: Optional[str] = None,
         with get_client(account) as new_client:
             return new_client.get_open_orders(symbol)
     return client.get_open_orders(symbol)
+
+def get_funding_rates(symbol: Optional[str] = None,
+                     account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                     client: Optional[HyperliquidClient] = None) -> Union[float, List[Dict[str, Any]]]:
+    """Get funding rates for all tokens or a specific symbol.
+    
+    Args:
+        symbol (Optional[str]): If provided, returns funding rate for specific symbol.
+                              If None, returns funding rates for all tokens sorted by value.
+        account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials (not needed for funding rates)
+        client (Optional[HyperliquidClient]): Existing client instance
+        
+    Returns:
+        Union[float, List[Dict[str, Any]]]: 
+            - If symbol is provided: float funding rate for the symbol
+            - If symbol is None: List of dicts with symbol and funding rate, sorted from highest positive to lowest negative
+    """
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_funding_rates(symbol)
+    return client.get_funding_rates(symbol)

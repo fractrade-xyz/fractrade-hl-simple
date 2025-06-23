@@ -23,6 +23,8 @@ import eth_account
 import logging
 from decimal import Decimal
 import threading
+import requests
+import json
 
 # Set up logger
 logger = logging.getLogger("fractrade_hl_simple")
@@ -969,6 +971,83 @@ class HyperliquidClient:
         
         return markets
 
+    def get_funding_rates(self, symbol: Optional[str] = None) -> Union[float, List[Dict[str, Any]]]:
+        """Get funding rates for all tokens or a specific symbol.
+        
+        Args:
+            symbol (Optional[str]): If provided, returns funding rate for specific symbol.
+                                  If None, returns funding rates for all tokens sorted by value.
+            
+        Returns:
+            Union[float, List[Dict[str, Any]]]: 
+                - If symbol is provided: float funding rate for the symbol
+                - If symbol is None: List of dicts with symbol and funding rate, sorted from highest positive to lowest negative
+                
+        Example:
+            # Get all funding rates sorted
+            rates = client.get_funding_rates()
+            for rate in rates:
+                print(f"{rate['symbol']}: {rate['funding_rate']:.6f}")
+                
+            # Get specific symbol funding rate
+            btc_rate = client.get_funding_rates("BTC")
+            print(f"BTC funding rate: {btc_rate:.6f}")
+        """
+        # API endpoint for funding rates
+        url = "https://api.hyperliquid.xyz/info"
+        
+        payload = json.dumps({
+            "type": "predictedFundings"
+        })
+        headers = {
+            'Content-Type': 'application/json'
+        }
+        
+        try:
+            response = requests.post(url, headers=headers, data=payload)
+            response.raise_for_status()
+            rates = response.json()
+            
+            # Get market info to map symbols
+            market_info = self.get_market_info()
+            market_names = {market['name'] for market in market_info}
+            
+            # Process funding rates
+            funding_data = []
+            
+            for rate in rates:
+                symbol_name = rate[0]
+                if symbol_name in market_names:
+                    # Extract funding rate from the nested structure
+                    funding_rate = None
+                    for item in rate[1]:
+                        if item[0] == 'HlPerp':
+                            funding_rate = item[1]['fundingRate']
+                            break
+                    
+                    if funding_rate is not None:
+                        funding_data.append({
+                            'symbol': symbol_name,
+                            'funding_rate': float(funding_rate)
+                        })
+            
+            # If specific symbol requested, return just that rate
+            if symbol is not None:
+                for data in funding_data:
+                    if data['symbol'] == symbol:
+                        return data['funding_rate']
+                raise ValueError(f"Symbol {symbol} not found in funding rates")
+            
+            # Sort by funding rate: highest positive to lowest negative
+            funding_data.sort(key=lambda x: x['funding_rate'], reverse=True)
+            
+            return funding_data
+            
+        except requests.RequestException as e:
+            raise ValueError(f"Failed to fetch funding rates: {str(e)}")
+        except (KeyError, IndexError, ValueError) as e:
+            raise ValueError(f"Failed to parse funding rates response: {str(e)}")
+
     def cancel_all(self) -> None:
         """Cancel all open orders across all symbols."""
         if not self.is_authenticated():
@@ -1465,5 +1544,29 @@ class HyperliquidClient:
                 logging.error(f"Failed to close position for {position.symbol}: {str(e)}")
                 
         return results
+
+    def cancel_order(self, order_id: str, symbol: str) -> bool:
+        """Cancel a specific order by order ID and symbol.
+        
+        Args:
+            order_id (str): The order ID to cancel
+            symbol (str): The symbol the order is for
+            
+        Returns:
+            bool: True if order was successfully cancelled, False otherwise
+            
+        Raises:
+            RuntimeError: If client is not authenticated
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+            
+        try:
+            self.exchange.cancel(symbol, order_id)
+            logger.info(f"Successfully cancelled order {order_id} for {symbol}")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to cancel order {order_id} for {symbol}: {str(e)}")
+            return False
 
 

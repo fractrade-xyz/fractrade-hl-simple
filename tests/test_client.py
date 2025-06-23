@@ -132,4 +132,47 @@ def test_get_positions(client, mock_exchange, sample_user_state):
         pos = positions[0]
         assert isinstance(pos, Position)
 
+def test_get_funding_rates_integration():
+    """Integration test for get_funding_rates - calls real API and checks major coins."""
+    client = HyperliquidClient()
+    
+    # Get all funding rates
+    funding_rates = client.get_funding_rates()
+    
+    # Basic validation
+    assert isinstance(funding_rates, list)
+    assert len(funding_rates) > 0
+    
+    # Check structure of each item
+    for item in funding_rates:
+        assert 'symbol' in item
+        assert 'funding_rate' in item
+        assert isinstance(item['symbol'], str)
+        assert isinstance(item['funding_rate'], float)
+    
+    # Check that major coins have non-zero funding rates
+    major_coins = ['BTC', 'ETH', 'SOL']
+    found_major_coins = []
+    
+    for item in funding_rates:
+        if item['symbol'] in major_coins:
+            found_major_coins.append(item['symbol'])
+            # Check that funding rate is not zero (should be some small number)
+            assert item['funding_rate'] != 0.0, f"Funding rate for {item['symbol']} should not be zero"
+            # Check that funding rate is reasonable (between -1% and +1%)
+            assert -0.01 <= item['funding_rate'] <= 0.01, f"Funding rate for {item['symbol']} should be between -1% and +1%"
+    
+    # Should find at least some of the major coins
+    assert len(found_major_coins) > 0, f"Should find at least some of the major coins: {major_coins}"
+    
+    # Test getting specific symbol funding rate
+    btc_rate = client.get_funding_rates("BTC")
+    assert isinstance(btc_rate, float)
+    assert btc_rate != 0.0
+    assert -0.01 <= btc_rate <= 0.01
+    
+    # Test getting non-existent symbol
+    with pytest.raises(ValueError, match="Symbol XYZ not found in funding rates"):
+        client.get_funding_rates("XYZ")
+
 
