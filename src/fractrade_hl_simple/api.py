@@ -141,6 +141,26 @@ def cancel_all_orders(symbol: Optional[str] = None,
             return new_client.cancel_all_orders(symbol)
     return client.cancel_all_orders(symbol)
 
+def cancel_order(order_id: str,
+                symbol: str,
+                account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                client: Optional[HyperliquidClient] = None) -> bool:
+    """Cancel a specific order by order ID and symbol.
+    
+    Args:
+        order_id (str): The order ID to cancel
+        symbol (str): The symbol the order is for
+        account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials
+        client (Optional[HyperliquidClient]): Existing client instance
+        
+    Returns:
+        bool: True if order was successfully cancelled, False otherwise
+    """
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.cancel_order(order_id, symbol)
+    return client.cancel_order(order_id, symbol)
+
 def get_open_orders(symbol: Optional[str] = None,
                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
                    client: Optional[HyperliquidClient] = None) -> List[Order]:

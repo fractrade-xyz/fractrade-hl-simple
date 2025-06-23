@@ -253,6 +253,10 @@ class HyperliquidClient:
                 raise ValueError("post_only cannot be used with IOC orders")
             order_type["limit"]["postOnly"] = True
 
+        # Debug logging
+        logger.debug(f"Order type structure: {order_type}")
+        logger.debug(f"Order parameters: symbol={symbol}, size={size}, limit_price={limit_price}, is_buy={is_buy}")
+
         try:
             response = self.exchange.order(
                 name=symbol,
@@ -263,8 +267,16 @@ class HyperliquidClient:
                 reduce_only=reduce_only
             )
             
+            # Debug logging
+            logger.debug(f"Order response: {response}")
+            
             # Check for error response
             if isinstance(response, dict):
+                # Check if response has status field
+                if response.get("status") != "ok":
+                    raise ValueError(f"Order failed with status: {response.get('status')}")
+                
+                # Check for response.data structure
                 if "response" in response and "data" in response["response"]:
                     statuses = response["response"]["data"].get("statuses", [])
                     if statuses and "error" in statuses[0]:
@@ -301,10 +313,16 @@ class HyperliquidClient:
                             "limit_price": str(limit_price)
                         }
                         return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
+                else:
+                    # Try alternative response format
+                    logger.debug(f"Trying alternative response format: {response}")
+                    raise ValueError(f"Unexpected response structure: {response}")
             
-            raise ValueError("Unexpected response format")
+            raise ValueError(f"Unexpected response format: {type(response)} - {response}")
         
         except Exception as e:
+            logger.error(f"Order placement failed for {symbol}: {str(e)}")
+            logger.error(f"Order details: symbol={symbol}, size={size}, limit_price={limit_price}, order_type={order_type}")
             raise ValueError(f"Failed to place order: {str(e)}")
 
     def buy(
