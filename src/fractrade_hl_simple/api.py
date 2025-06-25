@@ -158,8 +158,8 @@ def cancel_order(order_id: str,
     """
     if client is None:
         with get_client(account) as new_client:
-            return new_client.cancel_order(order_id, symbol)
-    return client.cancel_order(order_id, symbol)
+            return new_client.cancel_order(int(order_id), symbol)
+    return client.cancel_order(int(order_id), symbol)
 
 def get_open_orders(symbol: Optional[str] = None,
                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
