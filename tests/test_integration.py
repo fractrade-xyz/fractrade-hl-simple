@@ -765,3 +765,150 @@ def test_limit_orders(client):
             client.cancel_all_orders(symbol)
         except Exception as e:
             print(f"Cleanup error: {e}")
+
+def test_funding_rates(client):
+    """Test the get_funding_rates method with real data and threshold filtering."""
+    
+    # Test 1: Get all funding rates
+    print("Testing get_funding_rates() without parameters...")
+    all_rates = client.get_funding_rates()
+    
+    # Basic validation
+    assert isinstance(all_rates, list), "Should return a list"
+    assert len(all_rates) > 0, "Should return at least some funding rates"
+    
+    # Check structure of each item
+    for rate in all_rates:
+        assert 'symbol' in rate, "Each rate should have a symbol"
+        assert 'funding_rate' in rate, "Each rate should have a funding_rate"
+        assert isinstance(rate['symbol'], str), "Symbol should be a string"
+        assert isinstance(rate['funding_rate'], float), "Funding rate should be a float"
+    
+    print(f"Retrieved {len(all_rates)} total funding rates")
+    
+    # Test 2: Get specific symbol funding rate
+    print("\nTesting get_funding_rates() with specific symbol...")
+    
+    # Test with a major coin that should exist
+    major_coins = ['BTC', 'ETH', 'SOL']
+    found_major_coin = None
+    
+    for coin in major_coins:
+        try:
+            rate = client.get_funding_rates(coin)
+            assert isinstance(rate, float), f"Funding rate for {coin} should be a float"
+            assert -0.01 <= rate <= 0.01, f"Funding rate for {coin} should be reasonable (-1% to +1%)"
+            found_major_coin = coin
+            print(f"Successfully retrieved funding rate for {coin}: {rate:.6f}")
+            break
+        except ValueError:
+            continue
+    
+    assert found_major_coin is not None, "Should find at least one major coin"
+    
+    # Test 3: Test with non-existent symbol
+    print("\nTesting get_funding_rates() with non-existent symbol...")
+    with pytest.raises(ValueError, match="Symbol XYZ not found in funding rates"):
+        client.get_funding_rates("XYZ")
+    print("Correctly raised ValueError for non-existent symbol")
+    
+    # Test 4: Test threshold filtering
+    print("\nTesting get_funding_rates() with threshold filtering...")
+    
+    # Get rates with a low threshold (should return many results)
+    low_threshold = 0.00001  # 0.001%
+    low_threshold_rates = client.get_funding_rates(threshold=low_threshold)
+    
+    assert isinstance(low_threshold_rates, list), "Should return a list"
+    assert len(low_threshold_rates) > 0, "Should return some rates with low threshold"
+    assert len(low_threshold_rates) <= len(all_rates), "Threshold should filter results"
+    
+    # Verify all returned rates meet the threshold
+    for rate in low_threshold_rates:
+        assert abs(rate['funding_rate']) > low_threshold, f"Rate {rate['symbol']}: {rate['funding_rate']} should be above threshold {low_threshold}"
+    
+    print(f"Low threshold ({low_threshold}) returned {len(low_threshold_rates)} rates")
+    
+    # Test with a higher threshold (should return fewer results)
+    high_threshold = 0.0001  # 0.01%
+    high_threshold_rates = client.get_funding_rates(threshold=high_threshold)
+    
+    assert isinstance(high_threshold_rates, list), "Should return a list"
+    assert len(high_threshold_rates) <= len(low_threshold_rates), "Higher threshold should return fewer results"
+    
+    # Verify all returned rates meet the higher threshold
+    for rate in high_threshold_rates:
+        assert abs(rate['funding_rate']) > high_threshold, f"Rate {rate['symbol']}: {rate['funding_rate']} should be above threshold {high_threshold}"
+    
+    print(f"High threshold ({high_threshold}) returned {len(high_threshold_rates)} rates")
+    
+    # Test 5: Test with very high threshold (might return no results)
+    print("\nTesting get_funding_rates() with very high threshold...")
+    very_high_threshold = 0.001  # 0.1%
+    very_high_threshold_rates = client.get_funding_rates(threshold=very_high_threshold)
+    
+    assert isinstance(very_high_threshold_rates, list), "Should return a list (even if empty)"
+    assert len(very_high_threshold_rates) <= len(high_threshold_rates), "Very high threshold should return fewer or equal results"
+    
+    # Verify all returned rates meet the very high threshold
+    for rate in very_high_threshold_rates:
+        assert abs(rate['funding_rate']) > very_high_threshold, f"Rate {rate['symbol']}: {rate['funding_rate']} should be above threshold {very_high_threshold}"
+    
+    print(f"Very high threshold ({very_high_threshold}) returned {len(very_high_threshold_rates)} rates")
+    
+    # Test 6: Test sorting (rates should be sorted from highest positive to lowest negative)
+    print("\nTesting funding rates sorting...")
+    
+    if len(all_rates) >= 2:
+        # Check that rates are sorted in descending order
+        for i in range(len(all_rates) - 1):
+            assert all_rates[i]['funding_rate'] >= all_rates[i + 1]['funding_rate'], \
+                f"Rates should be sorted: {all_rates[i]['symbol']}: {all_rates[i]['funding_rate']} should be >= {all_rates[i + 1]['symbol']}: {all_rates[i + 1]['funding_rate']}"
+    
+    print("Funding rates are correctly sorted from highest to lowest")
+    
+    # Test 7: Test threshold with negative values (should work the same)
+    print("\nTesting threshold with negative values...")
+    
+    # Get some negative rates
+    negative_rates = [rate for rate in all_rates if rate['funding_rate'] < 0]
+    if negative_rates:
+        # Use the absolute value of a negative rate as threshold
+        negative_threshold = abs(negative_rates[0]['funding_rate']) * 0.5  # Half of the first negative rate
+        filtered_negative_rates = client.get_funding_rates(threshold=negative_threshold)
+        
+        # Should include the original negative rate and others with higher absolute values
+        assert len(filtered_negative_rates) > 0, "Should return some rates with negative threshold"
+        
+        for rate in filtered_negative_rates:
+            assert abs(rate['funding_rate']) > negative_threshold, f"Rate {rate['symbol']}: {rate['funding_rate']} should be above threshold {negative_threshold}"
+        
+        print(f"Negative threshold ({negative_threshold}) returned {len(filtered_negative_rates)} rates")
+    
+    # Test 8: Test edge cases
+    print("\nTesting edge cases...")
+    
+    # Test with threshold = 0 (should return all rates)
+    zero_threshold_rates = client.get_funding_rates(threshold=0.0)
+    assert len(zero_threshold_rates) == len(all_rates), "Zero threshold should return all rates"
+    print("Zero threshold correctly returns all rates")
+    
+    # Test with very large threshold (should return empty list)
+    large_threshold = 1.0  # 100%
+    large_threshold_rates = client.get_funding_rates(threshold=large_threshold)
+    assert len(large_threshold_rates) == 0, "Very large threshold should return empty list"
+    print("Very large threshold correctly returns empty list")
+    
+    # Print summary
+    print(f"\n=== Funding Rates Test Summary ===")
+    print(f"Total funding rates available: {len(all_rates)}")
+    print(f"Rates above {low_threshold} (0.001%): {len(low_threshold_rates)}")
+    print(f"Rates above {high_threshold} (0.01%): {len(high_threshold_rates)}")
+    print(f"Rates above {very_high_threshold} (0.1%): {len(very_high_threshold_rates)}")
+    
+    if high_threshold_rates:
+        print(f"Sample high funding rates:")
+        for rate in high_threshold_rates[:5]:  # Show first 5
+            print(f"  {rate['symbol']}: {rate['funding_rate']:.6f}")
+    
+    print("Funding rates test completed successfully!")

@@ -989,12 +989,14 @@ class HyperliquidClient:
         
         return markets
 
-    def get_funding_rates(self, symbol: Optional[str] = None) -> Union[float, List[Dict[str, Any]]]:
+    def get_funding_rates(self, symbol: Optional[str] = None, threshold: Optional[float] = None) -> Union[float, List[Dict[str, Any]]]:
         """Get funding rates for all tokens or a specific symbol.
         
         Args:
             symbol (Optional[str]): If provided, returns funding rate for specific symbol.
                                   If None, returns funding rates for all tokens sorted by value.
+            threshold (Optional[float]): If provided, only returns symbols where the absolute funding rate
+                                       is greater than the absolute threshold value.
             
         Returns:
             Union[float, List[Dict[str, Any]]]: 
@@ -1010,6 +1012,11 @@ class HyperliquidClient:
             # Get specific symbol funding rate
             btc_rate = client.get_funding_rates("BTC")
             print(f"BTC funding rate: {btc_rate:.6f}")
+            
+            # Get funding rates above 0.01% threshold
+            high_rates = client.get_funding_rates(threshold=0.0001)
+            for rate in high_rates:
+                print(f"{rate['symbol']}: {rate['funding_rate']:.6f}")
         """
         # API endpoint for funding rates
         url = "https://api.hyperliquid.xyz/info"
@@ -1055,6 +1062,13 @@ class HyperliquidClient:
                     if data['symbol'] == symbol:
                         return data['funding_rate']
                 raise ValueError(f"Symbol {symbol} not found in funding rates")
+            
+            # Apply threshold filter if provided
+            if threshold is not None:
+                funding_data = [
+                    data for data in funding_data 
+                    if abs(data['funding_rate']) >= abs(threshold)
+                ]
             
             # Sort by funding rate: highest positive to lowest negative
             funding_data.sort(key=lambda x: x['funding_rate'], reverse=True)
