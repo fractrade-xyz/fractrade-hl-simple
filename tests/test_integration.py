@@ -668,3 +668,100 @@ def test_convenience_functions(client):
             client.close(symbol)
         except Exception as e:
             print(f"Cleanup error: {e}")
+
+def test_limit_orders(client):
+    """Test creating, modifying, and canceling limit orders."""
+    symbol = "BTC"
+    size = 0.001  # Minimum size for BTC
+    
+    try:
+        # Clean up any existing orders for this symbol
+        client.cancel_all_orders(symbol)
+        time.sleep(1)
+        
+        # Get current price
+        current_price = client.get_price(symbol)
+        print(f"Current {symbol} price: ${current_price:,.2f}")
+        
+        # 1. Create a limit buy order (10% below current price)
+        limit_price = current_price * 0.90
+        limit_price = float(f"{limit_price:.5g}")  # Round to 5 significant figures
+        print(f"Creating limit buy order at price: ${limit_price:,.2f}")
+        
+        limit_order = client.buy(symbol, size, limit_price=limit_price)
+        assert limit_order.symbol == symbol
+        assert float(limit_order.size) == size
+        assert limit_order.is_buy is True
+        assert limit_order.status in ["open", "filled"]
+        print(f"Created limit order: {limit_order.order_id}")
+        
+        # Wait for order to be processed
+        time.sleep(2)
+        
+        # 2. Verify the order exists in open orders
+        open_orders = client.get_open_orders(symbol)
+        found_order = next((o for o in open_orders if o.order_id == limit_order.order_id), None)
+        assert found_order is not None, "Limit order should exist in open orders"
+        assert abs(float(found_order.limit_price) - limit_price) / limit_price < 0.01, "Limit price should match"
+        print(f"Verified order exists with price: ${found_order.limit_price}")
+        
+        # 3. Modify the limit order (8% below current price instead of 10%)
+        new_limit_price = current_price * 0.92
+        new_limit_price = float(f"{new_limit_price:.5g}")  # Round to 5 significant figures
+        print(f"Modifying limit order to new price: ${new_limit_price:,.2f}")
+        
+        order_type = {"limit": {"tif": "Gtc"}}
+        
+        modified_order = client.modify_order(
+            order_id=limit_order.order_id,
+            symbol=symbol,
+            is_buy=True,
+            size=size,
+            price=new_limit_price,
+            order_type=order_type,
+            reduce_only=False
+        )
+        
+        assert modified_order is not None, "Modified order should not be None"
+        # Note: Order ID might change if the exchange cancels and recreates the order
+        print(f"Original order ID: {limit_order.order_id}")
+        print(f"Modified order ID: {modified_order.order_id}")
+        print(f"Modified order: {modified_order.order_id}")
+        
+        # Wait for modification to be processed
+        time.sleep(2)
+        
+        # 4. Verify the modification worked
+        open_orders_after_modify = client.get_open_orders(symbol)
+        # Look for the modified order using the new order ID
+        found_modified_order = next((o for o in open_orders_after_modify if o.order_id == modified_order.order_id), None)
+        
+        assert found_modified_order is not None, "Modified order should still exist"
+        assert abs(float(found_modified_order.limit_price) - new_limit_price) / new_limit_price < 0.01, "Limit price should be updated"
+        print(f"Verified modification: new price is ${found_modified_order.limit_price}")
+        
+        # 5. Cancel the limit order
+        print("Canceling the limit order...")
+        client.cancel_all_orders(symbol)
+        time.sleep(2)
+        
+        # 6. Verify the order was canceled
+        open_orders_after_cancel = client.get_open_orders(symbol)
+        # Check that both the original and modified orders are no longer in open orders
+        found_original_order = next((o for o in open_orders_after_cancel if o.order_id == limit_order.order_id), None)
+        found_modified_order = next((o for o in open_orders_after_cancel if o.order_id == modified_order.order_id), None)
+        assert found_original_order is None, "Original order should be canceled and not in open orders"
+        assert found_modified_order is None, "Modified order should be canceled and not in open orders"
+        print("Verified orders were successfully canceled")
+        
+        print("Limit order test completed successfully!")
+        
+    except Exception as e:
+        print(f"Limit order test failed: {e}")
+        raise
+    finally:
+        # Ensure cleanup in case of test failure
+        try:
+            client.cancel_all_orders(symbol)
+        except Exception as e:
+            print(f"Cleanup error: {e}")

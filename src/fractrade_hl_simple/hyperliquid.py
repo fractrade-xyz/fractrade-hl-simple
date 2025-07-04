@@ -1289,8 +1289,10 @@ class HyperliquidClient:
         size, price = self._validate_and_format_order(symbol, size, price)
         
         try:
+            # Convert order_id to integer as required by the SDK
+            oid = int(order_id)
             response = self.exchange.modify_order(
-                oid=order_id,
+                oid=oid,
                 name=symbol,
                 is_buy=is_buy,
                 sz=size,
@@ -1580,9 +1582,14 @@ class HyperliquidClient:
             raise RuntimeError("This method requires authentication")
             
         try:
-            self.exchange.cancel(symbol, order_id)
+            # Convert order_id string to integer as required by the SDK
+            oid = int(order_id)
+            self.exchange.cancel(symbol, oid)
             logger.info(f"Successfully cancelled order {order_id} for {symbol}")
             return True
+        except ValueError as e:
+            logger.error(f"Invalid order ID format {order_id}: {str(e)}")
+            return False
         except Exception as e:
             logger.error(f"Failed to cancel order {order_id} for {symbol}: {str(e)}")
             return False
