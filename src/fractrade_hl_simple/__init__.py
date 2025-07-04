@@ -15,6 +15,9 @@ from .api import (
     cancel_all_orders,
     cancel_order,
     get_open_orders,
+    get_funding_rates,
+    get_order_book,
+    get_optimal_limit_price,
 )
 
 __all__ = [
@@ -34,4 +37,7 @@ __all__ = [
     'cancel_all_orders',
     'cancel_order',
     'get_open_orders',
+    'get_funding_rates',
+    'get_order_book',
+    'get_optimal_limit_price',
 ]

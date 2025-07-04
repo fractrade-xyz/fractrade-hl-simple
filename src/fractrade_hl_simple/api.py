@@ -180,6 +180,7 @@ def get_open_orders(symbol: Optional[str] = None,
     return client.get_open_orders(symbol)
 
 def get_funding_rates(symbol: Optional[str] = None,
+                     threshold: Optional[float] = None,
                      account: Optional[Union[Dict, HyperliquidAccount]] = None,
                      client: Optional[HyperliquidClient] = None) -> Union[float, List[Dict[str, Any]]]:
     """Get funding rates for all tokens or a specific symbol.
@@ -187,6 +188,8 @@ def get_funding_rates(symbol: Optional[str] = None,
     Args:
         symbol (Optional[str]): If provided, returns funding rate for specific symbol.
                               If None, returns funding rates for all tokens sorted by value.
+        threshold (Optional[float]): If provided, only returns symbols where the absolute funding rate
+                                   is greater than or equal to the absolute threshold value.
         account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials (not needed for funding rates)
         client (Optional[HyperliquidClient]): Existing client instance
         
@@ -197,5 +200,109 @@ def get_funding_rates(symbol: Optional[str] = None,
     """
     if client is None:
         with get_client(account) as new_client:
-            return new_client.get_funding_rates(symbol)
-    return client.get_funding_rates(symbol)
+            return new_client.get_funding_rates(symbol, threshold)
+    return client.get_funding_rates(symbol, threshold)
+
+def get_order_book(symbol: str,
+                  account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                  client: Optional[HyperliquidClient] = None) -> Dict[str, Any]:
+    """Get the current order book (L2 snapshot) for a symbol.
+    
+    Args:
+        symbol (str): Trading pair symbol (e.g., "BTC")
+        account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials (not needed for order book)
+        client (Optional[HyperliquidClient]): Existing client instance
+        
+    Returns:
+        Dict[str, Any]: Order book data with the following structure:
+            {
+                "symbol": str,
+                "bids": List[Dict[str, float]],  # List of {price, size} dicts
+                "asks": List[Dict[str, float]],  # List of {price, size} dicts
+                "timestamp": int,
+                "best_bid": float,
+                "best_ask": float,
+                "spread": float,
+                "mid_price": float
+            }
+            
+    Raises:
+        ValueError: If symbol is not found or order book data is invalid
+    """
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_order_book(symbol)
+    return client.get_order_book(symbol)
+
+def get_optimal_limit_price(symbol: str,
+                           side: str,
+                           urgency_factor: float = 0.5,
+                           account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                           client: Optional[HyperliquidClient] = None) -> float:
+    """Get optimal limit price by analyzing order book and urgency factor.
+    
+    Args:
+        symbol (str): Trading pair symbol (e.g., "BTC")
+        side (str): 'buy' or 'sell'
+        urgency_factor (float): Urgency factor from 0.0 to 1.0. 
+                              0.0 = very patient (far from market), 1.0 = very aggressive (close to market)
+        account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials (not needed for price calculation)
+        client (Optional[HyperliquidClient]): Existing client instance
+        
+    Returns:
+        float: Optimal limit price
+        
+    Raises:
+        ValueError: If parameters are invalid or order book data is unavailable
+    """
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_optimal_limit_price(symbol, side, urgency_factor)
+    return client.get_optimal_limit_price(symbol, side, urgency_factor)
+
+def get_spot_balance(address: Optional[str] = None,
+                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                    client: Optional[HyperliquidClient] = None,
+                    simple: bool = True) -> Union[Decimal, 'SpotState']:
+    """Get spot trading balance for an address or authenticated user."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_spot_balance(address, simple=simple)
+    return client.get_spot_balance(address, simple=simple)
+
+def get_evm_balance(address: Optional[str] = None,
+                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                    client: Optional[HyperliquidClient] = None,
+                    simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
+    """Get EVM chain balance for an address or authenticated user."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_evm_balance(address, simple=simple)
+    return client.get_evm_balance(address, simple=simple)
+
+def get_all_balances(address: Optional[str] = None,
+                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                    client: Optional[HyperliquidClient] = None,
+                    simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
+    """Get all balances (perp, spot, and EVM) for an address or authenticated user."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_all_balances(address, simple=simple)
+    return client.get_all_balances(address, simple=simple)
+
+def get_market_info(symbol: Optional[str] = None,
+                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                    client: Optional[HyperliquidClient] = None) -> Union[Dict, List[Dict]]:
+    """Get market information from the exchange."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_market_info(symbol)
+    return client.get_market_info(symbol)
+
+def cancel_all(account: Optional[Union[Dict, HyperliquidAccount]] = None,
+               client: Optional[HyperliquidClient] = None) -> None:
+    """Cancel all open orders across all symbols."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.cancel_all()
+    return client.cancel_all()

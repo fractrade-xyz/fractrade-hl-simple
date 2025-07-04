@@ -26,6 +26,23 @@ poetry update fractrade-hl-simple
 
 ⚠️ **Note**: This library is under active development. We recommend updating regularly to get the latest features and fixes.
 
+## Logging Configuration
+
+By default, the library uses Python's standard `logging` module. To see debug or info messages (for troubleshooting, order placement, API calls, etc.), configure logging in your script before using the client:
+
+```python
+import logging
+
+# Show info-level logs from fractrade_hl_simple
+logging.basicConfig(level=logging.INFO)
+
+# For more detailed output (including debugging info), use:
+# logging.basicConfig(level=logging.DEBUG)
+```
+
+You can place this at the top of your script or notebook.  
+All logs from the library are under the `fractrade_hl_simple` logger.
+
 ## Setup
 
 1. Create a `.env` file in your project root:
@@ -112,6 +129,17 @@ for symbol, price in all_prices.items():
     print(f"{symbol}: ${price:,.2f}")
 ```
 
+### Get Market Info
+```python
+# Get info for all available markets
+markets = client.get_market_info()
+print(f"Available markets: {[m['name'] for m in markets]}")
+
+# Get detailed info for a specific symbol
+btc_info = client.get_market_info("BTC")
+print("BTC market info:", btc_info)
+```
+
 ### Get Funding Rates
 ```python
 # Get all funding rates sorted from highest positive to lowest negative
@@ -126,20 +154,60 @@ btc_rate = client.get_funding_rates("BTC")
 print(f"BTC funding rate: {btc_rate*100:.4f}%")
 ```
 
+### Get Order Book Data
+```python
+# Get complete order book for a symbol
+order_book = client.get_order_book("BTC")
+print(f"Best bid: ${order_book['best_bid']:,.2f}")
+print(f"Best ask: ${order_book['best_ask']:,.2f}")
+print(f"Spread: ${order_book['spread']:,.2f}")
+print(f"Mid price: ${order_book['mid_price']:,.2f}")
+
+# View top 5 bids and asks
+print("\nTop 5 Bids:")
+for i, bid in enumerate(order_book['bids'][:5]):
+    print(f"  {i+1}. ${bid['price']:,.2f} - {bid['size']:.3f}")
+    
+print("\nTop 5 Asks:")
+for i, ask in enumerate(order_book['asks'][:5]):
+    print(f"  {i+1}. ${ask['price']:,.2f} - {ask['size']:.3f}")
+```
+
+### Get Optimal Limit Order Prices
+```python
+# Calculate optimal limit price based on urgency factor
+# Urgency factor ranges from 0.0 (very patient) to 1.0 (very aggressive)
+
+# Patient buy order (close to best bid)
+patient_buy_price = client.get_optimal_limit_price("BTC", "buy", urgency_factor=0.1)
+print(f"Patient buy price: ${patient_buy_price:,.2f}")
+
+# Aggressive buy order (close to best ask)
+aggressive_buy_price = client.get_optimal_limit_price("BTC", "buy", urgency_factor=0.9)
+print(f"Aggressive buy price: ${aggressive_buy_price:,.2f}")
+
+# Patient sell order (close to best ask)
+patient_sell_price = client.get_optimal_limit_price("BTC", "sell", urgency_factor=0.1)
+print(f"Patient sell price: ${patient_sell_price:,.2f}")
+
+# Aggressive sell order (close to best bid)
+aggressive_sell_price = client.get_optimal_limit_price("BTC", "sell", urgency_factor=0.9)
+print(f"Aggressive sell price: ${aggressive_sell_price:,.2f}")
+```
+
 ### Using the API Module (No Client Required)
 You can also use the API module functions directly without creating a client:
 
 ```python
-from fractrade_hl_simple.api import get_funding_rates
+from fractrade_hl_simple import get_order_book, get_optimal_limit_price
 
-# Get all funding rates
-funding_rates = get_funding_rates()
-for rate_data in funding_rates:
-    print(f"{rate_data['symbol']}: {rate_data['funding_rate']*100:.4f}%")
+# Get order book
+order_book = get_order_book("BTC")
+print(f"Spread: ${order_book['spread']:,.2f}")
 
-# Get specific symbol funding rate
-btc_rate = get_funding_rates("BTC")
-print(f"BTC funding rate: {btc_rate*100:.4f}%")
+# Get optimal price
+optimal_price = get_optimal_limit_price("BTC", "buy", urgency_factor=0.5)
+print(f"Optimal buy price: ${optimal_price:,.2f}")
 ```
 
 ### Check Account Balance

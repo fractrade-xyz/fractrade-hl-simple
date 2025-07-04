@@ -1608,4 +1608,171 @@ class HyperliquidClient:
             logger.error(f"Failed to cancel order {order_id} for {symbol}: {str(e)}")
             return False
 
+    def get_order_book(self, symbol: str) -> Dict[str, Any]:
+        """Get the current order book (L2 snapshot) for a symbol.
+        
+        Args:
+            symbol (str): Trading pair symbol (e.g., "BTC")
+            
+        Returns:
+            Dict[str, Any]: Order book data with the following structure:
+                {
+                    "symbol": str,
+                    "bids": List[Dict[str, float]],  # List of {price, size} dicts
+                    "asks": List[Dict[str, float]],  # List of {price, size} dicts
+                    "timestamp": int,
+                    "best_bid": float,
+                    "best_ask": float,
+                    "spread": float,
+                    "mid_price": float
+                }
+                
+        Raises:
+            ValueError: If symbol is not found or order book data is invalid
+        """
+        try:
+            # Get L2 order book snapshot
+            l2_data = self.info.l2_snapshot(symbol)
+            
+            # Validate response structure
+            if not isinstance(l2_data, dict) or "levels" not in l2_data:
+                raise ValueError(f"Invalid order book response for {symbol}")
+            
+            levels = l2_data.get("levels", [])
+            if len(levels) < 2:
+                raise ValueError(f"Insufficient order book levels for {symbol}")
+            
+            # Extract bids (level 0) and asks (level 1)
+            bids_raw = levels[0] if len(levels) > 0 else []
+            asks_raw = levels[1] if len(levels) > 1 else []
+            
+            # Convert to our format
+            bids = []
+            for bid in bids_raw:
+                if isinstance(bid, dict) and "px" in bid and "sz" in bid:
+                    bids.append({
+                        "price": float(bid["px"]),
+                        "size": float(bid["sz"])
+                    })
+            
+            asks = []
+            for ask in asks_raw:
+                if isinstance(ask, dict) and "px" in ask and "sz" in ask:
+                    asks.append({
+                        "price": float(ask["px"]),
+                        "size": float(ask["sz"])
+                    })
+            
+            # Sort bids (descending) and asks (ascending)
+            bids.sort(key=lambda x: x["price"], reverse=True)
+            asks.sort(key=lambda x: x["price"])
+            
+            # Calculate derived values
+            best_bid = bids[0]["price"] if bids else None
+            best_ask = asks[0]["price"] if asks else None
+            mid_price = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+            spread = best_ask - best_bid if best_bid and best_ask else None
+            
+            return {
+                "symbol": symbol,
+                "bids": bids,
+                "asks": asks,
+                "timestamp": l2_data.get("time", int(time.time() * 1000)),
+                "best_bid": best_bid,
+                "best_ask": best_ask,
+                "spread": spread,
+                "mid_price": mid_price
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting order book for {symbol}: {e}")
+            raise ValueError(f"Failed to get order book for {symbol}: {str(e)}")
+
+    def get_optimal_limit_price(
+        self, 
+        symbol: str, 
+        side: str, 
+        urgency_factor: float = 0.5
+    ) -> float:
+        """Get optimal limit price by analyzing order book and urgency factor.
+        
+        Args:
+            symbol (str): Trading pair symbol (e.g., "BTC")
+            side (str): 'buy' or 'sell'
+            urgency_factor (float): Urgency factor from 0.0 to 1.0. 
+                                  0.0 = very patient (far from market), 1.0 = very aggressive (close to market)
+            
+        Returns:
+            float: Optimal limit price
+            
+        Raises:
+            ValueError: If parameters are invalid or order book data is unavailable
+        """
+        if side not in ["buy", "sell"]:
+            raise ValueError("side must be 'buy' or 'sell'")
+        
+        if not 0.0 <= urgency_factor <= 1.0:
+            raise ValueError("urgency_factor must be between 0.0 and 1.0")
+        
+        try:
+            # Get order book data
+            order_book = self.get_order_book(symbol)
+            
+            # Get current mid price as fallback
+            current_mid = self.get_price(symbol)
+            
+            if side == "buy":
+                # For buy orders, we want to place above the best bid
+                if not order_book["bids"]:
+                    # No bids available, use current price with small premium
+                    return current_mid * (1 + 0.001 * urgency_factor)
+                
+                best_bid = order_book["best_bid"]
+                
+                # Calculate optimal price based on urgency
+                # At urgency 0.0: place at best bid (very patient)
+                # At urgency 1.0: place at best ask (very aggressive)
+                if order_book["best_ask"]:
+                    # Interpolate between best bid and best ask
+                    optimal_price = best_bid + (order_book["best_ask"] - best_bid) * urgency_factor
+                else:
+                    # No asks available, place slightly above best bid
+                    optimal_price = best_bid * (1 + 0.001 * urgency_factor)
+                
+            else:  # sell
+                # For sell orders, we want to place below the best ask
+                if not order_book["asks"]:
+                    # No asks available, use current price with small discount
+                    return current_mid * (1 - 0.001 * urgency_factor)
+                
+                best_ask = order_book["best_ask"]
+                
+                # Calculate optimal price based on urgency
+                # At urgency 0.0: place at best ask (very patient)
+                # At urgency 1.0: place at best bid (very aggressive)
+                if order_book["best_bid"]:
+                    # Interpolate between best bid and best ask
+                    optimal_price = best_ask - (best_ask - order_book["best_bid"]) * urgency_factor
+                else:
+                    # No bids available, place slightly below best ask
+                    optimal_price = best_ask * (1 - 0.001 * urgency_factor)
+            
+            # Validate and format the price using existing logic
+            _, formatted_price = self._validate_and_format_order(symbol, 1.0, optimal_price)
+            
+            logger.debug(f"Optimal {side} price for {symbol}: {formatted_price:.6f} "
+                        f"(urgency: {urgency_factor:.3f}, mid: {current_mid:.6f})")
+            
+            return formatted_price
+            
+        except Exception as e:
+            logger.error(f"Error calculating optimal limit price for {symbol} {side}: {e}")
+            
+            # Fallback to current price with small adjustment
+            current_price = self.get_price(symbol)
+            if side == "buy":
+                return current_price * (1 + 0.001 * urgency_factor)  # 0.1% above current price
+            else:
+                return current_price * (1 - 0.001 * urgency_factor)  # 0.1% below current price
+
 
