@@ -176,31 +176,49 @@ class HyperliquidClient:
         size: float, 
         limit_price: Optional[float]
     ) -> tuple[float, float]:
-        """Validate and format order size and price.
+        """Validate and format order size and price using Hyperliquid SDK logic.
         
-        Follows Hyperliquid's official rounding rules:
-        - Prices must be rounded to 5 significant figures
-        - Size must be rounded based on szDecimals
+        - Prices and sizes are formatted to 8 decimal places and normalized (see float_to_wire in SDK)
         - For prices > 100k, round to integer
+        - Validates minimum position sizes based on market specs
         """
-        if symbol not in self.market_specs:
-            # Use default values for unknown markets
-            size_decimals = 3
-        else:
+        from decimal import Decimal
+
+        def format_wire(x: float) -> str:
+            # Format to 8 decimals, normalize, and return as string (like SDK)
+            rounded = "{:.8f}".format(x)
+            if abs(float(rounded) - x) >= 1e-12:
+                raise ValueError(f"float_to_wire causes rounding: {x}")
+            if rounded == "-0":
+                rounded = "0"
+            normalized = Decimal(rounded).normalize()
+            return f"{normalized:f}"
+
+        # Validate minimum position size
+        if symbol in self.market_specs:
             specs = self.market_specs[symbol]
-            size_decimals = specs["size_decimals"]
-
-        # Round size based on szDecimals
-        size = round(float(size), size_decimals)
-
-        if limit_price is not None:
-            # For prices over 100k, round to integer
-            if limit_price > 100_000:
-                limit_price = round(float(limit_price))
-            else:
-                # Round to 5 significant figures using string formatting
-                limit_price = float(f"{limit_price:.5g}")
+            size_decimals = specs.get("size_decimals", 3)
             
+            # For tokens with size_decimals = 0, size must be >= 1
+            if size_decimals == 0 and size < 1:
+                raise ValueError(f"Minimum position size for {symbol} is 1 (size_decimals=0). Got: {size}")
+            
+            # For other tokens, check if size is too small after formatting
+            min_size = 1.0 / (10 ** size_decimals)
+            if size < min_size:
+                raise ValueError(f"Minimum position size for {symbol} is {min_size} (size_decimals={size_decimals}). Got: {size}")
+
+        # For prices over 100k, round to integer
+        if limit_price is not None and limit_price > 100_000:
+            limit_price = round(limit_price)
+        elif limit_price is not None:
+            logger.debug(f"Formatting price {limit_price} for {symbol}")
+            limit_price = float(format_wire(limit_price))
+            logger.debug(f"Formatted price: {limit_price}")
+        
+        logger.debug(f"Formatting size {size} for {symbol}")
+        size = float(format_wire(size))
+        logger.debug(f"Formatted size: {size}")
         return size, limit_price
 
     def create_order(
@@ -231,11 +249,22 @@ class HyperliquidClient:
         if not self.is_authenticated():
             raise RuntimeError("This method requires authentication")
 
-        # For market orders, get current price and add slippage
+        # For market orders, get current price and add slippage (matching SDK logic)
         if limit_price is None:
+            # Get midprice like SDK does
             current_price = self.get_price(symbol)
-            slippage = 0.005  # 0.5% slippage for market orders
+            logger.debug(f"Current price for {symbol}: {current_price}")
+            
+            # Check if price is valid
+            if current_price <= 0:
+                raise ValueError(f"Invalid current price for {symbol}: {current_price}")
+                
+            slippage = 0.05  # 5% slippage like SDK DEFAULT_SLIPPAGE
             limit_price = current_price * (1 + slippage) if is_buy else current_price * (1 - slippage)
+            
+            # Round like SDK: 5 significant figures and 6 decimals for perps
+            limit_price = round(float(f"{limit_price:.5g}"), 6)
+            logger.debug(f"Calculated limit price for {symbol}: {limit_price} (slippage: {slippage})")
 
         # Debug logging
         logger.debug(f"Original limit price: {limit_price}")
@@ -243,10 +272,15 @@ class HyperliquidClient:
         # Validate and format size and price
         size, limit_price = self._validate_and_format_order(symbol, size, limit_price)
         
+        # Apply SDK price formatting for limit orders too
+        if limit_price is not None:
+            # Round like SDK: 5 significant figures and 6 decimals for perps
+            limit_price = round(float(f"{limit_price:.5g}"), 6)
+        
         # Debug logging
         logger.debug(f"Formatted limit price: {limit_price}")
 
-        # Construct order type
+        # Construct order type (matching SDK)
         order_type = {"limit": {"tif": time_in_force}}
         if post_only:
             if time_in_force == "Ioc":
@@ -1107,6 +1141,7 @@ class HyperliquidClient:
         for market in response['universe']:
             specs[market['name']] = {
                 "size_decimals": market.get('szDecimals', 3),
+                "price_decimals": market.get('px_dps', 1),  # Price decimal places
             }
         
         return specs
@@ -1771,8 +1806,12 @@ class HyperliquidClient:
             # Fallback to current price with small adjustment
             current_price = self.get_price(symbol)
             if side == "buy":
-                return current_price * (1 + 0.001 * urgency_factor)  # 0.1% above current price
+                fallback_price = current_price * (1 + 0.001 * urgency_factor)  # 0.1% above current price
             else:
-                return current_price * (1 - 0.001 * urgency_factor)  # 0.1% below current price
+                fallback_price = current_price * (1 - 0.001 * urgency_factor)  # 0.1% below current price
+            
+            # Format the fallback price properly
+            _, formatted_price = self._validate_and_format_order(symbol, 1.0, fallback_price)
+            return formatted_price
 
 
