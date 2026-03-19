@@ -421,12 +421,13 @@ class HyperliquidClient:
                         }
                         return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
                     elif statuses and "filled" in statuses[0]:
+                        filled_sz = statuses[0]["filled"].get("totalSz", size)
                         order_data = {
                             "order_id": str(statuses[0]["filled"]["oid"]),
                             "symbol": symbol,
                             "is_buy": is_buy,
                             "size": str(size),
-                            "filled_size": str(size),
+                            "filled_size": str(filled_sz),
                             "average_fill_price": str(statuses[0]["filled"]["avgPx"]),
                             "order_type": order_type,
                             "reduce_only": reduce_only,
