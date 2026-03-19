@@ -1,6 +1,5 @@
-from typing import Optional, Dict, List, Union, Literal, Tuple, Any
+from typing import Optional, Dict, List, Union, Any
 from decimal import Decimal
-import os
 from contextlib import contextmanager
 from .hyperliquid import HyperliquidClient
 from .models import (
@@ -8,9 +7,7 @@ from .models import (
     UserState,
     Position,
     Order,
-    DACITE_CONFIG
 )
-from dacite import from_dict
 
 @contextmanager
 def get_client(account: Optional[Union[Dict, HyperliquidAccount]] = None) -> HyperliquidClient:
@@ -141,25 +138,28 @@ def cancel_all_orders(symbol: Optional[str] = None,
             return new_client.cancel_all_orders(symbol)
     return client.cancel_all_orders(symbol)
 
-def cancel_order(order_id: str,
+def cancel_order(order_id: Union[str, int],
                 symbol: str,
                 account: Optional[Union[Dict, HyperliquidAccount]] = None,
                 client: Optional[HyperliquidClient] = None) -> bool:
     """Cancel a specific order by order ID and symbol.
-    
+
     Args:
-        order_id (str): The order ID to cancel
+        order_id (Union[str, int]): The order ID to cancel
         symbol (str): The symbol the order is for
         account (Optional[Union[Dict, HyperliquidAccount]]): Account credentials
         client (Optional[HyperliquidClient]): Existing client instance
-        
+
     Returns:
-        bool: True if order was successfully cancelled, False otherwise
+        bool: True if cancelled, False if order not found or already processed.
+
+    Raises:
+        Exception: On network errors, auth failures, or other unexpected errors
     """
     if client is None:
         with get_client(account) as new_client:
-            return new_client.cancel_order(int(order_id), symbol)
-    return client.cancel_order(int(order_id), symbol)
+            return new_client.cancel_order(order_id, symbol)
+    return client.cancel_order(order_id, symbol)
 
 def get_open_orders(symbol: Optional[str] = None,
                    account: Optional[Union[Dict, HyperliquidAccount]] = None,
@@ -306,3 +306,91 @@ def cancel_all(account: Optional[Union[Dict, HyperliquidAccount]] = None,
         with get_client(account) as new_client:
             return new_client.cancel_all()
     return client.cancel_all()
+
+def set_leverage(symbol: str,
+                 leverage: int,
+                 is_cross: bool = True,
+                 account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                 client: Optional[HyperliquidClient] = None) -> dict:
+    """Set leverage for a symbol."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.set_leverage(symbol, leverage, is_cross)
+    return client.set_leverage(symbol, leverage, is_cross)
+
+def add_isolated_margin(symbol: str,
+                        amount: float,
+                        account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                        client: Optional[HyperliquidClient] = None) -> dict:
+    """Add margin to an isolated position."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.add_isolated_margin(symbol, amount)
+    return client.add_isolated_margin(symbol, amount)
+
+def get_fills(symbol: Optional[str] = None,
+              account: Optional[Union[Dict, HyperliquidAccount]] = None,
+              client: Optional[HyperliquidClient] = None) -> list:
+    """Get recent fills for the authenticated user."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_fills(symbol)
+    return client.get_fills(symbol)
+
+def get_fills_by_time(start_time: int,
+                      end_time: Optional[int] = None,
+                      symbol: Optional[str] = None,
+                      account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                      client: Optional[HyperliquidClient] = None) -> list:
+    """Get fills within a time range."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_fills_by_time(start_time, end_time, symbol)
+    return client.get_fills_by_time(start_time, end_time, symbol)
+
+def get_order_status(order_id: int,
+                     account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                     client: Optional[HyperliquidClient] = None) -> dict:
+    """Query the status of a specific order."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_order_status(order_id)
+    return client.get_order_status(order_id)
+
+def bulk_order(orders: List[dict],
+               account: Optional[Union[Dict, HyperliquidAccount]] = None,
+               client: Optional[HyperliquidClient] = None) -> list:
+    """Place multiple orders atomically."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.bulk_order(orders)
+    return client.bulk_order(orders)
+
+def bulk_cancel(cancels: List[dict],
+                account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                client: Optional[HyperliquidClient] = None) -> dict:
+    """Cancel multiple orders atomically."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.bulk_cancel(cancels)
+    return client.bulk_cancel(cancels)
+
+def get_funding_history(symbol: str,
+                        start_time: int,
+                        end_time: Optional[int] = None,
+                        account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                        client: Optional[HyperliquidClient] = None) -> List[dict]:
+    """Get historical funding rates for a symbol."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_funding_history(symbol, start_time, end_time)
+    return client.get_funding_history(symbol, start_time, end_time)
+
+def get_portfolio(address: Optional[str] = None,
+                  account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                  client: Optional[HyperliquidClient] = None) -> dict:
+    """Get portfolio performance metrics."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_portfolio(address)
+    return client.get_portfolio(address)

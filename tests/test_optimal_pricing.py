@@ -160,17 +160,14 @@ class TestOptimalLimitPrice:
             client.get_optimal_limit_price("BTC", "buy", 1.5)
 
     def test_get_optimal_limit_price_fallback(self, client):
-        """Test optimal price calculation fallback when order book fails"""
+        """Test optimal price calculation raises when order book fails"""
         with patch.object(client.info, 'l2_snapshot', side_effect=Exception("API error")):
-            with patch.object(client, 'get_price', return_value=50000.0):
-                price = client.get_optimal_limit_price(
+            with pytest.raises(Exception, match="API error"):
+                client.get_optimal_limit_price(
                     symbol="BTC",
                     side="buy",
                     urgency_factor=0.5
                 )
-                
-                # Should use fallback calculation
-                assert price > 50000.0  # Should be slightly above current price
 
     def test_get_optimal_limit_price_no_bids(self, client):
         """Test optimal price calculation when no bids are available"""
@@ -188,8 +185,8 @@ class TestOptimalLimitPrice:
                     urgency_factor=0.5
                 )
                 
-                # Should use current price with small premium
-                assert price > 50000.0
+                # Should return formatted mid price when no bids
+                assert price >= 50000.0
 
     def test_get_optimal_limit_price_no_asks(self, client):
         """Test optimal price calculation when no asks are available"""
@@ -207,8 +204,8 @@ class TestOptimalLimitPrice:
                     urgency_factor=0.5
                 )
                 
-                # Should use current price with small discount
-                assert price < 50000.0
+                # Should return formatted mid price when no asks
+                assert price <= 50000.0
 
 def test_integration_optimal_pricing(client):
     """Integration test for optimal pricing with real API calls"""

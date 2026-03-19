@@ -1,138 +1,97 @@
-#!/usr/bin/env python
 """
-Simple Trailing Stop Example for HyperliquidClient
+Simple trailing stop example.
 
-This example demonstrates how to implement a basic trailing stop using asyncio.
-A trailing stop automatically adjusts the stop loss as the price moves in your favor.
+A trailing stop adjusts the stop loss as the price moves in your favor.
+This script polls the price every few seconds and updates the stop loss
+using client.trailing_stop() which is a one-shot update.
+
+Requires authentication and an open position.
 """
 
-import asyncio
 import logging
-from typing import Optional
+import time
 
 from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
 
-# Set up logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("trailing_stop")
 
-async def trailing_stop(
-    client: HyperliquidClient,
-    symbol: str,
-    trail_percent: float,
-    check_interval: float = 5.0
-) -> None:
-    """Run a trailing stop for a position.
-    
+
+def run_trailing_stop(client, symbol, trail_percent, check_interval=5.0):
+    """Run a trailing stop loop for an open position.
+
     Args:
-        client: The HyperliquidClient instance
-        symbol: The trading symbol (e.g., "BTC")
-        trail_percent: The trailing percentage (e.g., 2.0 for 2%)
-        check_interval: How often to check the price in seconds
+        client: Authenticated HyperliquidClient
+        symbol: Trading pair (e.g., "BTC")
+        trail_percent: Trail distance as percentage (e.g., 2.0 for 2%)
+        check_interval: Seconds between price checks
     """
-    # Check if position exists
     if not client.has_position(symbol):
         logger.error(f"No position found for {symbol}")
         return
-    
-    # Get position direction
-    position_direction = client.get_position_direction(symbol)
-    position_size = client.get_position_size(symbol)
-    
-    logger.info(f"Starting trailing stop for {symbol} ({position_direction} position) with {trail_percent}% trail")
-    
-    # Get current price and position size
-    current_price = client.get_price(symbol)
-    position_size_abs = abs(float(position_size))
-    
+
+    direction = client.get_position_direction(symbol)
+    logger.info(f"Starting trailing stop for {symbol} ({direction}) with {trail_percent}% trail")
+
     # Set initial stop loss if none exists
     sl_price = client.get_stop_loss_price(symbol)
     if sl_price is None:
-        # Calculate initial stop loss price
-        if position_direction == "long":
-            sl_price = current_price * (1 - trail_percent / 100)
-        else:
-            sl_price = current_price * (1 + trail_percent / 100)
-            
-        # Create initial stop loss order
-        is_buy = position_direction == "short"
-        logger.info(f"Creating initial stop loss at {sl_price:.2f}")
-        client.stop_loss(symbol, position_size_abs, float(sl_price), is_buy=is_buy)
-    else:
-        logger.info(f"Using existing stop loss at {float(sl_price):.2f}")
-    
-    # Store the reference price (highest for long, lowest for short)
-    reference_price = current_price
-    
-    try:
-        while True:
-            # Check if position still exists
-            if not client.has_position(symbol):
-                logger.info(f"Position for {symbol} closed, stopping trailing stop")
-                break
-                
-            # Get current price and stop loss
-            current_price = client.get_price(symbol)
-            sl_price = client.get_stop_loss_price(symbol)
-            
-            if sl_price is None:
-                logger.warning(f"Stop loss for {symbol} not found, stopping")
-                break
-            
-            sl_price_float = float(sl_price)
-                
-            # Update stop loss if price moved in our favor
-            if position_direction == "long":
-                if current_price > reference_price:
-                    # Update reference price and calculate new stop loss
-                    reference_price = current_price
-                    new_sl_price = reference_price * (1 - trail_percent / 100)
-                    
-                    # Only update if the new stop loss is higher
-                    if new_sl_price > sl_price_float:
-                        logger.info(f"Updating stop loss to {new_sl_price:.2f}")
-                        client.update_stop_loss(symbol, new_sl_price)
-            else:  # Short position
-                if current_price < reference_price:
-                    # Update reference price and calculate new stop loss
-                    reference_price = current_price
-                    new_sl_price = reference_price * (1 + trail_percent / 100)
-                    
-                    # Only update if the new stop loss is lower
-                    if new_sl_price < sl_price_float:
-                        logger.info(f"Updating stop loss to {new_sl_price:.2f}")
-                        client.update_stop_loss(symbol, new_sl_price)
-            
-            # Wait before checking again
-            await asyncio.sleep(check_interval)
-    except Exception as e:
-        logger.error(f"Error in trailing stop: {str(e)}")
+        logger.info("No existing stop loss, creating one...")
+        order = client.trailing_stop(symbol, trail_percent)
+        logger.info(f"Initial stop loss set: {order}")
+
+    reference_price = client.get_price(symbol)
+
+    while True:
+        if not client.has_position(symbol):
+            logger.info(f"Position for {symbol} closed, stopping")
+            break
+
+        current_price = client.get_price(symbol)
+        sl_price = client.get_stop_loss_price(symbol)
+
+        if sl_price is None:
+            logger.warning("Stop loss disappeared, stopping")
+            break
+
+        sl_float = float(sl_price)
+
+        # Only move the stop loss in our favor, never against us
+        if direction == "long" and current_price > reference_price:
+            reference_price = current_price
+            new_sl = reference_price * (1 - trail_percent / 100)
+            if new_sl > sl_float:
+                logger.info(f"Price {current_price:,.2f} -> moving SL from {sl_float:,.2f} to {new_sl:,.2f}")
+                client.update_stop_loss(symbol, new_sl)
+
+        elif direction == "short" and current_price < reference_price:
+            reference_price = current_price
+            new_sl = reference_price * (1 + trail_percent / 100)
+            if new_sl < sl_float:
+                logger.info(f"Price {current_price:,.2f} -> moving SL from {sl_float:,.2f} to {new_sl:,.2f}")
+                client.update_stop_loss(symbol, new_sl)
+
+        time.sleep(check_interval)
 
 
-async def main():
-    # Create client from environment variables
-    account = HyperliquidAccount.from_env()
-    client = HyperliquidClient(account=account)
-    
-    # Configuration
-    symbol = "BTC"  # Change to your symbol
+def main():
+    client = HyperliquidClient()
+
+    symbol = "BTC"
     trail_percent = 2.0  # 2% trailing stop
-    
-    # Ensure you have an open position
+
     if not client.has_position(symbol):
-        print(f"No position for {symbol}. Please open a position first.")
+        print(f"No position for {symbol}. Open a position first.")
         return
-    
+
     print(f"Starting trailing stop for {symbol} with {trail_percent}% trail")
     print("Press Ctrl+C to stop")
-    
+
     try:
-        await trailing_stop(client, symbol, trail_percent)
+        run_trailing_stop(client, symbol, trail_percent)
     except KeyboardInterrupt:
-        print("Trailing stop terminated by user")
+        print("\nStopped by user")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-
-
+    main()

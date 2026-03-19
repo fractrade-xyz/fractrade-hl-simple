@@ -66,39 +66,53 @@ class HyperliquidAccount:
     def __str__(self) -> str:
         return f"HyperliquidAccount(public_address={self.public_address})"
 
+    def __repr__(self) -> str:
+        return f"HyperliquidAccount(public_address={self.public_address})"
+
 @dataclass(slots=True, kw_only=True)
 class Leverage:
+    """Leverage configuration for a position."""
     type: Literal["cross", "isolated"]
     value: Decimal
 
 @dataclass(slots=True, kw_only=True)
 class Position:
+    """An open perpetual futures position."""
     symbol: str
     entry_price: Optional[Decimal]
     leverage: Leverage
     liquidation_price: Optional[Decimal]
     margin_used: Decimal
-    max_trade_sizes: Optional[List[Decimal]] = None
     position_value: Decimal
     return_on_equity: Decimal
     size: Decimal
     unrealized_pnl: Decimal
+    max_trade_sizes: Optional[List[Decimal]] = None
     
     @property
     def is_long(self) -> bool:
         return self.size > 0
-    
+
     @property
     def is_short(self) -> bool:
         return self.size < 0
 
+    def __repr__(self) -> str:
+        direction = "LONG" if self.is_long else "SHORT"
+        return (
+            f"Position({self.symbol} {direction} {self.size} "
+            f"@ {self.entry_price} pnl={self.unrealized_pnl})"
+        )
+
 @dataclass(slots=True, kw_only=True)
 class AssetPosition:
+    """Wrapper around a Position with its margin mode."""
     position: Position
     type: Literal["oneWay"]
 
 @dataclass(slots=True, kw_only=True)
 class MarginSummary:
+    """Account margin summary with balances and usage."""
     account_value: Decimal
     total_margin_used: Decimal
     total_ntl_pos: Decimal
@@ -127,16 +141,39 @@ class UserState:
     margin_summary: MarginSummary
     cross_margin_summary: MarginSummary
     withdrawable: Decimal
-    spot_state: Optional[SpotState] = None  # Add spot state to UserState
+    spot_state: Optional[SpotState] = None
+
+@dataclass(slots=True, kw_only=True)
+class Fill:
+    """Represents a trade fill."""
+    symbol: str
+    side: str
+    price: Decimal
+    size: Decimal
+    closed_pnl: Decimal
+    direction: str
+    order_id: int
+    crossed: bool
+    time: int
+    hash: str
+    fee: Optional[Decimal] = None
+
+    def __repr__(self) -> str:
+        return (
+            f"Fill({self.symbol} {self.direction} {self.size} "
+            f"@ {self.price} pnl={self.closed_pnl})"
+        )
 
 @dataclass(slots=True, kw_only=True)
 class OrderType:
-    limit: Optional[Dict[str, Union[Decimal, bool]]]
-    market: Optional[Dict]
-    trigger: Optional[Dict[str, Union[Decimal, bool, str]]]
+    """Order type specification. Only one of limit, market, or trigger is set."""
+    limit: Optional[Dict[str, Union[Decimal, bool]]] = None
+    market: Optional[Dict] = None
+    trigger: Optional[Dict[str, Union[Decimal, bool, str]]] = None
 
 @dataclass(slots=True, kw_only=True)
 class Order:
+    """An order on the exchange (open, filled, or cancelled)."""
     order_id: str
     symbol: str
     is_buy: bool
@@ -164,6 +201,14 @@ class Order:
     @property
     def is_active(self) -> bool:
         return self.status == "open"
+
+    def __repr__(self) -> str:
+        side = "BUY" if self.is_buy else "SELL"
+        price = self.limit_price or self.trigger_price or "MKT"
+        return (
+            f"Order({self.symbol} {side} {self.size} @ {price} "
+            f"[{self.status}] id={self.order_id})"
+        )
 
 DACITE_CONFIG = DaciteConfig(
     cast=[Decimal, int],
@@ -210,241 +255,236 @@ def convert_api_response(response: dict) -> dict:
             converted[model_key] = value
     return converted
 
-# Market specifications for all pairs
+# Fallback market specifications, used when the API is unreachable at init.
+# Updated 2026-03-18 (229 markets). Live specs are fetched from the API on client init.
 MARKET_SPECS = {
-    "AAVE": {"size_decimals": 2, "price_decimals": 1},
-    "ACE": {"size_decimals": 2, "price_decimals": 1},
-    "ADA": {"size_decimals": 0, "price_decimals": 1},
-    "AI": {"size_decimals": 1, "price_decimals": 1},
-    "AI16Z": {"size_decimals": 1, "price_decimals": 1},
-    "AIXBT": {"size_decimals": 0, "price_decimals": 1},
-    "ALGO": {"size_decimals": 0, "price_decimals": 1},
-    "ALT": {"size_decimals": 0, "price_decimals": 1},
-    "ANIME": {"size_decimals": 0, "price_decimals": 1},
-    "APE": {"size_decimals": 1, "price_decimals": 1},
-    "APT": {"size_decimals": 2, "price_decimals": 1},
-    "AR": {"size_decimals": 2, "price_decimals": 1},
-    "ARB": {"size_decimals": 1, "price_decimals": 1},
-    "ARK": {"size_decimals": 0, "price_decimals": 1},
-    "ATOM": {"size_decimals": 2, "price_decimals": 1},
-    "AVAX": {"size_decimals": 2, "price_decimals": 1},
-    "BADGER": {"size_decimals": 1, "price_decimals": 1},
-    "BANANA": {"size_decimals": 1, "price_decimals": 1},
-    "BCH": {"size_decimals": 3, "price_decimals": 1},
-    "BERA": {"size_decimals": 1, "price_decimals": 1},
-    "BIGTIME": {"size_decimals": 0, "price_decimals": 1},
-    "BIO": {"size_decimals": 0, "price_decimals": 1},
-    "BLAST": {"size_decimals": 0, "price_decimals": 1},
-    "BLUR": {"size_decimals": 0, "price_decimals": 1},
-    "BLZ": {"size_decimals": 0, "price_decimals": 1},
-    "BNB": {"size_decimals": 3, "price_decimals": 1},
-    "BNT": {"size_decimals": 0, "price_decimals": 1},
-    "BOME": {"size_decimals": 0, "price_decimals": 1},
-    "BRETT": {"size_decimals": 0, "price_decimals": 1},
-    "BSV": {"size_decimals": 2, "price_decimals": 1},
-    "BTC": {
-        "size_decimals": 5,
-        "price_decimals": 1,
-        "tick_size": 0.1  # $0.1 minimum price increment
-    },
-    "CAKE": {"size_decimals": 1, "price_decimals": 1},
-    "CANTO": {"size_decimals": 0, "price_decimals": 1},
-    "CATI": {"size_decimals": 0, "price_decimals": 1},
-    "CELO": {"size_decimals": 0, "price_decimals": 1},
-    "CFX": {"size_decimals": 0, "price_decimals": 1},
-    "CHILLGUY": {"size_decimals": 0, "price_decimals": 1},
-    "COMP": {"size_decimals": 2, "price_decimals": 1},
-    "CRV": {"size_decimals": 1, "price_decimals": 1},
-    "CYBER": {"size_decimals": 1, "price_decimals": 1},
-    "DOGE": {"size_decimals": 0, "price_decimals": 1},
-    "DOT": {"size_decimals": 1, "price_decimals": 1},
-    "DYDX": {"size_decimals": 1, "price_decimals": 1},
-    "DYM": {"size_decimals": 1, "price_decimals": 1},
-    "EIGEN": {"size_decimals": 2, "price_decimals": 1},
-    "ENA": {"size_decimals": 0, "price_decimals": 1},
-    "ENS": {"size_decimals": 2, "price_decimals": 1},
-    "ETC": {"size_decimals": 2, "price_decimals": 1},
-    "ETH": {
-        "size_decimals": 4,
-        "price_decimals": 1,
-        "tick_size": 0.1
-    },
-    "ETHFI": {"size_decimals": 1, "price_decimals": 1},
-    "FARTCOIN": {"size_decimals": 1, "price_decimals": 1},
-    "FET": {"size_decimals": 0, "price_decimals": 1},
-    "FIL": {"size_decimals": 1, "price_decimals": 1},
-    "FRIEND": {"size_decimals": 1, "price_decimals": 1},
-    "FTM": {"size_decimals": 0, "price_decimals": 1},
-    "FTT": {"size_decimals": 1, "price_decimals": 1},
-    "FXS": {"size_decimals": 1, "price_decimals": 1},
-    "GALA": {"size_decimals": 0, "price_decimals": 1},
-    "GAS": {"size_decimals": 1, "price_decimals": 1},
-    "GMT": {"size_decimals": 0, "price_decimals": 1},
-    "GMX": {"size_decimals": 2, "price_decimals": 1},
-    "GOAT": {"size_decimals": 0, "price_decimals": 1},
-    "GRASS": {"size_decimals": 1, "price_decimals": 1},
-    "GRIFFAIN": {"size_decimals": 0, "price_decimals": 1},
-    "HBAR": {"size_decimals": 0, "price_decimals": 1},
-    "HMSTR": {"size_decimals": 0, "price_decimals": 1},
-    "HPOS": {"size_decimals": 0, "price_decimals": 1},
-    "HYPE": {"size_decimals": 2, "price_decimals": 1},
-    "ILV": {"size_decimals": 2, "price_decimals": 1},
-    "IMX": {"size_decimals": 1, "price_decimals": 1},
-    "INJ": {"size_decimals": 1, "price_decimals": 1},
-    "IO": {"size_decimals": 1, "price_decimals": 1},
-    "IOTA": {"size_decimals": 0, "price_decimals": 1},
-    "IP": {"size_decimals": 1, "price_decimals": 1},
-    "JELLY": {"size_decimals": 0, "price_decimals": 1},
-    "JTO": {"size_decimals": 0, "price_decimals": 1},
-    "JUP": {"size_decimals": 0, "price_decimals": 1},
-    "KAITO": {"size_decimals": 0, "price_decimals": 1},
-    "KAS": {"size_decimals": 0, "price_decimals": 1},
-    "LAYER": {"size_decimals": 0, "price_decimals": 1},
-    "LDO": {"size_decimals": 1, "price_decimals": 1},
-    "LINK": {"size_decimals": 1, "price_decimals": 1},
-    "LISTA": {"size_decimals": 0, "price_decimals": 1},
-    "LOOM": {"size_decimals": 0, "price_decimals": 1},
-    "LTC": {"size_decimals": 2, "price_decimals": 1},
-    "MANTA": {"size_decimals": 1, "price_decimals": 1},
-    "MATIC": {"size_decimals": 1, "price_decimals": 1},
-    "MAV": {"size_decimals": 0, "price_decimals": 1},
-    "MAVIA": {"size_decimals": 1, "price_decimals": 1},
-    "ME": {"size_decimals": 1, "price_decimals": 1},
-    "MELANIA": {"size_decimals": 1, "price_decimals": 1},
-    "MEME": {"size_decimals": 0, "price_decimals": 1},
-    "MERL": {"size_decimals": 0, "price_decimals": 1},
-    "MEW": {"size_decimals": 0, "price_decimals": 1},
-    "MINA": {"size_decimals": 0, "price_decimals": 1},
-    "MKR": {"size_decimals": 4, "price_decimals": 1},
-    "MNT": {"size_decimals": 1, "price_decimals": 1},
-    "MOODENG": {"size_decimals": 0, "price_decimals": 1},
-    "MORPHO": {"size_decimals": 1, "price_decimals": 1},
-    "MOVE": {"size_decimals": 0, "price_decimals": 1},
-    "MYRO": {"size_decimals": 0, "price_decimals": 1},
-    "NEAR": {"size_decimals": 1, "price_decimals": 1},
-    "NEIROETH": {"size_decimals": 0, "price_decimals": 1},
-    "NEO": {"size_decimals": 2, "price_decimals": 1},
-    "NFTI": {"size_decimals": 1, "price_decimals": 1},
-    "NOT": {"size_decimals": 0, "price_decimals": 1},
-    "NTRN": {"size_decimals": 0, "price_decimals": 1},
-    "OGN": {"size_decimals": 0, "price_decimals": 1},
-    "OM": {"size_decimals": 1, "price_decimals": 1},
-    "OMNI": {"size_decimals": 2, "price_decimals": 1},
-    "ONDO": {"size_decimals": 0, "price_decimals": 1},
-    "OP": {"size_decimals": 1, "price_decimals": 1},
-    "ORBS": {"size_decimals": 0, "price_decimals": 1},
-    "ORDI": {"size_decimals": 2, "price_decimals": 1},
-    "OX": {"size_decimals": 0, "price_decimals": 1},
-    "PANDORA": {"size_decimals": 5, "price_decimals": 1},
-    "PENDLE": {"size_decimals": 0, "price_decimals": 1},
-    "PENGU": {"size_decimals": 0, "price_decimals": 1},
-    "PEOPLE": {"size_decimals": 0, "price_decimals": 1},
-    "PIXEL": {"size_decimals": 0, "price_decimals": 1},
-    "PNUT": {"size_decimals": 1, "price_decimals": 1},
-    "POL": {"size_decimals": 0, "price_decimals": 1},
-    "POLYX": {"size_decimals": 0, "price_decimals": 1},
-    "POPCAT": {"size_decimals": 0, "price_decimals": 1},
-    "PURR": {"size_decimals": 0, "price_decimals": 1},
-    "PYTH": {"size_decimals": 0, "price_decimals": 1},
-    "RDNT": {"size_decimals": 0, "price_decimals": 1},
-    "RENDER": {"size_decimals": 1, "price_decimals": 1},
-    "REQ": {"size_decimals": 0, "price_decimals": 1},
-    "REZ": {"size_decimals": 0, "price_decimals": 1},
-    "RLB": {"size_decimals": 0, "price_decimals": 1},
-    "RNDR": {"size_decimals": 1, "price_decimals": 1},
-    "RSR": {"size_decimals": 0, "price_decimals": 1},
-    "RUNE": {"size_decimals": 1, "price_decimals": 1},
-    "S": {"size_decimals": 0, "price_decimals": 1},
-    "SAGA": {"size_decimals": 1, "price_decimals": 1},
-    "SAND": {"size_decimals": 0, "price_decimals": 1},
-    "SCR": {"size_decimals": 1, "price_decimals": 1},
-    "SEI": {"size_decimals": 0, "price_decimals": 1},
-    "SHIA": {"size_decimals": 0, "price_decimals": 1},
-    "SNX": {"size_decimals": 1, "price_decimals": 1},
-    "SOL": {"size_decimals": 2, "price_decimals": 1},
-    "SPX": {"size_decimals": 1, "price_decimals": 1},
-    "STG": {"size_decimals": 0, "price_decimals": 1},
-    "STRAX": {"size_decimals": 0, "price_decimals": 1},
-    "STRK": {"size_decimals": 1, "price_decimals": 1},
-    "STX": {"size_decimals": 1, "price_decimals": 1},
-    "SUI": {"size_decimals": 1, "price_decimals": 1},
-    "SUPER": {"size_decimals": 0, "price_decimals": 1},
-    "SUSHI": {"size_decimals": 1, "price_decimals": 1},
-    "TAO": {"size_decimals": 3, "price_decimals": 1},
-    "TIA": {"size_decimals": 1, "price_decimals": 1},
-    "TNSR": {"size_decimals": 1, "price_decimals": 1},
-    "TON": {"size_decimals": 1, "price_decimals": 1},
-    "TRB": {"size_decimals": 2, "price_decimals": 1},
-    "TRUMP": {"size_decimals": 1, "price_decimals": 1},
-    "TRX": {"size_decimals": 0, "price_decimals": 1},
-    "TST": {"size_decimals": 0, "price_decimals": 1},
-    "TURBO": {"size_decimals": 0, "price_decimals": 1},
-    "UMA": {"size_decimals": 1, "price_decimals": 1},
-    "UNI": {"size_decimals": 1, "price_decimals": 1},
-    "UNIBOT": {"size_decimals": 3, "price_decimals": 1},
-    "USTC": {"size_decimals": 0, "price_decimals": 1},
-    "USUAL": {"size_decimals": 1, "price_decimals": 1},
-    "VINE": {"size_decimals": 0, "price_decimals": 1},
-    "VIRTUAL": {"size_decimals": 1, "price_decimals": 1},
-    "VVV": {"size_decimals": 2, "price_decimals": 1},
-    "W": {"size_decimals": 1, "price_decimals": 1},
-    "WIF": {"size_decimals": 0, "price_decimals": 1},
-    "WLD": {"size_decimals": 1, "price_decimals": 1},
-    "XAI": {"size_decimals": 1, "price_decimals": 1},
-    "XLM": {"size_decimals": 0, "price_decimals": 1},
-    "XRP": {"size_decimals": 0, "price_decimals": 1},
-    "YGG": {"size_decimals": 0, "price_decimals": 1},
-    "ZEN": {"size_decimals": 2, "price_decimals": 1},
-    "ZEREBRO": {"size_decimals": 0, "price_decimals": 1},
-    "ZETA": {"size_decimals": 1, "price_decimals": 1},
-    "ZK": {"size_decimals": 0, "price_decimals": 1},
-    "ZRO": {"size_decimals": 1, "price_decimals": 1},
-    "kBONK": {"size_decimals": 0, "price_decimals": 1},
-    "kDOGS": {"size_decimals": 0, "price_decimals": 1},
-    "kFLOKI": {"size_decimals": 0, "price_decimals": 1},
-    "kLUNC": {"size_decimals": 0, "price_decimals": 1},
-    "kNEIRO": {"size_decimals": 1, "price_decimals": 1},
-    "kPEPE": {"size_decimals": 0, "price_decimals": 1},
-    "kSHIB": {"size_decimals": 0, "price_decimals": 1},
+    "0G": {"size_decimals": 0, "max_leverage": 3},
+    "2Z": {"size_decimals": 0, "max_leverage": 3},
+    "AAVE": {"size_decimals": 2, "max_leverage": 10},
+    "ACE": {"size_decimals": 2, "max_leverage": 3},
+    "ADA": {"size_decimals": 0, "max_leverage": 10},
+    "AERO": {"size_decimals": 0, "max_leverage": 3},
+    "AI": {"size_decimals": 1, "max_leverage": 3},
+    "AI16Z": {"size_decimals": 1, "max_leverage": 5},
+    "AIXBT": {"size_decimals": 0, "max_leverage": 3},
+    "ALGO": {"size_decimals": 0, "max_leverage": 5},
+    "ALT": {"size_decimals": 0, "max_leverage": 3},
+    "ANIME": {"size_decimals": 0, "max_leverage": 3},
+    "APE": {"size_decimals": 1, "max_leverage": 5},
+    "APEX": {"size_decimals": 0, "max_leverage": 3},
+    "APT": {"size_decimals": 2, "max_leverage": 10},
+    "AR": {"size_decimals": 2, "max_leverage": 5},
+    "ARB": {"size_decimals": 1, "max_leverage": 10},
+    "ARK": {"size_decimals": 0, "max_leverage": 3},
+    "ASTER": {"size_decimals": 0, "max_leverage": 5},
+    "ATOM": {"size_decimals": 2, "max_leverage": 5},
+    "AVAX": {"size_decimals": 2, "max_leverage": 10},
+    "AVNT": {"size_decimals": 0, "max_leverage": 5},
+    "AXS": {"size_decimals": 1, "max_leverage": 5},
+    "AZTEC": {"size_decimals": 0, "max_leverage": 3},
+    "BABY": {"size_decimals": 0, "max_leverage": 3},
+    "BADGER": {"size_decimals": 1, "max_leverage": 5},
+    "BANANA": {"size_decimals": 1, "max_leverage": 3},
+    "BCH": {"size_decimals": 3, "max_leverage": 10},
+    "BERA": {"size_decimals": 1, "max_leverage": 5},
+    "BIGTIME": {"size_decimals": 0, "max_leverage": 3},
+    "BIO": {"size_decimals": 0, "max_leverage": 3},
+    "BLAST": {"size_decimals": 0, "max_leverage": 3},
+    "BLUR": {"size_decimals": 0, "max_leverage": 3},
+    "BLZ": {"size_decimals": 0, "max_leverage": 5},
+    "BNB": {"size_decimals": 3, "max_leverage": 10},
+    "BNT": {"size_decimals": 0, "max_leverage": 3},
+    "BOME": {"size_decimals": 0, "max_leverage": 3},
+    "BRETT": {"size_decimals": 0, "max_leverage": 3},
+    "BSV": {"size_decimals": 2, "max_leverage": 3},
+    "BTC": {"size_decimals": 5, "max_leverage": 40},
+    "CAKE": {"size_decimals": 1, "max_leverage": 3},
+    "CANTO": {"size_decimals": 0, "max_leverage": 5},
+    "CATI": {"size_decimals": 0, "max_leverage": 3},
+    "CC": {"size_decimals": 0, "max_leverage": 3},
+    "CELO": {"size_decimals": 0, "max_leverage": 3},
+    "CFX": {"size_decimals": 0, "max_leverage": 5},
+    "CHILLGUY": {"size_decimals": 0, "max_leverage": 3},
+    "COMP": {"size_decimals": 2, "max_leverage": 5},
+    "CRV": {"size_decimals": 1, "max_leverage": 10},
+    "CYBER": {"size_decimals": 1, "max_leverage": 3},
+    "DASH": {"size_decimals": 2, "max_leverage": 5},
+    "DOGE": {"size_decimals": 0, "max_leverage": 10},
+    "DOOD": {"size_decimals": 0, "max_leverage": 3},
+    "DOT": {"size_decimals": 1, "max_leverage": 10},
+    "DYDX": {"size_decimals": 1, "max_leverage": 5},
+    "DYM": {"size_decimals": 1, "max_leverage": 3},
+    "EIGEN": {"size_decimals": 2, "max_leverage": 5},
+    "ENA": {"size_decimals": 0, "max_leverage": 10},
+    "ENS": {"size_decimals": 2, "max_leverage": 5},
+    "ETC": {"size_decimals": 2, "max_leverage": 5},
+    "ETH": {"size_decimals": 4, "max_leverage": 25},
+    "ETHFI": {"size_decimals": 1, "max_leverage": 5},
+    "FARTCOIN": {"size_decimals": 1, "max_leverage": 10},
+    "FET": {"size_decimals": 0, "max_leverage": 5},
+    "FIL": {"size_decimals": 1, "max_leverage": 5},
+    "FOGO": {"size_decimals": 0, "max_leverage": 3},
+    "FRIEND": {"size_decimals": 1, "max_leverage": 3},
+    "FTM": {"size_decimals": 0, "max_leverage": 10},
+    "FTT": {"size_decimals": 1, "max_leverage": 3},
+    "FXS": {"size_decimals": 1, "max_leverage": 5},
+    "GALA": {"size_decimals": 0, "max_leverage": 3},
+    "GAS": {"size_decimals": 1, "max_leverage": 3},
+    "GMT": {"size_decimals": 0, "max_leverage": 3},
+    "GMX": {"size_decimals": 2, "max_leverage": 3},
+    "GOAT": {"size_decimals": 0, "max_leverage": 3},
+    "GRASS": {"size_decimals": 1, "max_leverage": 3},
+    "GRIFFAIN": {"size_decimals": 0, "max_leverage": 3},
+    "HBAR": {"size_decimals": 0, "max_leverage": 5},
+    "HEMI": {"size_decimals": 0, "max_leverage": 3},
+    "HMSTR": {"size_decimals": 0, "max_leverage": 3},
+    "HPOS": {"size_decimals": 0, "max_leverage": 3},
+    "HYPE": {"size_decimals": 2, "max_leverage": 10},
+    "HYPER": {"size_decimals": 0, "max_leverage": 3},
+    "ICP": {"size_decimals": 1, "max_leverage": 5},
+    "ILV": {"size_decimals": 2, "max_leverage": 3},
+    "IMX": {"size_decimals": 1, "max_leverage": 5},
+    "INIT": {"size_decimals": 0, "max_leverage": 3},
+    "INJ": {"size_decimals": 1, "max_leverage": 10},
+    "IO": {"size_decimals": 1, "max_leverage": 3},
+    "IOTA": {"size_decimals": 0, "max_leverage": 3},
+    "IP": {"size_decimals": 1, "max_leverage": 3},
+    "JELLY": {"size_decimals": 0, "max_leverage": 3},
+    "JTO": {"size_decimals": 0, "max_leverage": 5},
+    "JUP": {"size_decimals": 0, "max_leverage": 10},
+    "KAITO": {"size_decimals": 0, "max_leverage": 5},
+    "KAS": {"size_decimals": 0, "max_leverage": 3},
+    "LAUNCHCOIN": {"size_decimals": 0, "max_leverage": 3},
+    "LAYER": {"size_decimals": 0, "max_leverage": 3},
+    "LDO": {"size_decimals": 1, "max_leverage": 10},
+    "LINEA": {"size_decimals": 0, "max_leverage": 3},
+    "LINK": {"size_decimals": 1, "max_leverage": 10},
+    "LISTA": {"size_decimals": 0, "max_leverage": 3},
+    "LIT": {"size_decimals": 0, "max_leverage": 5},
+    "LOOM": {"size_decimals": 0, "max_leverage": 10},
+    "LTC": {"size_decimals": 2, "max_leverage": 10},
+    "MANTA": {"size_decimals": 1, "max_leverage": 3},
+    "MATIC": {"size_decimals": 1, "max_leverage": 20},
+    "MAV": {"size_decimals": 0, "max_leverage": 3},
+    "MAVIA": {"size_decimals": 1, "max_leverage": 3},
+    "ME": {"size_decimals": 1, "max_leverage": 3},
+    "MEGA": {"size_decimals": 0, "max_leverage": 3},
+    "MELANIA": {"size_decimals": 1, "max_leverage": 3},
+    "MEME": {"size_decimals": 0, "max_leverage": 3},
+    "MERL": {"size_decimals": 0, "max_leverage": 3},
+    "MET": {"size_decimals": 0, "max_leverage": 3},
+    "MEW": {"size_decimals": 0, "max_leverage": 3},
+    "MINA": {"size_decimals": 0, "max_leverage": 3},
+    "MKR": {"size_decimals": 4, "max_leverage": 10},
+    "MNT": {"size_decimals": 1, "max_leverage": 5},
+    "MON": {"size_decimals": 0, "max_leverage": 5},
+    "MOODENG": {"size_decimals": 0, "max_leverage": 3},
+    "MORPHO": {"size_decimals": 1, "max_leverage": 5},
+    "MOVE": {"size_decimals": 0, "max_leverage": 3},
+    "MYRO": {"size_decimals": 0, "max_leverage": 3},
+    "NEAR": {"size_decimals": 1, "max_leverage": 10},
+    "NEIROETH": {"size_decimals": 0, "max_leverage": 5},
+    "NEO": {"size_decimals": 2, "max_leverage": 5},
+    "NFTI": {"size_decimals": 1, "max_leverage": 3},
+    "NIL": {"size_decimals": 0, "max_leverage": 3},
+    "NOT": {"size_decimals": 0, "max_leverage": 3},
+    "NTRN": {"size_decimals": 0, "max_leverage": 3},
+    "NXPC": {"size_decimals": 0, "max_leverage": 3},
+    "OGN": {"size_decimals": 0, "max_leverage": 3},
+    "OM": {"size_decimals": 1, "max_leverage": 3},
+    "OMNI": {"size_decimals": 2, "max_leverage": 3},
+    "ONDO": {"size_decimals": 0, "max_leverage": 10},
+    "OP": {"size_decimals": 1, "max_leverage": 10},
+    "ORBS": {"size_decimals": 0, "max_leverage": 3},
+    "ORDI": {"size_decimals": 2, "max_leverage": 3},
+    "OX": {"size_decimals": 0, "max_leverage": 3},
+    "PANDORA": {"size_decimals": 5, "max_leverage": 3},
+    "PAXG": {"size_decimals": 3, "max_leverage": 10},
+    "PENDLE": {"size_decimals": 0, "max_leverage": 5},
+    "PENGU": {"size_decimals": 0, "max_leverage": 5},
+    "PEOPLE": {"size_decimals": 0, "max_leverage": 3},
+    "PIXEL": {"size_decimals": 0, "max_leverage": 3},
+    "PNUT": {"size_decimals": 1, "max_leverage": 3},
+    "POL": {"size_decimals": 0, "max_leverage": 5},
+    "POLYX": {"size_decimals": 0, "max_leverage": 3},
+    "POPCAT": {"size_decimals": 0, "max_leverage": 3},
+    "PROMPT": {"size_decimals": 0, "max_leverage": 3},
+    "PROVE": {"size_decimals": 0, "max_leverage": 3},
+    "PUMP": {"size_decimals": 0, "max_leverage": 10},
+    "PURR": {"size_decimals": 0, "max_leverage": 3},
+    "PYTH": {"size_decimals": 0, "max_leverage": 5},
+    "RDNT": {"size_decimals": 0, "max_leverage": 5},
+    "RENDER": {"size_decimals": 1, "max_leverage": 5},
+    "REQ": {"size_decimals": 0, "max_leverage": 3},
+    "RESOLV": {"size_decimals": 0, "max_leverage": 3},
+    "REZ": {"size_decimals": 0, "max_leverage": 3},
+    "RLB": {"size_decimals": 0, "max_leverage": 3},
+    "RNDR": {"size_decimals": 1, "max_leverage": 20},
+    "RSR": {"size_decimals": 0, "max_leverage": 3},
+    "RUNE": {"size_decimals": 1, "max_leverage": 5},
+    "S": {"size_decimals": 0, "max_leverage": 5},
+    "SAGA": {"size_decimals": 1, "max_leverage": 3},
+    "SAND": {"size_decimals": 0, "max_leverage": 5},
+    "SCR": {"size_decimals": 1, "max_leverage": 3},
+    "SEI": {"size_decimals": 0, "max_leverage": 10},
+    "SHIA": {"size_decimals": 0, "max_leverage": 3},
+    "SKR": {"size_decimals": 0, "max_leverage": 3},
+    "SKY": {"size_decimals": 0, "max_leverage": 3},
+    "SNX": {"size_decimals": 1, "max_leverage": 3},
+    "SOL": {"size_decimals": 2, "max_leverage": 20},
+    "SOPH": {"size_decimals": 0, "max_leverage": 3},
+    "SPX": {"size_decimals": 1, "max_leverage": 5},
+    "STABLE": {"size_decimals": 0, "max_leverage": 3},
+    "STBL": {"size_decimals": 0, "max_leverage": 3},
+    "STG": {"size_decimals": 0, "max_leverage": 3},
+    "STRAX": {"size_decimals": 0, "max_leverage": 10},
+    "STRK": {"size_decimals": 1, "max_leverage": 5},
+    "STX": {"size_decimals": 1, "max_leverage": 5},
+    "SUI": {"size_decimals": 1, "max_leverage": 10},
+    "SUPER": {"size_decimals": 0, "max_leverage": 3},
+    "SUSHI": {"size_decimals": 1, "max_leverage": 3},
+    "SYRUP": {"size_decimals": 0, "max_leverage": 3},
+    "TAO": {"size_decimals": 3, "max_leverage": 5},
+    "TIA": {"size_decimals": 1, "max_leverage": 10},
+    "TNSR": {"size_decimals": 1, "max_leverage": 3},
+    "TON": {"size_decimals": 1, "max_leverage": 10},
+    "TRB": {"size_decimals": 2, "max_leverage": 3},
+    "TRUMP": {"size_decimals": 1, "max_leverage": 10},
+    "TRX": {"size_decimals": 0, "max_leverage": 10},
+    "TST": {"size_decimals": 0, "max_leverage": 3},
+    "TURBO": {"size_decimals": 0, "max_leverage": 3},
+    "UMA": {"size_decimals": 1, "max_leverage": 3},
+    "UNI": {"size_decimals": 1, "max_leverage": 10},
+    "UNIBOT": {"size_decimals": 3, "max_leverage": 3},
+    "USTC": {"size_decimals": 0, "max_leverage": 3},
+    "USUAL": {"size_decimals": 1, "max_leverage": 3},
+    "VINE": {"size_decimals": 0, "max_leverage": 3},
+    "VIRTUAL": {"size_decimals": 1, "max_leverage": 5},
+    "VVV": {"size_decimals": 2, "max_leverage": 3},
+    "W": {"size_decimals": 1, "max_leverage": 5},
+    "WCT": {"size_decimals": 0, "max_leverage": 3},
+    "WIF": {"size_decimals": 0, "max_leverage": 5},
+    "WLD": {"size_decimals": 1, "max_leverage": 10},
+    "WLFI": {"size_decimals": 0, "max_leverage": 5},
+    "XAI": {"size_decimals": 1, "max_leverage": 3},
+    "XLM": {"size_decimals": 0, "max_leverage": 5},
+    "XMR": {"size_decimals": 3, "max_leverage": 5},
+    "XPL": {"size_decimals": 0, "max_leverage": 10},
+    "XRP": {"size_decimals": 0, "max_leverage": 20},
+    "YGG": {"size_decimals": 0, "max_leverage": 3},
+    "YZY": {"size_decimals": 0, "max_leverage": 3},
+    "ZEC": {"size_decimals": 2, "max_leverage": 10},
+    "ZEN": {"size_decimals": 2, "max_leverage": 5},
+    "ZEREBRO": {"size_decimals": 0, "max_leverage": 3},
+    "ZETA": {"size_decimals": 1, "max_leverage": 3},
+    "ZK": {"size_decimals": 0, "max_leverage": 5},
+    "ZORA": {"size_decimals": 0, "max_leverage": 3},
+    "ZRO": {"size_decimals": 1, "max_leverage": 5},
+    "kBONK": {"size_decimals": 0, "max_leverage": 10},
+    "kDOGS": {"size_decimals": 0, "max_leverage": 3},
+    "kFLOKI": {"size_decimals": 0, "max_leverage": 5},
+    "kLUNC": {"size_decimals": 0, "max_leverage": 3},
+    "kNEIRO": {"size_decimals": 1, "max_leverage": 3},
+    "kPEPE": {"size_decimals": 0, "max_leverage": 10},
+    "kSHIB": {"size_decimals": 0, "max_leverage": 10},
 }
-
-def get_current_market_specs() -> Dict[str, Dict]:
-    """Get current market specifications from the API."""
-    from hyperliquid.info import Info
-    from hyperliquid.utils import constants
-    
-    info_client = Info(constants.MAINNET_API_URL, skip_ws=True)
-    response = info_client.meta()
-    current_specs = {}
-    
-    for market in response['universe']:
-        current_specs[market['name']] = {
-            "size_decimals": market.get('szDecimals', 3),  # Default to 3 if not found
-            "price_decimals": market.get('px_dps', 1),     # Using 'px_dps' instead of 'priceDecimals'
-        }
-    
-    return current_specs
-
-def print_market_specs_diff(current_specs: Dict, stored_specs: Dict = MARKET_SPECS):
-    """Print differences between current and stored market specifications."""
-    logger = logging.getLogger("fractrade_hl_simple")
-    
-    all_symbols = set(current_specs.keys()) | set(stored_specs.keys())
-    
-    for symbol in sorted(all_symbols):
-        if symbol not in stored_specs:
-            logger.info(f"New market {symbol}: {current_specs[symbol]}")
-            continue
-            
-        if symbol not in current_specs:
-            logger.info(f"Removed market {symbol}")
-            continue
-            
-        current = current_specs[symbol]
-        stored = stored_specs[symbol]
-        
-        if current != stored:
-            logger.info(f"Changed market {symbol}:")
-            for key in current.keys():
-                if key in stored and current[key] != stored.get(key):
-                    logger.info(f"  {key}: {stored.get(key)} -> {current[key]}")

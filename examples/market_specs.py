@@ -1,28 +1,35 @@
+"""
+Example showing how to inspect market specifications for trading pairs.
+
+Market specs include size decimals (minimum position granularity) and
+max leverage for each asset. These are fetched from the API on client
+init and cached for 24 hours.
+"""
+
 from fractrade_hl_simple import HyperliquidClient
-from fractrade_hl_simple.models import get_current_market_specs, print_market_specs_diff
+
 
 def main():
-    # Initialize client
     client = HyperliquidClient()
-    
-    print("\nGetting current market specifications...")
-    current_specs = get_current_market_specs(client.info)
-    
-    print("\nComparing with stored specifications:")
-    print_market_specs_diff(current_specs)
-    
-    print("\nFull current specifications:")
-    for symbol, specs in sorted(current_specs.items()):
-        print(f"\n{symbol}:")
-        for key, value in specs.items():
-            print(f"  {key}: {value}")
+
+    # Show specs for major trading pairs
+    print("=== Market Specifications ===\n")
+    majors = ["BTC", "ETH", "SOL", "DOGE", "kPEPE"]
+    for symbol in majors:
+        specs = client.market_specs.get(symbol)
+        if specs:
+            sz_dec = specs["size_decimals"]
+            min_size = 1 if sz_dec == 0 else 1.0 / (10 ** sz_dec)
+            print(f"{symbol:8s}  size_decimals={sz_dec}  min_size={min_size}  max_leverage={specs.get('max_leverage', '?')}x")
+
+    # Show total number of available markets
+    print(f"\nTotal markets available: {len(client.market_specs)}")
+
+    # Force refresh from API
+    print("\nRefreshing market specs from API...")
+    specs = client.refresh_market_specs()
+    print(f"Refreshed: {len(specs)} markets")
+
 
 if __name__ == "__main__":
     main()
-
-# Example output:
-# Changed market BTC:
-#   size_decimals: 3 -> 4
-# New market SOL: {'size_decimals': 1, 'price_decimals': 3, 'min_size': 0.1}
-
-

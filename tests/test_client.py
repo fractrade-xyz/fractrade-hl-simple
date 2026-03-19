@@ -95,8 +95,8 @@ def test_get_user_state():
     # Test positions if any exist
     if state.asset_positions:
         pos = state.asset_positions[0].position
-        assert isinstance(pos.coin, str)
-        assert isinstance(pos.szi, Decimal)
+        assert isinstance(pos.symbol, str)
+        assert isinstance(pos.size, Decimal)
         assert isinstance(pos.unrealized_pnl, Decimal)
         assert isinstance(pos.leverage.type, str)
         assert isinstance(pos.leverage.value, Decimal)

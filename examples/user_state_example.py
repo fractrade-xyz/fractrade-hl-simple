@@ -1,43 +1,41 @@
-from decimal import Decimal
-import os
+"""
+Example showing how to inspect account state: balances, positions, and margin usage.
+
+Works with both authenticated users and any public address.
+"""
+
 import argparse
-from dotenv import load_dotenv
 from fractrade_hl_simple import HyperliquidClient
 
-# Load .env file
-load_dotenv()
 
 def main():
-    # Set up argument parser
-    parser = argparse.ArgumentParser(description='Get Hyperliquid user state for an address')
-    parser.add_argument('--address', type=str, help='Hyperliquid address to check (optional)')
+    parser = argparse.ArgumentParser(description="Get Hyperliquid user state")
+    parser.add_argument("--address", type=str, help="Address to check (defaults to authenticated user)")
     args = parser.parse_args()
 
-    # Initialize client (automatically uses env variables)
     client = HyperliquidClient()
-    
-    # Get state for specified address or default to authenticated user
-    address = args.address
-    state = client.get_user_state(address)
-    
-    # Print account summary
-    print("\nAccount Summary:")
-    print(f"  Account Value: ${float(state.margin_summary.account_value):,.2f}")
-    print(f"  Total Position Value: ${float(state.margin_summary.total_ntl_pos):,.2f}")
 
-    # get the perp balance for any account
-    perp_balance = client.get_perp_balance("0xf967239debef10dbc78e9bbbb2d8a16b72a614eb")
-    print(f"  Perp Balance for address 0xf967239debef10dbc78e9bbbb2d8a16b72a614eb: ${float(perp_balance):,.2f}")
-    
-    # Show positions if any exist
+    # Get state for specified address or authenticated user
+    state = client.get_user_state(args.address)
+
+    print("\nAccount Summary:")
+    print(f"  Account Value:  ${float(state.margin_summary.account_value):,.2f}")
+    print(f"  Margin Used:    ${float(state.margin_summary.total_margin_used):,.2f}")
+    print(f"  Position Value: ${float(state.margin_summary.total_ntl_pos):,.2f}")
+    print(f"  Withdrawable:   ${float(state.withdrawable):,.2f}")
+
     if state.asset_positions:
         print("\nOpen Positions:")
-        for pos in state.asset_positions:
-            p = pos.position
-            entry = f"${float(p.entry_price):.1f}" if p.entry_price else "N/A"
-            print(f"  {p.symbol:4} {float(p.size):+.3f} @ {entry} (PnL: ${float(p.unrealized_pnl):,.2f})")
+        for asset_pos in state.asset_positions:
+            pos = asset_pos.position
+            direction = "LONG" if pos.is_long else "SHORT"
+            entry = f"${float(pos.entry_price):,.2f}" if pos.entry_price else "N/A"
+            print(f"  {pos.symbol:8s} {direction:5s} {float(pos.size):+.4f} @ {entry}  "
+                  f"PnL: ${float(pos.unrealized_pnl):,.2f}  "
+                  f"Leverage: {float(pos.leverage.value)}x {pos.leverage.type}")
     else:
         print("\nNo open positions")
 
+
 if __name__ == "__main__":
-    main() 
+    main()
