@@ -14,23 +14,26 @@ load_dotenv()
 class HyperliquidAccount:
     private_key: str
     public_address: Optional[str] = None
+    is_vault: bool = False
     
     @classmethod
-    def from_key(cls, private_key: str, public_address: Optional[str] = None) -> "HyperliquidAccount":
+    def from_key(cls, private_key: str, public_address: Optional[str] = None, is_vault: bool = False) -> "HyperliquidAccount":
         """Create a HyperliquidAccount from a private key.
-        
+
         Args:
             private_key (str): The private key to use
-            
+            public_address (Optional[str]): The public address (needed for API wallets and vaults)
+            is_vault (bool): If True, treat public_address as a vault/sub-account address
+
         Returns:
             HyperliquidAccount: The account instance
-            
+
         Raises:
             ValueError: If the private key is invalid
         """
         if not private_key:
             raise ValueError("private_key is required")
-            
+
         # Get public address from private key
         # if public address is provided, use it, public and private key dont need to match when its an api wallet
         if public_address is None:
@@ -39,10 +42,11 @@ class HyperliquidAccount:
                 public_address = account.address
             except Exception as e:
                 raise ValueError(f"Invalid private key: {str(e)}")
-            
+
         return cls(
             private_key=private_key,
-            public_address=public_address
+            public_address=public_address,
+            is_vault=is_vault,
         )
     
     @classmethod
@@ -54,10 +58,13 @@ class HyperliquidAccount:
         public_address = os.getenv("HYPERLIQUID_PUBLIC_ADDRESS")
         if not public_address:
             raise ValueError("HYPERLIQUID_PUBLIC_ADDRESS environment variable is required")
-            
+
+        is_vault = os.getenv("HYPERLIQUID_IS_VAULT", "").lower() in ("1", "true", "yes")
+
         return cls(
             private_key=private_key,
-            public_address=public_address
+            public_address=public_address,
+            is_vault=is_vault,
         )
     
     def to_dict(self) -> dict:

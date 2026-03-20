@@ -131,11 +131,18 @@ class HyperliquidClient:
         # When using an API wallet, the signing key address differs from the
         # trading account address. Pass account_address so the SDK sends
         # orders on behalf of the correct account.
+        # For sub-accounts (vaults), the SDK needs vault_address instead.
         account_address = None
+        vault_address = None
         if self.exchange_account.address.lower() != account.public_address.lower():
-            account_address = account.public_address
+            if account.is_vault:
+                vault_address = account.public_address
+            else:
+                account_address = account.public_address
         self.exchange = Exchange(
-            self.exchange_account, self.base_url, account_address=account_address
+            self.exchange_account, self.base_url,
+            account_address=account_address,
+            vault_address=vault_address,
         )
 
     def is_authenticated(self) -> bool:
