@@ -23,7 +23,7 @@ classifiers = [
 python = "^3.12"
 requests = "^2.32.3"
 python-dotenv = "^1.0.1"
-hyperliquid-python-sdk = ">=0.10.0,<1.0.0"
+hyperliquid-python-sdk = ">=0.22.0,<1.0.0"
 dacite = "^1.9.1"
 
 
