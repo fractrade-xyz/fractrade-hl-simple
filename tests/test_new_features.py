@@ -9,13 +9,15 @@ from fractrade_hl_simple.models import Fill
 @pytest.fixture
 def mock_client():
     """Create a fully mocked authenticated client for unit tests."""
+    HyperliquidClient._cached_market_specs = None
+    HyperliquidClient._cached_market_specs_at = 0
     with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
          patch('fractrade_hl_simple.hyperliquid.Exchange') as mock_exchange_cls:
         mock_info = mock_info_cls.return_value
         mock_exchange = mock_exchange_cls.return_value
 
-        # Mock meta_and_asset_ctxs for market specs initialization
-        mock_info.meta_and_asset_ctxs.return_value = [
+        # Mock info.post for market specs initialization (_fetch_market_specs uses info.post)
+        mock_info.post.return_value = [
             {"universe": [
                 {"name": "BTC", "szDecimals": 5, "maxLeverage": 50, "onlyIsolated": False},
                 {"name": "ETH", "szDecimals": 4, "maxLeverage": 50, "onlyIsolated": False},
@@ -348,7 +350,7 @@ class TestMetaAssetContext:
         with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
              patch('fractrade_hl_simple.hyperliquid.Exchange'):
             mock_info = mock_info_cls.return_value
-            mock_info.meta_and_asset_ctxs.return_value = [
+            mock_info.post.return_value = [
                 {"universe": [
                     {"name": "BTC", "szDecimals": 5, "maxLeverage": 50, "onlyIsolated": False},
                 ]},
@@ -362,14 +364,16 @@ class TestMetaAssetContext:
             assert client.market_specs["BTC"]["mark_price"] == "85000"
 
     def test_fallback_to_meta_on_error(self):
+        HyperliquidClient._cached_market_specs = None
+        HyperliquidClient._cached_market_specs_at = 0
         with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
              patch('fractrade_hl_simple.hyperliquid.Exchange'):
             mock_info = mock_info_cls.return_value
-            mock_info.meta_and_asset_ctxs.side_effect = Exception("not available")
+            mock_info.post.side_effect = Exception("not available")
             mock_info.meta.return_value = {
                 "universe": [{"name": "BTC", "szDecimals": 5}]
             }
-            client = HyperliquidClient(max_retries=0)
+            client = HyperliquidClient(max_retries=0, cache_market_specs=False)
             assert "BTC" in client.market_specs
             assert client.market_specs["BTC"]["size_decimals"] == 5
 

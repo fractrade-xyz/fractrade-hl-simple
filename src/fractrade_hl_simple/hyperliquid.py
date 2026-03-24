@@ -23,6 +23,7 @@ from .models import (
     MARKET_SPECS,
     HyperliquidAccount,
     Order,
+    OrderType,
     Position,
     SpotState,
     SpotTokenBalance,
@@ -46,6 +47,7 @@ class HyperliquidClient:
         max_retries: int = 3,
         retry_delay: float = 1.0,
         cache_market_specs: bool = True,
+        perp_dexs: Optional[List[str]] = None,
     ):
         """Initialize HyperliquidClient.
 
@@ -58,6 +60,8 @@ class HyperliquidClient:
             cache_market_specs (bool): If True (default), reuses cached market specs across instances
                 within the same process. Cache expires after 24 hours. Set to False to always fetch
                 fresh specs on init.
+            perp_dexs (Optional[List[str]]): Perp dexes to load. Defaults to [""] (crypto only).
+                Use ["", "xyz"] to also enable stocks, commodities, indices, and forex.
 
         Raises:
             ValueError: If env is not 'mainnet' or 'testnet'
@@ -74,7 +78,8 @@ class HyperliquidClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.base_url = constants.TESTNET_API_URL if env == "testnet" else constants.MAINNET_API_URL
-        self.info = Info(self.base_url, skip_ws=True)
+        self.perp_dexs = perp_dexs if perp_dexs is not None else [""]
+        self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs)
         
         # Initialize market specs
         cache_hit = (
@@ -143,6 +148,7 @@ class HyperliquidClient:
             self.exchange_account, self.base_url,
             account_address=account_address,
             vault_address=vault_address,
+            perp_dexs=self.perp_dexs,
         )
 
     def is_authenticated(self) -> bool:
@@ -194,19 +200,19 @@ class HyperliquidClient:
 
         raise last_exception  # pragma: no cover – safety fallback
 
-    def get_user_state(self, address: Optional[str] = None) -> UserState:
+    def get_user_state(self, address: Optional[str] = None, dex: str = "") -> UserState:
         """Get the state of any user by their address."""
         if address is None and not self.is_authenticated():
             raise ValueError("Address required when client is not authenticated")
-            
+
         if address is None:
             address = self.public_address
-            
+
         # Add address validation
         if not address.startswith("0x") or len(address) != 42:
             raise ValueError("Invalid address format")
-            
-        response = self._with_retry(self.info.user_state, address)
+
+        response = self._with_retry(self.info.user_state, address, dex=dex)
 
         # Format the response to match our data structure
         formatted_response = {
@@ -254,11 +260,14 @@ class HyperliquidClient:
         
         
     def get_positions(self) -> List[Position]:
-        """Get current open positions."""
+        """Get current open positions across all perp dexes."""
         if not self.is_authenticated():
             raise RuntimeError("This method requires authentication")
-        state = self.get_user_state(None)
-        return [pos.position for pos in state.asset_positions]
+        positions = []
+        for dex in self.perp_dexs:
+            state = self.get_user_state(None, dex=dex)
+            positions.extend(pos.position for pos in state.asset_positions)
+        return positions
         
     def _format_price(self, symbol: str, price: float) -> float:
         """Format a price for the exchange, matching the SDK's rounding logic.
@@ -797,7 +806,9 @@ class HyperliquidClient:
             raise RuntimeError("This method requires authentication")
 
         # Let this propagate on failure - trader MUST know if we can't fetch orders
-        open_orders = self._with_retry(self.info.open_orders, self.account.public_address)
+        open_orders = []
+        for dex in self.perp_dexs:
+            open_orders.extend(self._with_retry(self.info.open_orders, self.account.public_address, dex=dex))
 
         if symbol:
             open_orders = [order for order in open_orders if order["coin"] == symbol]
@@ -834,9 +845,11 @@ class HyperliquidClient:
             raise RuntimeError("This method requires authentication")
 
         # Get open orders from the API - let errors propagate
-        open_orders_response = self._with_retry(
-            self.info.frontend_open_orders, self.account.public_address
-        )
+        open_orders_response = []
+        for dex in self.perp_dexs:
+            open_orders_response.extend(self._with_retry(
+                self.info.frontend_open_orders, self.account.public_address, dex=dex
+            ))
 
         # Filter by symbol if provided
         if symbol:
@@ -902,16 +915,16 @@ class HyperliquidClient:
 
     def get_price(self, symbol: Optional[str] = None) -> Union[float, Dict[str, float]]:
         """Get current price(s). No authentication required."""
-        response = self._with_retry(self.info.all_mids)
+        prices: Dict[str, float] = {}
+        for dex in self.perp_dexs:
+            response = self._with_retry(self.info.all_mids, dex=dex)
+            prices.update({sym: float(price) for sym, price in response.items()})
 
-        # Convert all prices to float
-        prices = {sym: float(price) for sym, price in response.items()}
-        
         if symbol is not None:
             if symbol not in prices:
                 raise ValueError(f"Symbol {symbol} not found. Available symbols: {', '.join(sorted(prices.keys()))}")
             return prices[symbol]
-        
+
         return prices
 
     def get_perp_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
@@ -1019,13 +1032,419 @@ class HyperliquidClient:
             raw_state=response
         )
 
+    # ── Spot trading ─────────────────────────────────────────────────────
+
+    def _resolve_spot_pair(self, token: str) -> str:
+        """Resolve a token name to its spot pair name recognized by the SDK.
+
+        Args:
+            token: Token name (e.g., "PURR", "HYPE")
+
+        Returns:
+            The pair name (e.g., "PURR/USDC") that exists in info.name_to_coin.
+
+        Raises:
+            ValueError: If no spot pair found for the token.
+        """
+        pair = f"{token}/USDC"
+        if pair in self.info.name_to_coin:
+            return pair
+        raise ValueError(
+            f"No spot pair found for '{token}'. "
+            f"Try the full pair name (e.g., 'PURR/USDC') or check available spot pairs."
+        )
+
+    def _get_spot_sz_decimals(self, pair_name: str) -> int:
+        """Get szDecimals for a spot pair from the SDK's cached data."""
+        coin = self.info.name_to_coin[pair_name]
+        asset = self.info.coin_to_asset[coin]
+        return self.info.asset_to_sz_decimals.get(asset, 0)
+
+    def _format_spot_price(self, pair_name: str, price: float) -> float:
+        """Format a price for a spot order (8 decimal places, matching SDK)."""
+        sz_decimals = self._get_spot_sz_decimals(pair_name)
+        return round(float(f"{price:.5g}"), max(0, 8 - sz_decimals))
+
+    def _format_spot_size(self, pair_name: str, size: float) -> float:
+        """Format a size for a spot order."""
+        sz_decimals = self._get_spot_sz_decimals(pair_name)
+        return round(size, sz_decimals)
+
+    def transfer_to_spot(self, amount: float) -> dict:
+        """Transfer USDC from perp wallet to spot wallet.
+
+        Note: This does not work with API wallets. Use the main wallet's private key.
+
+        Args:
+            amount (float): Amount of USDC to transfer.
+
+        Returns:
+            dict: API response.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+        result = self._with_retry(self.exchange.usd_class_transfer, amount, False)
+        if result.get("status") == "err":
+            raise ValueError(f"Transfer failed: {result.get('response', 'unknown error')}")
+        return result
+
+    def transfer_to_perp(self, amount: float) -> dict:
+        """Transfer USDC from spot wallet to perp wallet.
+
+        Note: This does not work with API wallets. Use the main wallet's private key.
+
+        Args:
+            amount (float): Amount of USDC to transfer.
+
+        Returns:
+            dict: API response.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+        if amount <= 0:
+            raise ValueError("Amount must be positive")
+        result = self._with_retry(self.exchange.usd_class_transfer, amount, True)
+        if result.get("status") == "err":
+            raise ValueError(f"Transfer failed: {result.get('response', 'unknown error')}")
+        return result
+
+    def get_spot_price(self, token: str) -> float:
+        """Get current mid price for a spot token.
+
+        Args:
+            token (str): Token name (e.g., "PURR", "HYPE").
+
+        Returns:
+            float: Current mid price.
+        """
+        pair_name = self._resolve_spot_pair(token)
+        coin = self.info.name_to_coin[pair_name]
+        mids = self._with_retry(self.info.all_mids)
+        # Spot mids are keyed by the internal coin name
+        price_str = mids.get(coin)
+        if price_str is None:
+            raise ValueError(f"No price found for {token} (pair: {pair_name}, coin: {coin})")
+        return float(price_str)
+
+    def create_spot_order(
+        self,
+        token: str,
+        size: float,
+        is_buy: bool,
+        limit_price: Optional[float] = None,
+        post_only: bool = False,
+        time_in_force: Literal["Gtc", "Ioc", "Alo"] = "Gtc",
+        slippage: Optional[float] = None,
+    ) -> Order:
+        """Create a spot order.
+
+        Args:
+            token (str): Token name (e.g., "PURR", "HYPE").
+            size (float): Order size in token units.
+            is_buy (bool): True for buy, False for sell.
+            limit_price (Optional[float]): Price for limit orders. None for market.
+            post_only (bool): Maker only (limit orders only).
+            time_in_force (str): "Gtc", "Ioc", or "Alo".
+            slippage (Optional[float]): Slippage for market orders.
+
+        Returns:
+            Order: Order response.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+
+        pair_name = self._resolve_spot_pair(token)
+
+        # Market order: get price and apply slippage
+        if limit_price is None:
+            current_price = self.get_spot_price(token)
+            if current_price <= 0:
+                raise ValueError(f"Invalid current price for {token}: {current_price}")
+            effective_slippage = slippage if slippage is not None else self.default_slippage
+            if not 0 < effective_slippage <= 0.5:
+                raise ValueError("slippage must be between 0 (exclusive) and 0.5 (inclusive)")
+            limit_price = current_price * (1 + effective_slippage) if is_buy else current_price * (1 - effective_slippage)
+
+        # Format size and price for spot
+        size = self._format_spot_size(pair_name, size)
+        limit_price = self._format_spot_price(pair_name, limit_price)
+
+        sz_decimals = self._get_spot_sz_decimals(pair_name)
+        min_size = 1.0 / (10 ** sz_decimals) if sz_decimals > 0 else 1
+        if size < min_size:
+            raise ValueError(f"Minimum size for {token} is {min_size} (szDecimals={sz_decimals})")
+
+        order_type = {"limit": {"tif": time_in_force}}
+        if post_only:
+            if time_in_force == "Ioc":
+                raise ValueError("post_only cannot be used with IOC orders")
+            order_type["limit"]["postOnly"] = True
+
+        logger.debug(f"Spot order: pair={pair_name}, size={size}, price={limit_price}, buy={is_buy}")
+
+        try:
+            response = self._with_retry(
+                self.exchange.order,
+                name=pair_name,
+                is_buy=is_buy,
+                sz=size,
+                limit_px=limit_price,
+                order_type=order_type,
+                reduce_only=False,
+            )
+
+            logger.debug(f"Spot order response: {response}")
+
+            if isinstance(response, dict):
+                if response.get("status") != "ok":
+                    raise ValueError(f"Order failed with status: {response.get('status')}")
+
+                if "response" in response and "data" in response["response"]:
+                    statuses = response["response"]["data"].get("statuses", [])
+                    if statuses and "error" in statuses[0]:
+                        raise ValueError(f"Order error: {statuses[0]['error']}")
+
+                    if statuses and "resting" in statuses[0]:
+                        order_data = {
+                            "order_id": str(statuses[0]["resting"]["oid"]),
+                            "symbol": token,
+                            "is_buy": is_buy,
+                            "size": str(size),
+                            "order_type": order_type,
+                            "reduce_only": False,
+                            "status": "open",
+                            "time_in_force": time_in_force,
+                            "created_at": int(time.time() * 1000),
+                            "limit_price": str(limit_price),
+                        }
+                        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
+                    elif statuses and "filled" in statuses[0]:
+                        filled_sz = statuses[0]["filled"].get("totalSz", size)
+                        order_data = {
+                            "order_id": str(statuses[0]["filled"]["oid"]),
+                            "symbol": token,
+                            "is_buy": is_buy,
+                            "size": str(size),
+                            "filled_size": str(filled_sz),
+                            "average_fill_price": str(statuses[0]["filled"]["avgPx"]),
+                            "order_type": order_type,
+                            "reduce_only": False,
+                            "status": "filled",
+                            "time_in_force": time_in_force,
+                            "created_at": int(time.time() * 1000),
+                            "limit_price": str(limit_price),
+                        }
+                        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
+                else:
+                    raise ValueError(f"Unexpected response structure: {response}")
+
+            raise ValueError(f"Unexpected response format: {type(response)} - {response}")
+
+        except ValueError:
+            raise
+        except Exception as e:
+            logger.error(f"Spot order failed for {token}: {str(e)}")
+            raise
+
+    def spot_buy(
+        self,
+        token: str,
+        size: float,
+        limit_price: Optional[float] = None,
+        post_only: bool = False,
+        slippage: Optional[float] = None,
+    ) -> Order:
+        """Buy a spot token.
+
+        Args:
+            token (str): Token name (e.g., "PURR", "HYPE").
+            size (float): Amount of tokens to buy.
+            limit_price (Optional[float]): Price for limit order. None for market order.
+            post_only (bool): Maker only (limit orders only).
+            slippage (Optional[float]): Slippage for market orders. Overrides default_slippage.
+
+        Returns:
+            Order: Order response.
+        """
+        time_in_force = "Gtc" if limit_price is not None else "Ioc"
+        return self.create_spot_order(
+            token=token,
+            size=size,
+            is_buy=True,
+            limit_price=limit_price,
+            post_only=post_only,
+            time_in_force=time_in_force,
+            slippage=slippage,
+        )
+
+    def spot_sell(
+        self,
+        token: str,
+        size: float,
+        limit_price: Optional[float] = None,
+        post_only: bool = False,
+        slippage: Optional[float] = None,
+    ) -> Order:
+        """Sell a spot token.
+
+        Args:
+            token (str): Token name (e.g., "PURR", "HYPE").
+            size (float): Amount of tokens to sell.
+            limit_price (Optional[float]): Price for limit order. None for market order.
+            post_only (bool): Maker only (limit orders only).
+            slippage (Optional[float]): Slippage for market orders. Overrides default_slippage.
+
+        Returns:
+            Order: Order response.
+        """
+        time_in_force = "Gtc" if limit_price is not None else "Ioc"
+        return self.create_spot_order(
+            token=token,
+            size=size,
+            is_buy=False,
+            limit_price=limit_price,
+            post_only=post_only,
+            time_in_force=time_in_force,
+            slippage=slippage,
+        )
+
+    def spot_cancel_order(self, order_id: Union[str, int], token: str) -> bool:
+        """Cancel a specific spot order.
+
+        Args:
+            order_id (Union[str, int]): The order ID to cancel.
+            token (str): Token name (e.g., "PURR").
+
+        Returns:
+            bool: True if cancelled, False if not found.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+        pair_name = self._resolve_spot_pair(token)
+        try:
+            self._with_retry(self.exchange.cancel, pair_name, int(order_id))
+            return True
+        except Exception as e:
+            err = str(e).lower()
+            if "not found" in err or "already" in err or "no order" in err:
+                return False
+            raise
+
+    def spot_cancel_all_orders(self, token: Optional[str] = None) -> None:
+        """Cancel all open spot orders.
+
+        Args:
+            token (Optional[str]): If provided, only cancels orders for this token.
+                                   If None, cancels all spot orders.
+
+        Raises:
+            RuntimeError: If any cancellation fails.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+
+        # Build set of spot coin names
+        spot_coins = {coin for coin, asset in self.info.coin_to_asset.items() if asset >= 10000}
+
+        # Filter to specific token if requested
+        if token:
+            pair_name = self._resolve_spot_pair(token)
+            target_coin = self.info.name_to_coin[pair_name]
+            spot_coins = {target_coin}
+
+        open_orders = self._with_retry(self.info.open_orders, self.account.public_address)
+        spot_orders = [o for o in open_orders if o["coin"] in spot_coins]
+
+        failures = []
+        for order in spot_orders:
+            try:
+                self._with_retry(self.exchange.cancel, order["coin"], order["oid"])
+            except Exception as e:
+                failures.append((order["coin"], order["oid"], str(e)))
+                logger.error(f"Failed to cancel spot order {order['oid']} for {order['coin']}: {e}")
+
+        if failures:
+            symbols = [f"{coin}:{oid}" for coin, oid, _ in failures]
+            raise RuntimeError(
+                f"Failed to cancel {len(failures)} spot order(s): {', '.join(symbols)}. "
+                f"These orders may still be active!"
+            )
+
+    def get_spot_open_orders(self, token: Optional[str] = None) -> List[Order]:
+        """Get open spot orders.
+
+        Args:
+            token (Optional[str]): If provided, only returns orders for this token.
+
+        Returns:
+            List[Order]: List of open spot orders.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+
+        # Build set of spot coin names and reverse mapping (coin -> token name)
+        spot_coin_to_token: Dict[str, str] = {}
+        meta = self.info.spot_meta()
+        for pair in meta["universe"]:
+            base_idx = pair["tokens"][0]
+            base_name = meta["tokens"][base_idx]["name"]
+            coin = self.info.name_to_coin.get(f"{base_name}/USDC")
+            if coin:
+                spot_coin_to_token[coin] = base_name
+
+        # Filter to specific token if requested
+        if token:
+            pair_name = self._resolve_spot_pair(token)
+            target_coin = self.info.name_to_coin[pair_name]
+            spot_coin_to_token = {target_coin: token}
+
+        response = self._with_retry(
+            self.info.frontend_open_orders, self.account.public_address
+        )
+
+        orders = []
+        for order_data in response:
+            coin = order_data.get("coin", "")
+            if coin not in spot_coin_to_token:
+                continue
+
+            token_name = spot_coin_to_token[coin]
+            try:
+                order_type = {}
+                if order_data.get("orderType") == "Limit":
+                    order_type["limit"] = {
+                        "tif": order_data.get("tif", "Gtc"),
+                    }
+
+                order = Order(
+                    order_id=str(order_data["oid"]),
+                    symbol=token_name,
+                    is_buy=order_data["side"] == "B",
+                    size=Decimal(str(order_data.get("sz", "0"))),
+                    order_type=from_dict(data_class=OrderType, data=order_type, config=DACITE_CONFIG),
+                    status="open",
+                    time_in_force=order_data.get("tif", "Gtc"),
+                    created_at=order_data.get("timestamp", 0),
+                    limit_price=Decimal(str(order_data.get("limitPx", "0"))),
+                    filled_size=Decimal(str(order_data.get("origSz", "0"))) - Decimal(str(order_data.get("sz", "0"))),
+                    type="limit",
+                )
+                orders.append(order)
+            except Exception as e:
+                logger.warning(f"Failed to parse spot order: {e}")
+                continue
+
+        return orders
+
     def get_evm_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
         """Get EVM chain balance for an address.
-        
+
         Args:
             address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
             simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
-            
+
         Returns:
             Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance in USD.
                                           If simple=False, returns a dictionary containing:
@@ -1106,15 +1525,17 @@ class HyperliquidClient:
             # Get specific market
             btc_info = client.get_market_info("BTC")
         """
-        response = self._with_retry(self.info.meta)
-        markets = response['universe']
-        
+        markets = []
+        for dex in self.perp_dexs:
+            response = self._with_retry(self.info.meta, dex=dex)
+            markets.extend(response['universe'])
+
         if symbol:
             market = next((m for m in markets if m['name'] == symbol), None)
             if not market:
                 raise ValueError(f"Symbol {symbol} not found")
             return market
-        
+
         return markets
 
     def get_funding_rates(self, symbol: Optional[str] = None, threshold: Optional[float] = None) -> Union[float, List[Dict[str, Any]]]:
@@ -1217,32 +1638,37 @@ class HyperliquidClient:
 
     def _fetch_market_specs(self) -> Dict[str, Dict]:
         """Fetch current market specifications from the API using meta_and_asset_ctxs for richer data."""
-        try:
-            response = self.info.meta_and_asset_ctxs()
-            meta = response[0]
-            ctxs = response[1] if len(response) > 1 else []
-        except Exception:
-            # Fall back to basic meta() if meta_and_asset_ctxs is unavailable
-            response = self.info.meta()
-            meta = response
-            ctxs = []
-
         specs = {}
-        universe = meta.get('universe', meta) if isinstance(meta, dict) else meta
 
-        for i, market in enumerate(universe):
-            spec = {
-                "size_decimals": market.get('szDecimals', 3),
-                "price_decimals": market.get('px_dps', 1),
-                "max_leverage": market.get('maxLeverage', 50),
-                "only_isolated": market.get('onlyIsolated', False),
-            }
-            if i < len(ctxs) and isinstance(ctxs[i], dict):
-                spec["funding"] = ctxs[i].get("funding")
-                spec["open_interest"] = ctxs[i].get("openInterest")
-                spec["mark_price"] = ctxs[i].get("markPx")
-            specs[market['name']] = spec
+        for dex in self.perp_dexs:
+            try:
+                response = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+                meta = response[0]
+                ctxs = response[1] if len(response) > 1 else []
+            except Exception:
+                try:
+                    meta = self.info.meta(dex=dex)
+                    ctxs = []
+                except Exception:
+                    continue
 
+            universe = meta.get('universe', meta) if isinstance(meta, dict) else meta
+
+            for i, market in enumerate(universe):
+                spec = {
+                    "size_decimals": market.get('szDecimals', 3),
+                    "price_decimals": market.get('px_dps', 1),
+                    "max_leverage": market.get('maxLeverage', 50),
+                    "only_isolated": market.get('onlyIsolated', False),
+                }
+                if i < len(ctxs) and isinstance(ctxs[i], dict):
+                    spec["funding"] = ctxs[i].get("funding")
+                    spec["open_interest"] = ctxs[i].get("openInterest")
+                    spec["mark_price"] = ctxs[i].get("markPx")
+                specs[market['name']] = spec
+
+        if not specs:
+            raise RuntimeError("Failed to fetch market specs from any dex")
         return specs
 
     def refresh_market_specs(self) -> Dict[str, Dict]:

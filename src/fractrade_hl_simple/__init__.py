@@ -43,6 +43,14 @@ from .api import (
     bulk_cancel,
     get_funding_history,
     get_portfolio,
+    transfer_to_spot,
+    transfer_to_perp,
+    get_spot_price,
+    spot_buy,
+    spot_sell,
+    spot_cancel_order,
+    spot_cancel_all_orders,
+    get_spot_open_orders,
 )
 
 __all__ = [
@@ -92,4 +100,12 @@ __all__ = [
     'bulk_cancel',
     'get_funding_history',
     'get_portfolio',
+    'transfer_to_spot',
+    'transfer_to_perp',
+    'get_spot_price',
+    'spot_buy',
+    'spot_sell',
+    'spot_cancel_order',
+    'spot_cancel_all_orders',
+    'get_spot_open_orders',
 ]

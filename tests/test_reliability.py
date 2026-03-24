@@ -18,12 +18,14 @@ from fractrade_hl_simple.exceptions import (
 @pytest.fixture
 def mock_client():
     """Create a fully mocked authenticated client."""
+    HyperliquidClient._cached_market_specs = None
+    HyperliquidClient._cached_market_specs_at = 0
     with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
          patch('fractrade_hl_simple.hyperliquid.Exchange') as mock_exchange_cls:
         mock_info = mock_info_cls.return_value
         mock_exchange = mock_exchange_cls.return_value
 
-        mock_info.meta_and_asset_ctxs.return_value = [
+        mock_info.post.return_value = [
             {"universe": [
                 {"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
                 {"name": "ETH", "szDecimals": 4, "maxLeverage": 50},
@@ -316,7 +318,7 @@ class TestOrderIdTypes:
 class TestMarketSpecsRefresh:
     def test_refresh_market_specs(self, mock_client):
         old_specs = mock_client.market_specs.copy()
-        mock_client.info.meta_and_asset_ctxs.return_value = [
+        mock_client.info.post.return_value = [
             {"universe": [
                 {"name": "BTC", "szDecimals": 5, "maxLeverage": 100},
                 {"name": "NEWCOIN", "szDecimals": 2, "maxLeverage": 20},
@@ -329,7 +331,7 @@ class TestMarketSpecsRefresh:
 
     def test_auto_refresh_when_stale(self, mock_client):
         mock_client._market_specs_fetched_at = time.time() - 90000  # 25 hours ago
-        mock_client.info.meta_and_asset_ctxs.return_value = [
+        mock_client.info.post.return_value = [
             {"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]},
             [{}],
         ]
@@ -339,14 +341,14 @@ class TestMarketSpecsRefresh:
 
     def test_no_refresh_when_fresh(self, mock_client):
         mock_client._market_specs_fetched_at = time.time()  # Just now
-        mock_client.info.meta_and_asset_ctxs.reset_mock()
+        mock_client.info.post.reset_mock()
         mock_client._ensure_fresh_market_specs()
         # Should NOT have called the API
-        mock_client.info.meta_and_asset_ctxs.assert_not_called()
+        mock_client.info.post.assert_not_called()
 
     def test_refresh_failure_keeps_existing(self, mock_client):
         old_specs = mock_client.market_specs.copy()
-        mock_client.info.meta_and_asset_ctxs.side_effect = Exception("API down")
+        mock_client.info.post.side_effect = Exception("API down")
         mock_client.info.meta.side_effect = Exception("API down")
         mock_client.refresh_market_specs()
         assert mock_client.market_specs == old_specs
@@ -358,9 +360,11 @@ class TestRetryOnOriginalMethods:
     def test_get_price_uses_retry(self, mock_client):
         mock_client.max_retries = 1
         mock_client.retry_delay = 0.01
+        # get_price iterates perp_dexs ["", "xyz"], calling all_mids for each
         mock_client.info.all_mids.side_effect = [
             requests.ConnectionError("fail"),
             {"BTC": "85000.0"},
+            {},  # xyz dex (empty is fine)
         ]
         with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
             result = mock_client.get_price("BTC")

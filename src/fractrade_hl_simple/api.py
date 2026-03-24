@@ -394,3 +394,83 @@ def get_portfolio(address: Optional[str] = None,
         with get_client(account) as new_client:
             return new_client.get_portfolio(address)
     return client.get_portfolio(address)
+
+
+# ── Spot trading ──────────────────────────────────────────────────────
+
+def transfer_to_spot(amount: float,
+                     account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                     client: Optional[HyperliquidClient] = None) -> dict:
+    """Transfer USDC from perp wallet to spot wallet."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.transfer_to_spot(amount)
+    return client.transfer_to_spot(amount)
+
+def transfer_to_perp(amount: float,
+                     account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                     client: Optional[HyperliquidClient] = None) -> dict:
+    """Transfer USDC from spot wallet to perp wallet."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.transfer_to_perp(amount)
+    return client.transfer_to_perp(amount)
+
+def get_spot_price(token: str,
+                   account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                   client: Optional[HyperliquidClient] = None) -> float:
+    """Get current mid price for a spot token."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_spot_price(token)
+    return client.get_spot_price(token)
+
+def spot_buy(token: str,
+             size: float,
+             limit_price: Optional[float] = None,
+             account: Optional[Union[Dict, HyperliquidAccount]] = None,
+             client: Optional[HyperliquidClient] = None) -> Order:
+    """Buy a spot token (market or limit)."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.spot_buy(token, size, limit_price)
+    return client.spot_buy(token, size, limit_price)
+
+def spot_sell(token: str,
+              size: float,
+              limit_price: Optional[float] = None,
+              account: Optional[Union[Dict, HyperliquidAccount]] = None,
+              client: Optional[HyperliquidClient] = None) -> Order:
+    """Sell a spot token (market or limit)."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.spot_sell(token, size, limit_price)
+    return client.spot_sell(token, size, limit_price)
+
+def spot_cancel_order(order_id: Union[str, int],
+                      token: str,
+                      account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                      client: Optional[HyperliquidClient] = None) -> bool:
+    """Cancel a specific spot order."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.spot_cancel_order(order_id, token)
+    return client.spot_cancel_order(order_id, token)
+
+def spot_cancel_all_orders(token: Optional[str] = None,
+                           account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                           client: Optional[HyperliquidClient] = None) -> None:
+    """Cancel all open spot orders."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.spot_cancel_all_orders(token)
+    return client.spot_cancel_all_orders(token)
+
+def get_spot_open_orders(token: Optional[str] = None,
+                         account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                         client: Optional[HyperliquidClient] = None) -> List[Order]:
+    """Get open spot orders."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_spot_open_orders(token)
+    return client.get_spot_open_orders(token)

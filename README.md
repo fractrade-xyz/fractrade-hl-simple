@@ -49,6 +49,7 @@ client = HyperliquidClient(
     max_retries=3,              # Retry transient failures (0 to disable)
     retry_delay=1.0,            # Base delay between retries (exponential backoff)
     cache_market_specs=True,    # Cache market specs across instances (24h TTL)
+    perp_dexs=["", "xyz"],      # Enable extended universe (stocks, commodities, forex)
 )
 ```
 
@@ -162,6 +163,51 @@ client.cancel_all_orders("BTC")   # Cancel all BTC orders
 client.cancel_all_orders()        # Cancel all orders across all symbols
 ```
 
+## Spot Trading
+
+Trade spot tokens (e.g., PURR, HYPE, FRAC) using just the token name — the library handles the `/USDC` pair mapping internally.
+
+### Transfer Between Wallets
+```python
+# Move USDC between perp and spot wallets (requires main wallet key, not API wallet)
+client.transfer_to_spot(100.0)   # $100 USDC to spot
+client.transfer_to_perp(50.0)    # $50 USDC back to perp
+```
+
+### Buy and Sell
+```python
+# Market buy
+order = client.spot_buy("FRAC", size=500)
+
+# Limit buy
+order = client.spot_buy("FRAC", size=500, limit_price=0.020)
+
+# Market sell
+order = client.spot_sell("FRAC", size=500)
+
+# Limit sell
+order = client.spot_sell("FRAC", size=500, limit_price=0.050)
+```
+
+### Spot Price
+```python
+price = client.get_spot_price("FRAC")
+```
+
+### Cancel Spot Orders
+```python
+client.spot_cancel_order(order_id=12345, token="FRAC")
+client.spot_cancel_all_orders("FRAC")   # Cancel all FRAC spot orders
+client.spot_cancel_all_orders()          # Cancel all spot orders
+```
+
+### Spot Open Orders and Balance
+```python
+orders = client.get_spot_open_orders("FRAC")
+balance = client.get_spot_balance()              # Total spot balance in USD
+balance = client.get_spot_balance(simple=False)  # Detailed per-token balances
+```
+
 ## Leverage Management
 
 ```python
@@ -210,6 +256,32 @@ client.bulk_cancel([
     {"symbol": "ETH", "order_id": 67890},
 ])
 ```
+
+## Extended Universe (Stocks, Commodities, Forex)
+
+Hyperliquid's extended perp universe includes stocks, commodities, indices, and forex — all prefixed with `xyz:`. Enable it by passing `perp_dexs=["", "xyz"]` at init. This is off by default to avoid extra API overhead for users who only trade crypto.
+
+```python
+# Enable extended universe (crypto + stocks/commodities/forex)
+client = HyperliquidClient(perp_dexs=["", "xyz"])
+
+# Prices
+tsla = client.get_price("xyz:TSLA")
+gold = client.get_price("xyz:GOLD")
+sp500 = client.get_price("xyz:SP500")
+
+# Trading — same API as crypto
+order = client.buy("xyz:TSLA", size=1.0)
+order = client.sell("xyz:GOLD", size=0.5, limit_price=4500.0)
+client.set_leverage("xyz:NVDA", 10)
+client.close("xyz:TSLA")
+
+# Market info and order book
+info = client.get_market_info("xyz:TSLA")
+book = client.get_order_book("xyz:GOLD")
+```
+
+Available symbols include `xyz:TSLA`, `xyz:NVDA`, `xyz:GOLD`, `xyz:SILVER`, `xyz:SP500`, `xyz:EUR`, `xyz:BRENTOIL`, and many more. Use `client.get_price()` to see all available symbols.
 
 ## Market Data
 
