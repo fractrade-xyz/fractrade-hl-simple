@@ -474,3 +474,21 @@ def get_spot_open_orders(token: Optional[str] = None,
         with get_client(account) as new_client:
             return new_client.get_spot_open_orders(token)
     return client.get_spot_open_orders(token)
+
+def get_spot_order_book(token: str,
+                        account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                        client: Optional[HyperliquidClient] = None) -> Dict:
+    """Get the order book for a spot token."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_spot_order_book(token)
+    return client.get_spot_order_book(token)
+
+def get_spot_fills(token: Optional[str] = None,
+                   account: Optional[Union[Dict, HyperliquidAccount]] = None,
+                   client: Optional[HyperliquidClient] = None) -> list:
+    """Get recent spot fills."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.get_spot_fills(token)
+    return client.get_spot_fills(token)

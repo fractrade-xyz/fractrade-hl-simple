@@ -201,6 +201,20 @@ client.spot_cancel_all_orders("FRAC")   # Cancel all FRAC spot orders
 client.spot_cancel_all_orders()          # Cancel all spot orders
 ```
 
+### Spot Order Book
+```python
+book = client.get_spot_order_book("FRAC")
+print(f"Best bid: ${book['best_bid']:.6f}, Best ask: ${book['best_ask']:.6f}")
+```
+
+### Spot Fills
+```python
+fills = client.get_spot_fills("FRAC")       # FRAC fills only
+all_spot_fills = client.get_spot_fills()     # All spot fills
+for fill in fills:
+    print(f"{fill.symbol} {fill.direction} {fill.size} @ {fill.price}")
+```
+
 ### Spot Open Orders and Balance
 ```python
 orders = client.get_spot_open_orders("FRAC")

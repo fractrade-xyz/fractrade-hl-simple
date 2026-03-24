@@ -1087,7 +1087,10 @@ class HyperliquidClient:
             raise ValueError("Amount must be positive")
         result = self._with_retry(self.exchange.usd_class_transfer, amount, False)
         if result.get("status") == "err":
-            raise ValueError(f"Transfer failed: {result.get('response', 'unknown error')}")
+            msg = result.get("response", "unknown error")
+            if "Must deposit" in msg:
+                raise ValueError("Transfer failed: API wallets cannot transfer funds. Use the main wallet's private key.")
+            raise ValueError(f"Transfer failed: {msg}")
         return result
 
     def transfer_to_perp(self, amount: float) -> dict:
@@ -1107,7 +1110,10 @@ class HyperliquidClient:
             raise ValueError("Amount must be positive")
         result = self._with_retry(self.exchange.usd_class_transfer, amount, True)
         if result.get("status") == "err":
-            raise ValueError(f"Transfer failed: {result.get('response', 'unknown error')}")
+            msg = result.get("response", "unknown error")
+            if "Must deposit" in msg:
+                raise ValueError("Transfer failed: API wallets cannot transfer funds. Use the main wallet's private key.")
+            raise ValueError(f"Transfer failed: {msg}")
         return result
 
     def get_spot_price(self, token: str) -> float:
@@ -1437,6 +1443,56 @@ class HyperliquidClient:
                 continue
 
         return orders
+
+    def get_spot_order_book(self, token: str) -> Dict[str, Any]:
+        """Get the order book for a spot token.
+
+        Args:
+            token (str): Token name (e.g., "FRAC", "HYPE").
+
+        Returns:
+            Dict[str, Any]: Order book data (same format as get_order_book).
+        """
+        pair_name = self._resolve_spot_pair(token)
+        return self.get_order_book(pair_name)
+
+    def get_spot_fills(self, token: Optional[str] = None) -> list:
+        """Get recent spot fills for the authenticated user.
+
+        Args:
+            token (Optional[str]): If provided, only returns fills for this token.
+
+        Returns:
+            List[Fill]: List of spot fill objects.
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+
+        # Build reverse mapping: internal coin name -> token name
+        spot_coin_to_token: Dict[str, str] = {}
+        meta = self.info.spot_meta()
+        for pair in meta["universe"]:
+            base_idx = pair["tokens"][0]
+            base_name = meta["tokens"][base_idx]["name"]
+            coin = self.info.name_to_coin.get(f"{base_name}/USDC")
+            if coin:
+                spot_coin_to_token[coin] = base_name
+                # Also map the human-readable pair name
+                spot_coin_to_token[f"{base_name}/USDC"] = base_name
+
+        raw = self._with_retry(self.info.user_fills, self.public_address)
+        fills = []
+        for f in raw:
+            coin = f.get("coin", "")
+            if coin not in spot_coin_to_token:
+                continue
+            fill = self._parse_fill(f)
+            # Replace internal coin name with token name
+            fill.symbol = spot_coin_to_token[coin]
+            if token and fill.symbol != token:
+                continue
+            fills.append(fill)
+        return fills
 
     def get_evm_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
         """Get EVM chain balance for an address.

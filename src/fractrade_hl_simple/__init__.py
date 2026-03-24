@@ -51,6 +51,8 @@ from .api import (
     spot_cancel_order,
     spot_cancel_all_orders,
     get_spot_open_orders,
+    get_spot_order_book,
+    get_spot_fills,
 )
 
 __all__ = [
@@ -108,4 +110,6 @@ __all__ = [
     'spot_cancel_order',
     'spot_cancel_all_orders',
     'get_spot_open_orders',
+    'get_spot_order_book',
+    'get_spot_fills',
 ]
