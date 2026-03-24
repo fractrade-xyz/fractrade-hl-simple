@@ -49,7 +49,7 @@ client = HyperliquidClient(
     max_retries=3,              # Retry transient failures (0 to disable)
     retry_delay=1.0,            # Base delay between retries (exponential backoff)
     cache_market_specs=True,    # Cache market specs across instances (24h TTL)
-    perp_dexs=["", "xyz"],      # Enable extended universe (stocks, commodities, forex)
+    extended_universe=True,      # Enable stocks, commodities, indices, forex (xyz: symbols)
 )
 ```
 
@@ -259,11 +259,11 @@ client.bulk_cancel([
 
 ## Extended Universe (Stocks, Commodities, Forex)
 
-Hyperliquid's extended perp universe includes stocks, commodities, indices, and forex — all prefixed with `xyz:`. Enable it by passing `perp_dexs=["", "xyz"]` at init. This is off by default to avoid extra API overhead for users who only trade crypto.
+Hyperliquid's extended perp universe includes stocks, commodities, indices, and forex — all prefixed with `xyz:`. Enable it with `extended_universe=True`. Off by default to avoid extra API overhead for users who only trade crypto.
 
 ```python
 # Enable extended universe (crypto + stocks/commodities/forex)
-client = HyperliquidClient(perp_dexs=["", "xyz"])
+client = HyperliquidClient(extended_universe=True)
 
 # Prices
 tsla = client.get_price("xyz:TSLA")

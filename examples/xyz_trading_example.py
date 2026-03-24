@@ -10,7 +10,7 @@ from fractrade_hl_simple import HyperliquidClient
 
 
 def main():
-    client = HyperliquidClient(perp_dexs=["", "xyz"])
+    client = HyperliquidClient(extended_universe=True)
 
     # ── Price queries (no auth required) ──────────────────────────────
 

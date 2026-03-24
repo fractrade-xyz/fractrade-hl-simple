@@ -67,7 +67,7 @@ def mock_client():
 
         mock_info.meta.side_effect = mock_meta
 
-        client = HyperliquidClient(max_retries=0, retry_delay=0, cache_market_specs=False, perp_dexs=["", "xyz"])
+        client = HyperliquidClient(max_retries=0, retry_delay=0, cache_market_specs=False, extended_universe=True)
 
         # Set up auth
         client.exchange = mock_exchange
@@ -267,7 +267,7 @@ class TestXyzTrading:
 # ── SDK Initialization ────────────────────────────────────────────────
 
 class TestXyzSdkInit:
-    def test_default_perp_dexs_is_crypto_only(self):
+    def test_default_is_crypto_only(self):
         with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
              patch('fractrade_hl_simple.hyperliquid.Exchange'):
             mock_info_cls.return_value.post.return_value = [DEFAULT_META, DEFAULT_CTXS]
@@ -275,15 +275,15 @@ class TestXyzSdkInit:
             call_kwargs = mock_info_cls.call_args
             assert call_kwargs.kwargs.get("perp_dexs") == [""]
 
-    def test_info_initialized_with_perp_dexs(self):
+    def test_extended_universe_enables_xyz(self):
         with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
              patch('fractrade_hl_simple.hyperliquid.Exchange'):
             mock_info_cls.return_value.post.return_value = [DEFAULT_META, DEFAULT_CTXS]
-            HyperliquidClient(max_retries=0, perp_dexs=["", "xyz"])
+            HyperliquidClient(max_retries=0, extended_universe=True)
             call_kwargs = mock_info_cls.call_args
             assert call_kwargs.kwargs.get("perp_dexs") == ["", "xyz"]
 
-    def test_exchange_initialized_with_perp_dexs(self):
+    def test_exchange_gets_extended_universe(self):
         with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
              patch('fractrade_hl_simple.hyperliquid.Exchange') as mock_exchange_cls:
             mock_info_cls.return_value.post.return_value = [DEFAULT_META, DEFAULT_CTXS]
@@ -293,6 +293,6 @@ class TestXyzSdkInit:
                 private_key="0x" + "ab" * 32,
                 public_address="0x1234567890abcdef1234567890abcdef12345678",
             )
-            HyperliquidClient(account=account, max_retries=0, perp_dexs=["", "xyz"])
+            HyperliquidClient(account=account, max_retries=0, extended_universe=True)
             call_kwargs = mock_exchange_cls.call_args
             assert call_kwargs.kwargs.get("perp_dexs") == ["", "xyz"]

@@ -13,7 +13,7 @@ from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
 @pytest.fixture(scope="module")
 def client():
     account = HyperliquidAccount.from_env()
-    return HyperliquidClient(account=account, perp_dexs=["", "xyz"])
+    return HyperliquidClient(account=account, extended_universe=True)
 
 
 # ── Public endpoints (no auth needed) ─────────────────────────────────

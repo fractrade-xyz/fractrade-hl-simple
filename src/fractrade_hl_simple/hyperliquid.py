@@ -47,7 +47,7 @@ class HyperliquidClient:
         max_retries: int = 3,
         retry_delay: float = 1.0,
         cache_market_specs: bool = True,
-        perp_dexs: Optional[List[str]] = None,
+        extended_universe: bool = False,
     ):
         """Initialize HyperliquidClient.
 
@@ -60,8 +60,8 @@ class HyperliquidClient:
             cache_market_specs (bool): If True (default), reuses cached market specs across instances
                 within the same process. Cache expires after 24 hours. Set to False to always fetch
                 fresh specs on init.
-            perp_dexs (Optional[List[str]]): Perp dexes to load. Defaults to [""] (crypto only).
-                Use ["", "xyz"] to also enable stocks, commodities, indices, and forex.
+            extended_universe (bool): If True, enables trading of stocks, commodities, indices, and forex
+                (xyz: symbols like xyz:TSLA, xyz:GOLD). Off by default to avoid extra API overhead.
 
         Raises:
             ValueError: If env is not 'mainnet' or 'testnet'
@@ -78,7 +78,7 @@ class HyperliquidClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay
         self.base_url = constants.TESTNET_API_URL if env == "testnet" else constants.MAINNET_API_URL
-        self.perp_dexs = perp_dexs if perp_dexs is not None else [""]
+        self.perp_dexs = ["", "xyz"] if extended_universe else [""]
         self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs)
         
         # Initialize market specs
