@@ -10,6 +10,7 @@ from dacite import from_dict
 from hyperliquid.exchange import Exchange
 from hyperliquid.info import Info
 from hyperliquid.utils import constants
+from hyperliquid.utils.error import ClientError
 
 from .exceptions import (
     PositionNotFoundException,
@@ -37,6 +38,8 @@ logger.addHandler(logging.NullHandler())
 class HyperliquidClient:
     _cached_market_specs: Optional[Dict[str, Dict]] = None
     _cached_market_specs_at: float = 0
+    _cached_meta: Optional[Any] = None
+    _cached_spot_meta: Optional[Any] = None
     _CACHE_TTL: float = 86400  # 24 hours
 
     def __init__(
@@ -79,14 +82,21 @@ class HyperliquidClient:
         self.retry_delay = retry_delay
         self.base_url = constants.TESTNET_API_URL if env == "testnet" else constants.MAINNET_API_URL
         self.perp_dexs = ["", "xyz"] if extended_universe else [""]
-        self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs)
-        
+
         # Initialize market specs
         cache_hit = (
             cache_market_specs
             and HyperliquidClient._cached_market_specs is not None
             and time.time() - HyperliquidClient._cached_market_specs_at < self._CACHE_TTL
         )
+        if cache_hit and HyperliquidClient._cached_meta is not None:
+            self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs,
+                            meta=HyperliquidClient._cached_meta,
+                            spot_meta=HyperliquidClient._cached_spot_meta)
+        else:
+            self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs)
+            HyperliquidClient._cached_meta = self.info.meta()
+            HyperliquidClient._cached_spot_meta = self.info.spot_meta()
         if cache_hit:
             self.market_specs = HyperliquidClient._cached_market_specs
             self._market_specs_fetched_at = HyperliquidClient._cached_market_specs_at
@@ -185,6 +195,17 @@ class HyperliquidClient:
         for attempt in range(attempts):
             try:
                 return fn(*args, **kwargs)
+            except ClientError as e:
+                if e.status_code == 429:
+                    last_exception = e
+                    if attempt < self.max_retries:
+                        wait = self.retry_delay * (2 ** attempt)
+                        logger.warning(f"Rate limited, retry {attempt + 1}/{self.max_retries} after {wait:.1f}s")
+                        time.sleep(wait)
+                    else:
+                        raise RateLimitException(f"Rate limited after {self.max_retries} retries")
+                else:
+                    raise
             except (requests.ConnectionError, requests.Timeout,
                     RateLimitException, ServerErrorException) as e:
                 last_exception = e
@@ -229,32 +250,43 @@ class HyperliquidClient:
                 "total_ntl_pos": response.get("crossMarginSummary", {}).get("totalNtlPos", "0"),
                 "total_raw_usd": response.get("crossMarginSummary", {}).get("totalRawUsd", "0")
             },
-            "withdrawable": response.get("withdrawable", "0")
+            "withdrawable": response.get("withdrawable", "0"),
+            "cross_maintenance_margin_used": response.get("crossMaintenanceMarginUsed"),
         }
-        
+
         # Add positions if they exist
         if "assetPositions" in response:
-            formatted_response["asset_positions"] = [
-                {
-                    "position": {
-                        "symbol": pos["position"]["coin"],
-                        "entry_price": pos["position"].get("entryPx"),
-                        "leverage": {
-                            "type": pos["position"]["leverage"]["type"],
-                            "value": pos["position"]["leverage"]["value"]
-                        },
-                        "liquidation_price": pos["position"].get("liquidationPx"),
-                        "margin_used": pos["position"]["marginUsed"],
-                        "max_trade_sizes": pos["position"].get("maxTradeSzs"),
-                        "position_value": pos["position"]["positionValue"],
-                        "return_on_equity": pos["position"]["returnOnEquity"],
-                        "size": pos["position"]["szi"],
-                        "unrealized_pnl": pos["position"]["unrealizedPnl"]
+            formatted_response["asset_positions"] = []
+            for pos in response.get("assetPositions", []):
+                pos_data = pos["position"]
+                position_dict = {
+                    "symbol": pos_data["coin"],
+                    "entry_price": pos_data.get("entryPx"),
+                    "leverage": {
+                        "type": pos_data["leverage"]["type"],
+                        "value": pos_data["leverage"]["value"]
                     },
-                    "type": pos["type"]
+                    "liquidation_price": pos_data.get("liquidationPx"),
+                    "margin_used": pos_data["marginUsed"],
+                    "max_trade_sizes": pos_data.get("maxTradeSzs"),
+                    "position_value": pos_data["positionValue"],
+                    "return_on_equity": pos_data["returnOnEquity"],
+                    "size": pos_data["szi"],
+                    "unrealized_pnl": pos_data["unrealizedPnl"],
+                    "max_leverage": pos_data.get("maxLeverage"),
                 }
-                for pos in response.get("assetPositions", [])
-            ]
+                # Parse cumulative funding if present
+                cf = pos_data.get("cumFunding")
+                if cf and isinstance(cf, dict):
+                    position_dict["cum_funding"] = {
+                        "all_time": cf.get("allTime", "0"),
+                        "since_open": cf.get("sinceOpen", "0"),
+                        "since_change": cf.get("sinceChange", "0"),
+                    }
+                formatted_response["asset_positions"].append({
+                    "position": position_dict,
+                    "type": pos["type"]
+                })
         
         return from_dict(data_class=UserState, data=formatted_response, config=DACITE_CONFIG)
         
@@ -695,18 +727,18 @@ class HyperliquidClient:
             Dict[str, Order]: Dictionary containing entry order and optional sl/tp orders
         """
         orders = {"entry": self.buy(symbol, size, limit_price, slippage=slippage)}
-        
-        current_price = self.get_price(symbol)
+
+        reference_price = limit_price or float(orders["entry"].limit_price or 0) or self.get_price(symbol)
         if stop_loss_price:
-            if stop_loss_price >= (limit_price or current_price):
+            if stop_loss_price >= reference_price:
                 raise ValueError("Stop loss price must be below entry price for longs")
             orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price)
-        
+
         if take_profit_price:
-            if take_profit_price <= (limit_price or current_price):
+            if take_profit_price <= reference_price:
                 raise ValueError("Take profit price must be above entry price for longs")
             orders["take_profit"] = self.take_profit(symbol, size, take_profit_price)
-        
+
         return orders
 
     def open_short_position(
@@ -732,19 +764,287 @@ class HyperliquidClient:
             Dict[str, Order]: Dictionary containing entry order and optional sl/tp orders
         """
         orders = {"entry": self.sell(symbol, size, limit_price, slippage=slippage)}
-        
-        current_price = self.get_price(symbol)
+
+        reference_price = limit_price or float(orders["entry"].limit_price or 0) or self.get_price(symbol)
         if stop_loss_price:
-            if stop_loss_price <= (limit_price or current_price):
+            if stop_loss_price <= reference_price:
                 raise ValueError("Stop loss price must be above entry price for shorts")
             orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price)
-        
+
         if take_profit_price:
-            if take_profit_price >= (limit_price or current_price):
+            if take_profit_price >= reference_price:
                 raise ValueError("Take profit price must be below entry price for shorts")
             orders["take_profit"] = self.take_profit(symbol, size, take_profit_price)
-        
+
         return orders
+
+    def _check_order_filled(self, order_id: int) -> bool:
+        """Check if an order has been filled via the order status API."""
+        try:
+            status = self.get_order_status(order_id)
+            order_info = status.get("order", {})
+            return order_info.get("status") == "filled"
+        except Exception as e:
+            logger.debug(f"Error checking order status {order_id}: {e}")
+            return False
+
+    def _make_filled_order(self, order_id: int, symbol: str, is_buy: bool, size: float,
+                           order: Order, avg_fill_price: Optional[Decimal] = None) -> Order:
+        """Create a filled Order object from a completed maker chase."""
+        logger.info(f"Maker order filled: {symbol} {'buy' if is_buy else 'sell'} {size}"
+                    f"{f' @ {avg_fill_price}' if avg_fill_price else ''}")
+        return Order(
+            order_id=str(order_id),
+            symbol=symbol,
+            is_buy=is_buy,
+            size=Decimal(str(size)),
+            filled_size=Decimal(str(size)),
+            order_type=order.order_type,
+            reduce_only=order.reduce_only,
+            status="filled",
+            created_at=order.created_at,
+            limit_price=order.limit_price,
+            average_fill_price=avg_fill_price,
+        )
+
+    def _auto_reprice_interval(self, symbol: str) -> tuple:
+        """Auto-detect timeout and reprice_interval based on order book spread.
+
+        Returns:
+            (timeout, reprice_interval) tuple
+        """
+        try:
+            book = self.get_order_book(symbol)
+            mid = book.get("mid_price")
+            spread = book.get("spread")
+            if mid and spread and mid > 0:
+                spread_bps = (spread / mid) * 10000
+                if spread_bps < 2:       # Tight spread: BTC, ETH, SOL
+                    return (30.0, 3.0)
+                elif spread_bps < 20:     # Medium: kPEPE, DOGE, LINK
+                    return (45.0, 5.0)
+                else:                     # Wide spread: DYM, low-cap
+                    return (60.0, 8.0)
+        except Exception as e:
+            logger.debug(f"Auto-detect spread failed for {symbol}: {e}")
+        return (60.0, 5.0)  # Safe defaults
+
+    def maker_order(
+        self,
+        symbol: str,
+        is_buy: bool,
+        size: float,
+        timeout: Optional[float] = None,
+        reprice_interval: Optional[float] = None,
+        fallback: str = "ioc",
+        reduce_only: bool = False,
+    ) -> Order:
+        """Place a maker (post_only) limit order and chase the best price until filled.
+
+        Places a post_only order at the best bid (buy) or best ask (sell), then
+        re-prices every `reprice_interval` seconds to follow the market. If the order
+        is not fully filled within `timeout` seconds, falls back to the specified
+        strategy.
+
+        When timeout and reprice_interval are None (default), they are auto-detected
+        from the order book spread:
+        - Tight spread (<2 bps, e.g. BTC/ETH): timeout=30s, reprice=3s
+        - Medium spread (<20 bps, e.g. kPEPE): timeout=45s, reprice=5s
+        - Wide spread (>20 bps, e.g. DYM): timeout=60s, reprice=8s
+
+        Args:
+            symbol (str): Trading pair symbol (e.g., "BTC")
+            is_buy (bool): True for buy, False for sell
+            size (float): Order size in base currency
+            timeout (Optional[float]): Max seconds to chase before fallback. None for auto-detect.
+            reprice_interval (Optional[float]): Seconds between re-pricing. None for auto-detect.
+            fallback (str): What to do on timeout. One of:
+                - "ioc": Place an IOC market order for remaining size (default)
+                - "market": Place a market order for remaining size
+                - "cancel": Give up, return last order as-is
+            reduce_only (bool): Whether the order should only reduce position
+
+        Returns:
+            Order: The final order. Check order.status and order.filled_size for results.
+
+        Raises:
+            RuntimeError: If client is not authenticated
+            ValueError: If parameters are invalid
+        """
+        if not self.is_authenticated():
+            raise RuntimeError("This method requires authentication")
+        if fallback not in ("ioc", "market", "cancel"):
+            raise ValueError("fallback must be 'ioc', 'market', or 'cancel'")
+
+        # Auto-detect timing from spread if not specified
+        if timeout is None or reprice_interval is None:
+            auto_timeout, auto_reprice = self._auto_reprice_interval(symbol)
+            if timeout is None:
+                timeout = auto_timeout
+            if reprice_interval is None:
+                reprice_interval = auto_reprice
+            logger.info(f"Maker order {symbol}: auto-detected timeout={timeout}s, reprice={reprice_interval}s")
+
+        remaining_size = size
+        last_order = None
+        attempts = 0
+        start_time = time.time()
+        deadline = start_time + timeout
+        last_spread_bps = None
+
+        def _annotate(order: Order, is_maker: bool) -> Order:
+            """Attach execution metadata to the order."""
+            order.is_maker = is_maker
+            order.attempts = attempts
+            order.elapsed = round(time.time() - start_time, 2)
+            order.spread_bps = last_spread_bps
+            return order
+
+        while time.time() < deadline and remaining_size > 0:
+            # Get best price for our side
+            book = self.get_order_book(symbol)
+            mid = book.get("mid_price")
+            spread = book.get("spread")
+            if mid and spread and mid > 0:
+                last_spread_bps = round((spread / mid) * 10000, 2)
+
+            if is_buy:
+                best_price = book.get("best_bid")
+            else:
+                best_price = book.get("best_ask")
+
+            if best_price is None:
+                logger.warning(f"No {'bid' if is_buy else 'ask'} in order book for {symbol}, retrying...")
+                time.sleep(min(reprice_interval, max(0.1, deadline - time.time())))
+                continue
+
+            limit_price = self._format_price(symbol, best_price)
+            formatted_size = self._format_size(symbol, remaining_size)
+            attempts += 1
+
+            # Place post_only order
+            try:
+                order = self.create_order(
+                    symbol=symbol,
+                    is_buy=is_buy,
+                    size=formatted_size,
+                    limit_price=limit_price,
+                    reduce_only=reduce_only,
+                    post_only=True,
+                    time_in_force="Gtc",
+                )
+                last_order = order
+            except ValueError as e:
+                # post_only rejected (would cross spread) — retry at next interval
+                logger.debug(f"Post-only rejected for {symbol}: {e}")
+                time.sleep(min(reprice_interval, max(0.1, deadline - time.time())))
+                continue
+
+            # If filled immediately
+            if order.status == "filled":
+                logger.info(f"Maker order filled immediately: {symbol} {'buy' if is_buy else 'sell'} "
+                           f"{order.filled_size} @ {order.average_fill_price}")
+                return _annotate(order, is_maker=True)
+
+            # Sleep for reprice interval, then cancel and check result
+            order_id = int(order.order_id)
+            sleep_time = min(reprice_interval, max(0.1, deadline - time.time()))
+            time.sleep(sleep_time)
+
+            # Try to cancel — if it fails, order was likely filled
+            cancelled = self.cancel_order(order_id, symbol)
+
+            # Single status check: detect fill or partial fill
+            try:
+                status = self.get_order_status(order_id)
+                order_info = status.get("order", {})
+                order_detail = order_info.get("order", {})
+
+                # Extract fill price from status response
+                avg_px_str = order_detail.get("avgPx") or order_detail.get("limitPx")
+                avg_px = Decimal(str(avg_px_str)) if avg_px_str else None
+
+                if order_info.get("status") == "filled":
+                    return _annotate(
+                        self._make_filled_order(order_id, symbol, is_buy, remaining_size, order, avg_px),
+                        is_maker=True,
+                    )
+
+                # Check for partial fills
+                orig_sz = Decimal(str(order_detail.get("origSz", formatted_size)))
+                current_sz = Decimal(str(order_detail.get("sz", formatted_size)))
+                partial_filled = orig_sz - current_sz
+                if partial_filled > 0:
+                    remaining_size = float(Decimal(str(remaining_size)) - partial_filled)
+                    remaining_size = max(0, remaining_size)
+                    logger.info(f"Partial fill detected: {partial_filled} filled, {remaining_size} remaining")
+                    if remaining_size <= 0:
+                        return _annotate(
+                            self._make_filled_order(order_id, symbol, is_buy, size, order, avg_px),
+                            is_maker=True,
+                        )
+            except Exception as e:
+                logger.debug(f"Error checking order status after cancel: {e}")
+
+        # Timeout reached — apply fallback for remaining size
+        if remaining_size > 0 and fallback != "cancel":
+            formatted_remaining = self._format_size(symbol, remaining_size)
+            if formatted_remaining <= 0:
+                if last_order is not None:
+                    return _annotate(last_order, is_maker=True)
+            logger.info(f"Maker chase timeout for {symbol}, falling back to {fallback} "
+                       f"for remaining {formatted_remaining}")
+            if fallback == "ioc":
+                fallback_order = self.create_order(
+                    symbol=symbol,
+                    is_buy=is_buy,
+                    size=formatted_remaining,
+                    limit_price=None,
+                    reduce_only=reduce_only,
+                    time_in_force="Ioc",
+                )
+                return _annotate(fallback_order, is_maker=False)
+            elif fallback == "market":
+                if is_buy:
+                    fallback_order = self.buy(symbol, formatted_remaining, reduce_only=reduce_only)
+                else:
+                    fallback_order = self.sell(symbol, formatted_remaining, reduce_only=reduce_only)
+                return _annotate(fallback_order, is_maker=False)
+
+        if last_order is not None:
+            return _annotate(last_order, is_maker=False)
+
+        raise RuntimeError(f"maker_order failed: no order placed for {symbol}")
+
+    def maker_buy(
+        self,
+        symbol: str,
+        size: float,
+        timeout: Optional[float] = None,
+        reprice_interval: Optional[float] = None,
+        fallback: str = "ioc",
+        reduce_only: bool = False,
+    ) -> Order:
+        """Place a maker buy order. Convenience wrapper for maker_order().
+
+        See maker_order() for full documentation.
+        """
+        return self.maker_order(symbol, True, size, timeout, reprice_interval, fallback, reduce_only)
+
+    def maker_sell(
+        self,
+        symbol: str,
+        size: float,
+        timeout: Optional[float] = None,
+        reprice_interval: Optional[float] = None,
+        fallback: str = "ioc",
+        reduce_only: bool = False,
+    ) -> Order:
+        """Place a maker sell order. Convenience wrapper for maker_order().
+
+        See maker_order() for full documentation.
+        """
+        return self.maker_order(symbol, False, size, timeout, reprice_interval, fallback, reduce_only)
 
     def close(
         self,
@@ -813,21 +1113,12 @@ class HyperliquidClient:
         if symbol:
             open_orders = [order for order in open_orders if order["coin"] == symbol]
 
-        # Track failures and raise at the end
-        failures = []
-        for order in open_orders:
-            try:
-                self._with_retry(self.exchange.cancel, order["coin"], order["oid"])
-            except Exception as e:
-                failures.append((order["coin"], order["oid"], str(e)))
-                logger.error(f"Failed to cancel order {order['oid']} for {order['coin']}: {e}")
+        if not open_orders:
+            return
 
-        if failures:
-            symbols = [f"{coin}:{oid}" for coin, oid, _ in failures]
-            raise RuntimeError(
-                f"Failed to cancel {len(failures)} order(s): {', '.join(symbols)}. "
-                f"These orders may still be active!"
-            )
+        # Bulk cancel in a single API call
+        cancel_requests = [{"coin": order["coin"], "oid": order["oid"]} for order in open_orders]
+        self._with_retry(self.exchange.bulk_cancel, cancel_requests)
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
         """Get all open orders for the authenticated user.
@@ -898,7 +1189,10 @@ class HyperliquidClient:
                     "time_in_force": order_data.get("tif", "Gtc") or "Gtc",
                     "created_at": order_data.get("timestamp", 0),
                     "filled_size": Decimal(str(order_data.get("origSz", 0))) - Decimal(str(order_data.get("sz", 0))),
-                    "type": order_type_str
+                    "type": order_type_str,
+                    "children": order_data.get("children") or None,
+                    "is_position_tpsl": order_data.get("isPositionTpsl"),
+                    "trigger_condition": order_data.get("triggerCondition"),
                 }
 
                 if "limitPx" in order_data:
@@ -961,13 +1255,17 @@ class HyperliquidClient:
             'state': user_state
         }
 
-    def get_spot_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, SpotState]:
+    def get_spot_balance(self, address: Optional[str] = None, simple: bool = True,
+                         prices: Optional[Dict[str, float]] = None) -> Union[Decimal, SpotState]:
         """Get spot trading balance for an address.
-        
+
         Args:
             address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
             simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
-            
+            prices (Optional[Dict[str, float]]): Pre-fetched price dict from get_price(). If None, fetches fresh
+                prices internally. Pass this when calling get_spot_balance for multiple wallets to avoid
+                redundant API calls.
+
         Returns:
             Union[Decimal, SpotState]: If simple=True (default), returns just the total balance in USD.
                                      If simple=False, returns a SpotState object containing:
@@ -977,15 +1275,16 @@ class HyperliquidClient:
         """
         if address is None and not self.is_authenticated():
             raise ValueError("Address required when client is not authenticated")
-            
+
         if address is None:
             address = self.public_address
-            
+
         # Get spot user state
         response = self._with_retry(self.info.spot_user_state, address)
-        
-        # Get current prices for all tokens
-        prices = self.get_price()
+
+        # Get current prices for all tokens (use provided prices or fetch fresh)
+        if prices is None:
+            prices = self.get_price()
         
         # Process balances
         total_balance = Decimal('0')
@@ -1002,8 +1301,10 @@ class HyperliquidClient:
                 if token_amount == 0:
                     continue
                     
-                # Get token price
+                # Get token price (stablecoins default to $1 since they have no perp market)
                 token_price = Decimal(str(prices.get(token, '0')))
+                if token_price == 0 and token.upper() in ('USDC', 'USDT', 'USDC.E', 'USDBC'):
+                    token_price = Decimal('1')
                 
                 # Calculate USD value
                 usd_value = token_amount * token_price
@@ -1363,20 +1664,12 @@ class HyperliquidClient:
         open_orders = self._with_retry(self.info.open_orders, self.account.public_address)
         spot_orders = [o for o in open_orders if o["coin"] in spot_coins]
 
-        failures = []
-        for order in spot_orders:
-            try:
-                self._with_retry(self.exchange.cancel, order["coin"], order["oid"])
-            except Exception as e:
-                failures.append((order["coin"], order["oid"], str(e)))
-                logger.error(f"Failed to cancel spot order {order['oid']} for {order['coin']}: {e}")
+        if not spot_orders:
+            return
 
-        if failures:
-            symbols = [f"{coin}:{oid}" for coin, oid, _ in failures]
-            raise RuntimeError(
-                f"Failed to cancel {len(failures)} spot order(s): {', '.join(symbols)}. "
-                f"These orders may still be active!"
-            )
+        # Bulk cancel in a single API call
+        cancel_requests = [{"coin": order["coin"], "oid": order["oid"]} for order in spot_orders]
+        self._with_retry(self.exchange.bulk_cancel, cancel_requests)
 
     def get_spot_open_orders(self, token: Optional[str] = None) -> List[Order]:
         """Get open spot orders.
@@ -2453,6 +2746,8 @@ class HyperliquidClient:
             time=raw.get("time", 0),
             hash=raw.get("hash", ""),
             fee=Decimal(str(raw["fee"])) if "fee" in raw else None,
+            start_position=Decimal(str(raw["startPosition"])) if "startPosition" in raw else None,
+            fee_token=raw.get("feeToken"),
         )
 
     def get_fills(self, symbol: Optional[str] = None) -> list:

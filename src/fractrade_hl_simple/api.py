@@ -129,6 +129,39 @@ def open_short_position(symbol: str,
             return new_client.open_short_position(symbol, size, stop_loss_price, take_profit_price)
     return client.open_short_position(symbol, size, stop_loss_price, take_profit_price)
 
+def maker_order(symbol: str, is_buy: bool, size: float,
+               timeout: Optional[float] = None, reprice_interval: Optional[float] = None,
+               fallback: str = "ioc", reduce_only: bool = False,
+               account: Optional[Union[Dict, HyperliquidAccount]] = None,
+               client: Optional[HyperliquidClient] = None) -> Order:
+    """Place a maker (post_only) order with automatic chase and fallback."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.maker_order(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only)
+    return client.maker_order(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only)
+
+def maker_buy(symbol: str, size: float,
+             timeout: Optional[float] = None, reprice_interval: Optional[float] = None,
+             fallback: str = "ioc", reduce_only: bool = False,
+             account: Optional[Union[Dict, HyperliquidAccount]] = None,
+             client: Optional[HyperliquidClient] = None) -> Order:
+    """Place a maker buy order with automatic chase and fallback."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.maker_buy(symbol, size, timeout, reprice_interval, fallback, reduce_only)
+    return client.maker_buy(symbol, size, timeout, reprice_interval, fallback, reduce_only)
+
+def maker_sell(symbol: str, size: float,
+              timeout: Optional[float] = None, reprice_interval: Optional[float] = None,
+              fallback: str = "ioc", reduce_only: bool = False,
+              account: Optional[Union[Dict, HyperliquidAccount]] = None,
+              client: Optional[HyperliquidClient] = None) -> Order:
+    """Place a maker sell order with automatic chase and fallback."""
+    if client is None:
+        with get_client(account) as new_client:
+            return new_client.maker_sell(symbol, size, timeout, reprice_interval, fallback, reduce_only)
+    return client.maker_sell(symbol, size, timeout, reprice_interval, fallback, reduce_only)
+
 def cancel_all_orders(symbol: Optional[str] = None,
                      account: Optional[Union[Dict, HyperliquidAccount]] = None,
                      client: Optional[HyperliquidClient] = None) -> None:
@@ -263,12 +296,13 @@ def get_optimal_limit_price(symbol: str,
 def get_spot_balance(address: Optional[str] = None,
                     account: Optional[Union[Dict, HyperliquidAccount]] = None,
                     client: Optional[HyperliquidClient] = None,
-                    simple: bool = True) -> Union[Decimal, 'SpotState']:
+                    simple: bool = True,
+                    prices: Optional[Dict] = None) -> Union[Decimal, 'SpotState']:
     """Get spot trading balance for an address or authenticated user."""
     if client is None:
         with get_client(account) as new_client:
-            return new_client.get_spot_balance(address, simple=simple)
-    return client.get_spot_balance(address, simple=simple)
+            return new_client.get_spot_balance(address, simple=simple, prices=prices)
+    return client.get_spot_balance(address, simple=simple, prices=prices)
 
 def get_evm_balance(address: Optional[str] = None,
                     account: Optional[Union[Dict, HyperliquidAccount]] = None,

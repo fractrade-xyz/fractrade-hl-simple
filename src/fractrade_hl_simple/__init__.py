@@ -1,5 +1,5 @@
 from .hyperliquid import HyperliquidClient
-from .models import HyperliquidAccount, Fill, Order, Position, UserState
+from .models import HyperliquidAccount, Fill, Order, Position, UserState, CumFunding
 from .exceptions import (
     HyperliquidException,
     ConfigurationException,
@@ -53,6 +53,9 @@ from .api import (
     get_spot_open_orders,
     get_spot_order_book,
     get_spot_fills,
+    maker_order,
+    maker_buy,
+    maker_sell,
 )
 
 __all__ = [
@@ -62,6 +65,7 @@ __all__ = [
     'Order',
     'Position',
     'UserState',
+    'CumFunding',
     'HyperliquidException',
     'ConfigurationException',
     'UnauthorizedException',
@@ -112,4 +116,7 @@ __all__ = [
     'get_spot_open_orders',
     'get_spot_order_book',
     'get_spot_fills',
+    'maker_order',
+    'maker_buy',
+    'maker_sell',
 ]

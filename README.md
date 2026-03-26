@@ -147,6 +147,22 @@ position = client.open_long_position(
 position = client.open_short_position("BTC", 0.001, stop_loss_price=90000.0, take_profit_price=75000.0)
 ```
 
+### Maker Orders (Fee-Optimized)
+
+```python
+# Simple maker buy/sell — auto-detects optimal timing from order book spread
+order = client.maker_buy("BTC", 0.001)    # Tight spread → 30s timeout, 3s reprice
+order = client.maker_sell("kPEPE", 1500)  # Medium spread → 45s timeout, 5s reprice
+
+# Equivalent verbose form
+order = client.maker_order("BTC", is_buy=True, size=0.001)
+
+# Override auto-detection with manual timing
+order = client.maker_buy("DYM", 30, timeout=60, reprice_interval=8, fallback="ioc")
+
+# fallback options: "ioc" (default), "market", "cancel"
+```
+
 ### Close Position
 ```python
 close_order = client.close("BTC")
@@ -220,6 +236,11 @@ for fill in fills:
 orders = client.get_spot_open_orders("FRAC")
 balance = client.get_spot_balance()              # Total spot balance in USD
 balance = client.get_spot_balance(simple=False)  # Detailed per-token balances
+
+# For multiple wallets, fetch prices once to avoid redundant API calls:
+prices = client.get_price()
+for wallet in wallets:
+    balance = client.get_spot_balance(wallet, prices=prices)
 ```
 
 ## Leverage Management

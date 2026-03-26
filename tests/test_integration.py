@@ -905,10 +905,118 @@ def test_funding_rates(client):
     print(f"Rates above {low_threshold} (0.001%): {len(low_threshold_rates)}")
     print(f"Rates above {high_threshold} (0.01%): {len(high_threshold_rates)}")
     print(f"Rates above {very_high_threshold} (0.1%): {len(very_high_threshold_rates)}")
-    
-    if high_threshold_rates:
-        print(f"Sample high funding rates:")
-        for rate in high_threshold_rates[:5]:  # Show first 5
-            print(f"  {rate['symbol']}: {rate['funding_rate']:.6f}")
-    
-    print("Funding rates test completed successfully!")
+
+
+# ── Maker order integration tests ────────────────────────────────────
+
+# Asset configs: symbol, size, liquidity tier
+MAKER_TEST_ASSETS = [
+    pytest.param("BTC", 0.001, id="BTC-high-liquidity"),       # ~$70 notional
+    pytest.param("kPEPE", 4000, id="kPEPE-medium-liquidity"),  # ~$13 notional
+    pytest.param("DYM", 400, id="DYM-low-liquidity"),          # ~$12 notional
+]
+
+
+class TestMakerOrderIntegration:
+    """Real-money tests for maker_buy / maker_sell across liquidity tiers."""
+
+    @pytest.fixture(autouse=True)
+    def cleanup(self, client, request):
+        """Ensure no positions or orders are left after each test."""
+        yield
+        symbol = request.node.callspec.params.get("symbol", None)
+        if symbol:
+            try:
+                client.cancel_all_orders(symbol)
+                positions = client.get_positions()
+                if any(p.symbol == symbol for p in positions):
+                    client.close(symbol)
+            except Exception as e:
+                print(f"Cleanup {symbol}: {e}")
+            time.sleep(2)
+
+    @pytest.mark.parametrize("symbol,size", MAKER_TEST_ASSETS)
+    def test_maker_buy_fills(self, client, symbol, size):
+        """maker_buy fills for each asset (maker or IOC fallback)."""
+        # Measure spread first
+        book = client.get_order_book(symbol)
+        spread_bps = (book["spread"] / book["mid_price"]) * 10000 if book["mid_price"] else 0
+        print(f"\n{symbol}: bid={book['best_bid']} ask={book['best_ask']} spread={book['spread']} ({spread_bps:.1f} bps)")
+
+        mid_before = book["mid_price"]
+
+        order = client.maker_buy(symbol, size)
+        fill_price = float(order.average_fill_price or order.limit_price or 0)
+
+        print(f"{symbol} maker_buy: status={order.status}, is_maker={order.is_maker}, "
+              f"attempts={order.attempts}, elapsed={order.elapsed}s, spread={order.spread_bps} bps, "
+              f"fill_price={fill_price}, avg_fill={order.average_fill_price}")
+        assert order.status == "filled", f"Expected filled, got {order.status}"
+        assert order.is_maker is not None, "is_maker should be set"
+        assert order.attempts >= 1, "Should have at least 1 attempt"
+        assert order.elapsed is not None and order.elapsed >= 0, "elapsed should be set"
+
+        # No overpay: actual fill price should be within 0.5% of mid
+        if mid_before and fill_price:
+            overpay_pct = (fill_price - mid_before) / mid_before * 100
+            print(f"{symbol} overpay: {overpay_pct:+.4f}% ({'MAKER' if order.is_maker else 'TAKER/IOC'})")
+            assert overpay_pct < 0.5, f"Overpaid by {overpay_pct:.4f}% on {symbol}"
+
+    @pytest.mark.parametrize("symbol,size", MAKER_TEST_ASSETS)
+    def test_maker_sell_fills(self, client, symbol, size):
+        """maker_sell fills for each asset. Opens position first with market buy."""
+        # Open position first
+        client.buy(symbol, size)
+        time.sleep(2)
+
+        book = client.get_order_book(symbol)
+        mid_before = book["mid_price"]
+        spread_bps = (book["spread"] / book["mid_price"]) * 10000 if book["mid_price"] else 0
+        print(f"\n{symbol}: bid={book['best_bid']} ask={book['best_ask']} spread={book['spread']} ({spread_bps:.1f} bps)")
+
+        order = client.maker_sell(symbol, size, reduce_only=True)
+        fill_price = float(order.average_fill_price or order.limit_price or 0)
+
+        print(f"{symbol} maker_sell: status={order.status}, is_maker={order.is_maker}, "
+              f"attempts={order.attempts}, elapsed={order.elapsed}s, spread={order.spread_bps} bps, "
+              f"fill_price={fill_price}, avg_fill={order.average_fill_price}")
+        assert order.status == "filled", f"Expected filled, got {order.status}"
+        assert order.is_maker is not None, "is_maker should be set"
+
+        # No underpay: actual fill price should be within 0.5% of mid
+        if mid_before and fill_price:
+            underpay_pct = (mid_before - fill_price) / mid_before * 100
+            print(f"{symbol} underpay: {underpay_pct:+.4f}% ({'MAKER' if order.is_maker else 'TAKER/IOC'})")
+            assert underpay_pct < 0.5, f"Underpaid by {underpay_pct:.4f}% on {symbol}"
+
+    @pytest.mark.parametrize("symbol,size", MAKER_TEST_ASSETS)
+    def test_auto_timing_detected(self, client, symbol, size):
+        """Auto-detect produces reasonable timeout/reprice for each tier."""
+        timeout, reprice = client._auto_reprice_interval(symbol)
+        book = client.get_order_book(symbol)
+        spread_bps = (book["spread"] / book["mid_price"]) * 10000 if book["mid_price"] else 0
+
+        print(f"{symbol}: spread={spread_bps:.1f} bps → timeout={timeout}s, reprice={reprice}s")
+
+        assert timeout >= 10, "Timeout should be at least 10s"
+        assert timeout <= 120, "Timeout should be at most 120s"
+        assert reprice >= 1, "Reprice should be at least 1s"
+        assert reprice <= timeout, "Reprice should be less than timeout"
+
+    def test_short_timeout_falls_back_to_ioc(self, client):
+        """With a short timeout, should try maker then fall back to IOC."""
+        order = client.maker_buy("BTC", 0.001, timeout=8, reprice_interval=3)
+        print(f"Short timeout: status={order.status}")
+        assert order.status == "filled"
+
+    def test_fallback_cancel_no_fill(self, client):
+        """With fallback='cancel' and short timeout, returns the resting order."""
+        order = client.maker_buy("BTC", 0.001, timeout=8, reprice_interval=3, fallback="cancel")
+        print(f"Cancel fallback: status={order.status}")
+        # With cancel fallback, we get whatever happened — maker fill or open order
+        assert order.status in ("filled", "open")
+        # Clean up
+        if order.status == "filled":
+            client.close("BTC")
+        else:
+            client.cancel_all_orders("BTC")

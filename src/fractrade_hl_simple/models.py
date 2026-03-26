@@ -83,6 +83,13 @@ class Leverage:
     value: Decimal
 
 @dataclass(slots=True, kw_only=True)
+class CumFunding:
+    """Cumulative funding payments for a position."""
+    all_time: Decimal
+    since_open: Decimal
+    since_change: Decimal
+
+@dataclass(slots=True, kw_only=True)
 class Position:
     """An open perpetual futures position."""
     symbol: str
@@ -95,6 +102,8 @@ class Position:
     size: Decimal
     unrealized_pnl: Decimal
     max_trade_sizes: Optional[List[Decimal]] = None
+    cum_funding: Optional[CumFunding] = None
+    max_leverage: Optional[int] = None
     
     @property
     def is_long(self) -> bool:
@@ -148,6 +157,7 @@ class UserState:
     margin_summary: MarginSummary
     cross_margin_summary: MarginSummary
     withdrawable: Decimal
+    cross_maintenance_margin_used: Optional[Decimal] = None
     spot_state: Optional[SpotState] = None
 
 @dataclass(slots=True, kw_only=True)
@@ -164,6 +174,8 @@ class Fill:
     time: int
     hash: str
     fee: Optional[Decimal] = None
+    start_position: Optional[Decimal] = None  # Position size before this fill
+    fee_token: Optional[str] = None           # Token the fee was paid in
 
     def __repr__(self) -> str:
         return (
@@ -196,7 +208,14 @@ class Order:
     trigger_price: Optional[Decimal] = None
     fee: Optional[Decimal] = None
     type: str = "unknown"  # Can be "limit", "market", "take_profit", "stop_loss"
-    
+    is_maker: Optional[bool] = None      # True if filled as maker, False if taker/IOC fallback
+    attempts: int = 1                     # Number of order placement attempts
+    elapsed: Optional[float] = None       # Seconds from first attempt to fill
+    spread_bps: Optional[float] = None    # Spread in basis points at time of execution
+    children: Optional[List[Dict[str, Any]]] = None       # Nested child orders (bracket orders)
+    is_position_tpsl: Optional[bool] = None               # Whether this is a position TP/SL order
+    trigger_condition: Optional[str] = None                # Trigger condition: "mark", "index", "last"
+
     @property
     def remaining_size(self) -> Decimal:
         return self.size - self.filled_size

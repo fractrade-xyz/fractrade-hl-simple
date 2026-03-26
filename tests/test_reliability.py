@@ -94,14 +94,14 @@ class TestCancelAllOrdersReliability:
             mock_client.cancel_all_orders()
 
     def test_raises_on_cancel_failure(self, mock_client):
-        """Must raise if any individual cancel fails."""
+        """Must raise if bulk cancel fails."""
         mock_client.info.open_orders.return_value = [
             {"coin": "BTC", "oid": 1},
             {"coin": "ETH", "oid": 2},
         ]
-        mock_client.exchange.cancel.side_effect = [None, Exception("cancel failed")]
+        mock_client.exchange.bulk_cancel.side_effect = Exception("cancel failed")
 
-        with pytest.raises(RuntimeError, match="Failed to cancel 1 order"):
+        with pytest.raises(Exception, match="cancel failed"):
             mock_client.cancel_all_orders()
 
     def test_succeeds_when_all_cancel(self, mock_client):
@@ -109,8 +109,29 @@ class TestCancelAllOrdersReliability:
             {"coin": "BTC", "oid": 1},
             {"coin": "ETH", "oid": 2},
         ]
-        mock_client.exchange.cancel.return_value = None
+        mock_client.exchange.bulk_cancel.return_value = None
         mock_client.cancel_all_orders()  # Should not raise
+
+    def test_uses_bulk_cancel(self, mock_client):
+        """cancel_all_orders should use a single bulk_cancel call."""
+        mock_client.info.open_orders.return_value = [
+            {"coin": "BTC", "oid": 1},
+            {"coin": "ETH", "oid": 2},
+            {"coin": "SOL", "oid": 3},
+        ]
+        mock_client.exchange.bulk_cancel.return_value = None
+        mock_client.cancel_all_orders()
+        mock_client.exchange.bulk_cancel.assert_called_once_with([
+            {"coin": "BTC", "oid": 1},
+            {"coin": "ETH", "oid": 2},
+            {"coin": "SOL", "oid": 3},
+        ])
+
+    def test_no_api_call_when_no_orders(self, mock_client):
+        """Should not call bulk_cancel when there are no orders."""
+        mock_client.info.open_orders.return_value = []
+        mock_client.cancel_all_orders()
+        mock_client.exchange.bulk_cancel.assert_not_called()
 
     def test_cancel_all_is_alias(self, mock_client):
         """cancel_all() should delegate to cancel_all_orders()."""
@@ -439,3 +460,368 @@ class TestExceptionHierarchy:
             OrderNotFoundException,
             InsufficientMarginException,
         )
+
+
+# ── get_spot_balance prices parameter ────────────────────────────────
+
+class TestGetSpotBalancePrices:
+    def test_uses_provided_prices(self, mock_client):
+        """get_spot_balance should use provided prices instead of calling get_price()."""
+        mock_client.info.spot_user_state.return_value = {
+            "balances": [
+                {"coin": "HYPE", "total": "10", "hold": "0", "entryNtl": "0"},
+            ]
+        }
+        external_prices = {"HYPE": 40.0}
+        result = mock_client.get_spot_balance(simple=True, prices=external_prices)
+        assert result == Decimal("400")
+        # all_mids should NOT have been called
+        mock_client.info.all_mids.assert_not_called()
+
+    def test_fetches_prices_when_not_provided(self, mock_client):
+        """get_spot_balance should fetch prices when none provided."""
+        mock_client.info.spot_user_state.return_value = {
+            "balances": [
+                {"coin": "HYPE", "total": "10", "hold": "0", "entryNtl": "0"},
+            ]
+        }
+        mock_client.info.all_mids.return_value = {"HYPE": "40.0"}
+        result = mock_client.get_spot_balance(simple=True)
+        assert result == Decimal("400")
+        mock_client.info.all_mids.assert_called()
+
+    def test_stablecoin_price_defaults_to_one(self, mock_client):
+        """USDC/USDT should default to $1 when not in price dict."""
+        mock_client.info.spot_user_state.return_value = {
+            "balances": [
+                {"coin": "USDC", "total": "10000", "hold": "0", "entryNtl": "0"},
+            ]
+        }
+        mock_client.info.all_mids.return_value = {}
+        result = mock_client.get_spot_balance(simple=True)
+        assert result == Decimal("10000")
+
+
+# ── open_long/short_position price reuse ─────────────────────────────
+
+class TestPositionPriceReuse:
+    USER_STATE = {
+        "marginSummary": {"accountValue": "10000", "totalMarginUsed": "100",
+                          "totalNtlPos": "500", "totalRawUsd": "10000"},
+        "crossMarginSummary": {"accountValue": "10000", "totalMarginUsed": "100",
+                               "totalNtlPos": "500", "totalRawUsd": "10000"},
+        "withdrawable": "9000",
+        "assetPositions": [{
+            "type": "oneWay",
+            "position": {
+                "coin": "BTC", "entryPx": "85000", "szi": "0.001",
+                "leverage": {"type": "cross", "value": "10"},
+                "liquidationPx": None, "marginUsed": "8.5",
+                "positionValue": "85", "returnOnEquity": "0.01",
+                "unrealizedPnl": "1.0",
+            },
+        }],
+    }
+
+    def _setup(self, mock_client):
+        mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
+        mock_client.info.user_state.return_value = self.USER_STATE
+        # First call: entry order (buy/sell). Subsequent: SL/TP trigger orders.
+        mock_client.exchange.order.return_value = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}},
+        }
+
+    def test_open_long_no_extra_get_price(self, mock_client):
+        """open_long_position should not call get_price() again for SL/TP validation."""
+        self._setup(mock_client)
+        mock_client.open_long_position("BTC", 0.001, stop_loss_price=80000.0, take_profit_price=90000.0)
+        # all_mids called once by buy() for slippage, not again for SL/TP validation
+        assert mock_client.info.all_mids.call_count == 1
+
+    def test_open_short_no_extra_get_price(self, mock_client):
+        """open_short_position should not call get_price() again for SL/TP validation."""
+        self._setup(mock_client)
+        # For short, szi should be negative
+        short_state = {**self.USER_STATE, "assetPositions": [{
+            "type": "oneWay",
+            "position": {
+                "coin": "BTC", "entryPx": "85000", "szi": "-0.001",
+                "leverage": {"type": "cross", "value": "10"},
+                "liquidationPx": None, "marginUsed": "8.5",
+                "positionValue": "85", "returnOnEquity": "-0.01",
+                "unrealizedPnl": "-1.0",
+            },
+        }]}
+        mock_client.info.user_state.return_value = short_state
+        mock_client.open_short_position("BTC", 0.001, stop_loss_price=90000.0, take_profit_price=80000.0)
+        assert mock_client.info.all_mids.call_count == 1
+
+
+# ── maker_order / maker_buy / maker_sell ─────────────────────────────
+
+class TestMakerOrder:
+    """Tests for maker_order, maker_buy, maker_sell."""
+
+    BOOK = {
+        "levels": [
+            [{"n": 1, "px": "85000.0", "sz": "1.0"}],
+            [{"n": 1, "px": "85001.0", "sz": "1.0"}],
+        ]
+    }
+    ORDER_STATUS_OPEN = {
+        "status": "order", "order": {"order": {"sz": "0.001", "origSz": "0.001"}, "status": "open"}
+    }
+
+    def test_fills_immediately(self, mock_client):
+        """If post_only order fills on first try, return immediately."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok",
+            "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}},
+        }
+        order = mock_client.maker_buy("BTC", 0.001, timeout=5)
+        assert order.status == "filled"
+        assert float(order.filled_size) == 0.001
+
+    def test_reprices_then_fills(self, mock_client):
+        """Places post_only, not filled, cancels, reprices, fills on second try."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [
+            {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}},
+            {"status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 2, "avgPx": "85000", "totalSz": "0.001"}}]}}},
+        ]
+        # First cycle: cancel succeeds, status shows open → reprice
+        # Second cycle: fills immediately
+        mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_OPEN
+        mock_client.exchange.cancel.return_value = None
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            order = mock_client.maker_order("BTC", True, 0.001, timeout=10, reprice_interval=1)
+        assert order.status == "filled"
+
+    def test_fallback_ioc_on_timeout(self, mock_client):
+        """After timeout, falls back to IOC order."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_OPEN
+        mock_client.exchange.cancel.return_value = True
+        mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
+
+        call_count = [0]
+        def order_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if kwargs.get("order_type", {}).get("limit", {}).get("tif") == "Ioc":
+                return {"status": "ok", "response": {"data": {"statuses": [
+                    {"filled": {"oid": 99, "avgPx": "85001", "totalSz": "0.001"}}
+                ]}}}
+            return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": call_count[0]}}]}}}
+
+        mock_client.exchange.order.side_effect = order_side_effect
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            with patch('fractrade_hl_simple.hyperliquid.time.time') as mock_time:
+                mock_time.side_effect = [0, 0, 100, 100, 100, 100, 100, 100, 100, 100, 100]
+                order = mock_client.maker_buy("BTC", 0.001, timeout=1, reprice_interval=0.5)
+
+        assert order.status == "filled"
+
+    def test_fallback_market(self, mock_client):
+        """With fallback='market', uses buy()/sell() for remaining."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_OPEN
+        mock_client.exchange.cancel.return_value = True
+        mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
+
+        call_count = [0]
+        def order_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] > 1:
+                return {"status": "ok", "response": {"data": {"statuses": [
+                    {"filled": {"oid": 99, "avgPx": "85001", "totalSz": "0.001"}}
+                ]}}}
+            return {"status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}}
+
+        mock_client.exchange.order.side_effect = order_side_effect
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            with patch('fractrade_hl_simple.hyperliquid.time.time') as mock_time:
+                mock_time.return_value = 100  # Always past deadline except first
+                mock_time.side_effect = [0, 0, 0, 100, 100, 100, 100, 100, 100, 100, 100, 100, 100]
+                order = mock_client.maker_sell("BTC", 0.001, timeout=1, reprice_interval=0.5, fallback="market")
+        assert order.status == "filled"
+        assert order.is_maker is False
+
+    def test_fallback_cancel(self, mock_client):
+        """With fallback='cancel', returns last order without IOC."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}
+        }
+        mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_OPEN
+        mock_client.exchange.cancel.return_value = True
+
+        # Use explicit timeout to skip auto-detect, then mock time to expire after 1 order
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            with patch('fractrade_hl_simple.hyperliquid.time.time') as mock_time:
+                # 0=deadline calc, 0=loop check, 0..=inner loop, 100=loop check (expired)
+                mock_time.side_effect = [0, 0, 0, 0, 100, 100, 100, 100, 100]
+                order = mock_client.maker_buy("BTC", 0.001, timeout=1, reprice_interval=0.5, fallback="cancel")
+
+        assert order.status == "open"
+        assert mock_client.exchange.order.call_count == 1
+
+    def test_invalid_fallback_raises(self, mock_client):
+        with pytest.raises(ValueError, match="fallback must be"):
+            mock_client.maker_order("BTC", True, 0.001, fallback="invalid")
+
+    def test_requires_auth(self, mock_client):
+        mock_client.account = None
+        with pytest.raises(RuntimeError, match="authentication"):
+            mock_client.maker_buy("BTC", 0.001)
+
+    def test_buy_uses_best_bid(self, mock_client):
+        """maker_buy should place at best bid."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
+        }
+        order = mock_client.maker_buy("BTC", 0.001, timeout=5)
+        call_args = mock_client.exchange.order.call_args
+        assert call_args[1]["limit_px"] == 85000.0
+
+    def test_sell_uses_best_ask(self, mock_client):
+        """maker_sell should place at best ask."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85001", "totalSz": "0.001"}}]}}
+        }
+        order = mock_client.maker_sell("BTC", 0.001, timeout=5)
+        call_args = mock_client.exchange.order.call_args
+        assert call_args[1]["limit_px"] == 85001.0
+
+    def test_post_only_rejection_retries(self, mock_client):
+        """If post_only is rejected, retries on next interval."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+
+        call_count = [0]
+        def order_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise ValueError("Post-only order would cross spread")
+            return {"status": "ok", "response": {"data": {"statuses": [
+                {"filled": {"oid": 2, "avgPx": "85000", "totalSz": "0.001"}}
+            ]}}}
+
+        mock_client.exchange.order.side_effect = order_side_effect
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            order = mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=1)
+        assert order.status == "filled"
+        assert call_count[0] == 2
+
+    def test_no_bid_retries(self, mock_client):
+        """When order book has no bids, retries."""
+        call_count = [0]
+        def l2_side_effect(*args, **kwargs):
+            call_count[0] += 1
+            if call_count[0] == 1:
+                return {"levels": [[], [{"n": 1, "px": "85001.0", "sz": "1.0"}]]}
+            return {"levels": [[{"n": 1, "px": "85000.0", "sz": "1.0"}], [{"n": 1, "px": "85001.0", "sz": "1.0"}]]}
+
+        mock_client.info.l2_snapshot.side_effect = l2_side_effect
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
+        }
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            order = mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=1)
+        assert order.status == "filled"
+
+    def test_cancel_fails_order_was_filled(self, mock_client):
+        """If cancel fails (order not found), status check detects fill."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}
+        }
+        # Cancel fails (order filled between place and cancel), status shows filled
+        mock_client.exchange.cancel.side_effect = Exception("Order not found")
+        mock_client.info.query_order_by_oid.return_value = {
+            "status": "order", "order": {"order": {"sz": "0.001", "origSz": "0.001"}, "status": "filled"}
+        }
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            order = mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.5)
+        assert order.status == "filled"
+        assert order.is_maker is True
+
+    def test_reduce_only_passed_through(self, mock_client):
+        """reduce_only is forwarded to both maker and fallback orders."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
+        }
+        mock_client.maker_buy("BTC", 0.001, timeout=5, reduce_only=True)
+        call_args = mock_client.exchange.order.call_args
+        assert call_args[1]["reduce_only"] is True
+
+    def test_auto_detect_tight_spread(self, mock_client):
+        """Auto-detects short timeout for tight spreads."""
+        mock_client.info.l2_snapshot.return_value = {
+            "levels": [
+                [{"n": 1, "px": "85000.0", "sz": "1.0"}],
+                [{"n": 1, "px": "85001.0", "sz": "1.0"}],  # 1/85000 = 0.1 bps
+            ]
+        }
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
+        }
+        # Don't specify timeout — let auto-detect work
+        # Auto-detect calls get_order_book once, then the main loop calls it again
+        order = mock_client.maker_buy("BTC", 0.001)
+        assert order.status == "filled"
+
+    def test_auto_detect_wide_spread(self, mock_client):
+        """Auto-detects longer timeout for wide spreads."""
+        mock_client.info.l2_snapshot.return_value = {
+            "levels": [
+                [{"n": 1, "px": "0.450", "sz": "100.0"}],
+                [{"n": 1, "px": "0.460", "sz": "100.0"}],  # 0.01/0.455 = ~220 bps
+            ]
+        }
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "0.450", "totalSz": "30"}}]}}
+        }
+        order = mock_client.maker_buy("DYM", 30)
+        assert order.status == "filled"
+
+    def test_no_order_placed_raises(self, mock_client):
+        """If loop exits with no orders placed, raises RuntimeError."""
+        mock_client.info.l2_snapshot.return_value = {
+            "levels": [[], []]  # Empty book
+        }
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            with patch('fractrade_hl_simple.hyperliquid.time.time') as mock_time:
+                mock_time.side_effect = [0, 0, 100, 100]
+                with pytest.raises(RuntimeError, match="no order placed"):
+                    mock_client.maker_buy("BTC", 0.001, timeout=1, fallback="cancel")
+
+    def test_maker_buy_wrapper(self, mock_client):
+        """maker_buy is a convenience wrapper for maker_order(is_buy=True)."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
+        }
+        order = mock_client.maker_buy("BTC", 0.001, timeout=5)
+        assert order.is_buy is True
+
+    def test_maker_sell_wrapper(self, mock_client):
+        """maker_sell is a convenience wrapper for maker_order(is_buy=False)."""
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.return_value = {
+            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85001", "totalSz": "0.001"}}]}}
+        }
+        order = mock_client.maker_sell("BTC", 0.001, timeout=5)
+        assert order.is_buy is False
+
+    def test_importable_from_package(self):
+        """maker_order, maker_buy, maker_sell are importable from the package."""
+        from fractrade_hl_simple import maker_order, maker_buy, maker_sell

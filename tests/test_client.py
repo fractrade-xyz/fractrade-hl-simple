@@ -55,16 +55,17 @@ class TestHyperliquidClient:
 
     def test_get_perp_balance(self):
         client = HyperliquidClient()
-        
-        # Test with specific address
-        address = "0xf967239debef10dbc78e9bbbb2d8a16b72a614eb"
+
+        # Test with address from .env
+        address = os.getenv("HYPERLIQUID_PUBLIC_ADDRESS")
+        assert address is not None, "HYPERLIQUID_PUBLIC_ADDRESS must be set in .env"
         balance = client.get_perp_balance(address)
-        
+
         # Basic validations
         assert balance is not None
         assert isinstance(balance, Decimal)
         assert balance >= 0
-        
+
         # Test without address (should use public_address from env)
         balance_default = client.get_perp_balance()
         assert balance_default is not None
