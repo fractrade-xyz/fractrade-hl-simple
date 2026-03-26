@@ -1,3 +1,4 @@
+import threading
 from typing import Optional, Dict, List, Union, Any
 from decimal import Decimal
 from contextlib import contextmanager
@@ -132,35 +133,47 @@ def open_short_position(symbol: str,
 def maker_order(symbol: str, is_buy: bool, size: float,
                timeout: Optional[float] = None, reprice_interval: Optional[float] = None,
                fallback: str = "ioc", reduce_only: bool = False,
+               bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
+               fill_event: Optional[threading.Event] = None,
                account: Optional[Union[Dict, HyperliquidAccount]] = None,
                client: Optional[HyperliquidClient] = None) -> Order:
     """Place a maker (post_only) order with automatic chase and fallback."""
     if client is None:
         with get_client(account) as new_client:
-            return new_client.maker_order(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only)
-    return client.maker_order(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only)
+            return new_client.maker_order(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only,
+                                          bbo_cache=bbo_cache, fill_event=fill_event)
+    return client.maker_order(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only,
+                              bbo_cache=bbo_cache, fill_event=fill_event)
 
 def maker_buy(symbol: str, size: float,
              timeout: Optional[float] = None, reprice_interval: Optional[float] = None,
              fallback: str = "ioc", reduce_only: bool = False,
+             bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
+             fill_event: Optional[threading.Event] = None,
              account: Optional[Union[Dict, HyperliquidAccount]] = None,
              client: Optional[HyperliquidClient] = None) -> Order:
     """Place a maker buy order with automatic chase and fallback."""
     if client is None:
         with get_client(account) as new_client:
-            return new_client.maker_buy(symbol, size, timeout, reprice_interval, fallback, reduce_only)
-    return client.maker_buy(symbol, size, timeout, reprice_interval, fallback, reduce_only)
+            return new_client.maker_buy(symbol, size, timeout, reprice_interval, fallback, reduce_only,
+                                        bbo_cache=bbo_cache, fill_event=fill_event)
+    return client.maker_buy(symbol, size, timeout, reprice_interval, fallback, reduce_only,
+                            bbo_cache=bbo_cache, fill_event=fill_event)
 
 def maker_sell(symbol: str, size: float,
               timeout: Optional[float] = None, reprice_interval: Optional[float] = None,
               fallback: str = "ioc", reduce_only: bool = False,
+              bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
+              fill_event: Optional[threading.Event] = None,
               account: Optional[Union[Dict, HyperliquidAccount]] = None,
               client: Optional[HyperliquidClient] = None) -> Order:
     """Place a maker sell order with automatic chase and fallback."""
     if client is None:
         with get_client(account) as new_client:
-            return new_client.maker_sell(symbol, size, timeout, reprice_interval, fallback, reduce_only)
-    return client.maker_sell(symbol, size, timeout, reprice_interval, fallback, reduce_only)
+            return new_client.maker_sell(symbol, size, timeout, reprice_interval, fallback, reduce_only,
+                                         bbo_cache=bbo_cache, fill_event=fill_event)
+    return client.maker_sell(symbol, size, timeout, reprice_interval, fallback, reduce_only,
+                             bbo_cache=bbo_cache, fill_event=fill_event)
 
 def cancel_all_orders(symbol: Optional[str] = None,
                      account: Optional[Union[Dict, HyperliquidAccount]] = None,
@@ -270,6 +283,7 @@ def get_order_book(symbol: str,
 def get_optimal_limit_price(symbol: str,
                            side: str,
                            urgency_factor: float = 0.5,
+                           bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
                            account: Optional[Union[Dict, HyperliquidAccount]] = None,
                            client: Optional[HyperliquidClient] = None) -> float:
     """Get optimal limit price by analyzing order book and urgency factor.
@@ -290,8 +304,8 @@ def get_optimal_limit_price(symbol: str,
     """
     if client is None:
         with get_client(account) as new_client:
-            return new_client.get_optimal_limit_price(symbol, side, urgency_factor)
-    return client.get_optimal_limit_price(symbol, side, urgency_factor)
+            return new_client.get_optimal_limit_price(symbol, side, urgency_factor, bbo_cache=bbo_cache)
+    return client.get_optimal_limit_price(symbol, side, urgency_factor, bbo_cache=bbo_cache)
 
 def get_spot_balance(address: Optional[str] = None,
                     account: Optional[Union[Dict, HyperliquidAccount]] = None,

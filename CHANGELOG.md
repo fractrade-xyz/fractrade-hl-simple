@@ -2,6 +2,18 @@
 
 All notable changes to fractrade-hl-simple will be documented in this file.
 
+## [0.3.2] - 2026-03-27
+
+### Bug Fixes
+
+- **`get_user_state()` missing xyz: positions** — When `extended_universe=True`, `get_user_state()` now auto-merges positions and margin summaries across all perp dexes. Previously only queried the default clearinghouse, silently missing xyz: positions (commodities, indices, forex). Pass `dex=""` or `dex="xyz"` explicitly for per-dex isolation.
+- **`get_perp_balance()` missing xyz: margin** — Now includes xyz margin in totals via the auto-merging `get_user_state()`.
+
+### New Features
+
+- **`bbo_cache` parameter for `maker_order()` and `get_optimal_limit_price()`** — Pass a pre-fetched best-bid/ask dict from a websocket feed to skip REST `get_order_book()` calls. Reduces API calls from 4 to 2 per maker order reprice cycle.
+- **`fill_event` parameter for `maker_order()`** — Pass a `threading.Event` that your websocket fill handler sets. Replaces `time.sleep()` with `event.wait()` for instant fill detection without polling.
+
 ## [0.3.1] - 2026-03-26
 
 ### New Features

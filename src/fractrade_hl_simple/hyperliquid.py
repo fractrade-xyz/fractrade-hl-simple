@@ -1,5 +1,6 @@
 import json
 import logging
+import threading
 import time
 from decimal import Decimal
 from typing import Any, Dict, List, Literal, Optional, Union
@@ -23,6 +24,7 @@ from .models import (
     DACITE_CONFIG,
     MARKET_SPECS,
     HyperliquidAccount,
+    MarginSummary,
     Order,
     OrderType,
     Position,
@@ -221,8 +223,15 @@ class HyperliquidClient:
 
         raise last_exception  # pragma: no cover – safety fallback
 
-    def get_user_state(self, address: Optional[str] = None, dex: str = "") -> UserState:
-        """Get the state of any user by their address."""
+    _SENTINEL_DEX = object()  # Used to detect "dex not explicitly passed"
+
+    def get_user_state(self, address: Optional[str] = None, dex: object = _SENTINEL_DEX) -> UserState:
+        """Get the state of any user by their address.
+
+        When extended_universe=True and dex is not specified, merges positions and
+        margin summaries across all perp dexes (default + xyz). Pass dex="" or dex="xyz"
+        explicitly to query a single clearinghouse.
+        """
         if address is None and not self.is_authenticated():
             raise ValueError("Address required when client is not authenticated")
 
@@ -233,11 +242,47 @@ class HyperliquidClient:
         if not address.startswith("0x") or len(address) != 42:
             raise ValueError("Invalid address format")
 
+        # If dex explicitly specified, query single clearinghouse
+        if dex is not self._SENTINEL_DEX:
+            return self._get_user_state_single(address, dex)
+
+        # Auto-merge across all perp_dexs
+        if len(self.perp_dexs) == 1:
+            return self._get_user_state_single(address, self.perp_dexs[0])
+
+        # Merge multiple dexes
+        merged_positions = []
+        merged_margin = {"account_value": Decimal("0"), "total_margin_used": Decimal("0"),
+                         "total_ntl_pos": Decimal("0"), "total_raw_usd": Decimal("0")}
+        merged_cross = {"account_value": Decimal("0"), "total_margin_used": Decimal("0"),
+                        "total_ntl_pos": Decimal("0"), "total_raw_usd": Decimal("0")}
+        merged_withdrawable = Decimal("0")
+        merged_cross_maint = Decimal("0")
+
+        for d in self.perp_dexs:
+            state = self._get_user_state_single(address, d)
+            merged_positions.extend(state.asset_positions)
+            for field in merged_margin:
+                merged_margin[field] += getattr(state.margin_summary, field)
+                merged_cross[field] += getattr(state.cross_margin_summary, field)
+            merged_withdrawable += state.withdrawable
+            if state.cross_maintenance_margin_used:
+                merged_cross_maint += state.cross_maintenance_margin_used
+
+        return UserState(
+            asset_positions=merged_positions,
+            margin_summary=MarginSummary(**merged_margin),
+            cross_margin_summary=MarginSummary(**merged_cross),
+            withdrawable=merged_withdrawable,
+            cross_maintenance_margin_used=merged_cross_maint or None,
+        )
+
+    def _get_user_state_single(self, address: str, dex: str = "") -> UserState:
+        """Get user state from a single clearinghouse."""
         response = self._with_retry(self.info.user_state, address, dex=dex)
 
-        # Format the response to match our data structure
         formatted_response = {
-            "asset_positions": [],  # Initialize with empty list if no positions
+            "asset_positions": [],
             "margin_summary": {
                 "account_value": response.get("marginSummary", {}).get("accountValue", "0"),
                 "total_margin_used": response.get("marginSummary", {}).get("totalMarginUsed", "0"),
@@ -254,7 +299,6 @@ class HyperliquidClient:
             "cross_maintenance_margin_used": response.get("crossMaintenanceMarginUsed"),
         }
 
-        # Add positions if they exist
         if "assetPositions" in response:
             formatted_response["asset_positions"] = []
             for pos in response.get("assetPositions", []):
@@ -275,7 +319,6 @@ class HyperliquidClient:
                     "unrealized_pnl": pos_data["unrealizedPnl"],
                     "max_leverage": pos_data.get("maxLeverage"),
                 }
-                # Parse cumulative funding if present
                 cf = pos_data.get("cumFunding")
                 if cf and isinstance(cf, dict):
                     position_dict["cum_funding"] = {
@@ -287,7 +330,7 @@ class HyperliquidClient:
                     "position": position_dict,
                     "type": pos["type"]
                 })
-        
+
         return from_dict(data_class=UserState, data=formatted_response, config=DACITE_CONFIG)
         
         
@@ -295,11 +338,8 @@ class HyperliquidClient:
         """Get current open positions across all perp dexes."""
         if not self.is_authenticated():
             raise RuntimeError("This method requires authentication")
-        positions = []
-        for dex in self.perp_dexs:
-            state = self.get_user_state(None, dex=dex)
-            positions.extend(pos.position for pos in state.asset_positions)
-        return positions
+        state = self.get_user_state()
+        return [pos.position for pos in state.asset_positions]
         
     def _format_price(self, symbol: str, price: float) -> float:
         """Format a price for the exchange, matching the SDK's rounding logic.
@@ -807,16 +847,23 @@ class HyperliquidClient:
             average_fill_price=avg_fill_price,
         )
 
-    def _auto_reprice_interval(self, symbol: str) -> tuple:
+    def _auto_reprice_interval(self, symbol: str,
+                               bbo_cache: Optional[Dict[str, Dict[str, float]]] = None) -> tuple:
         """Auto-detect timeout and reprice_interval based on order book spread.
 
         Returns:
             (timeout, reprice_interval) tuple
         """
         try:
-            book = self.get_order_book(symbol)
-            mid = book.get("mid_price")
-            spread = book.get("spread")
+            # Try bbo_cache first, fall back to REST
+            cached = bbo_cache.get(symbol) if bbo_cache else None
+            if cached and "bid" in cached and "ask" in cached:
+                mid = (cached["bid"] + cached["ask"]) / 2
+                spread = cached["ask"] - cached["bid"]
+            else:
+                book = self.get_order_book(symbol)
+                mid = book.get("mid_price")
+                spread = book.get("spread")
             if mid and spread and mid > 0:
                 spread_bps = (spread / mid) * 10000
                 if spread_bps < 2:       # Tight spread: BTC, ETH, SOL
@@ -838,6 +885,8 @@ class HyperliquidClient:
         reprice_interval: Optional[float] = None,
         fallback: str = "ioc",
         reduce_only: bool = False,
+        bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
+        fill_event: Optional[threading.Event] = None,
     ) -> Order:
         """Place a maker (post_only) limit order and chase the best price until filled.
 
@@ -878,7 +927,7 @@ class HyperliquidClient:
 
         # Auto-detect timing from spread if not specified
         if timeout is None or reprice_interval is None:
-            auto_timeout, auto_reprice = self._auto_reprice_interval(symbol)
+            auto_timeout, auto_reprice = self._auto_reprice_interval(symbol, bbo_cache)
             if timeout is None:
                 timeout = auto_timeout
             if reprice_interval is None:
@@ -902,7 +951,15 @@ class HyperliquidClient:
 
         while time.time() < deadline and remaining_size > 0:
             # Get best price for our side
-            book = self.get_order_book(symbol)
+            if bbo_cache is not None and symbol in bbo_cache:
+                cached = bbo_cache[symbol]
+                best_bid = cached.get("bid")
+                best_ask = cached.get("ask")
+                mid = (best_bid + best_ask) / 2 if best_bid and best_ask else None
+                spread = best_ask - best_bid if best_bid and best_ask else None
+                book = {"best_bid": best_bid, "best_ask": best_ask, "mid_price": mid, "spread": spread}
+            else:
+                book = self.get_order_book(symbol)
             mid = book.get("mid_price")
             spread = book.get("spread")
             if mid and spread and mid > 0:
@@ -922,7 +979,7 @@ class HyperliquidClient:
             formatted_size = self._format_size(symbol, remaining_size)
             attempts += 1
 
-            # Place post_only order
+            # Place post_only order (Alo = Add Limit Only = post-only on HL)
             try:
                 order = self.create_order(
                     symbol=symbol,
@@ -930,8 +987,8 @@ class HyperliquidClient:
                     size=formatted_size,
                     limit_price=limit_price,
                     reduce_only=reduce_only,
-                    post_only=True,
-                    time_in_force="Gtc",
+                    post_only=False,
+                    time_in_force="Alo",
                 )
                 last_order = order
             except ValueError as e:
@@ -949,7 +1006,12 @@ class HyperliquidClient:
             # Sleep for reprice interval, then cancel and check result
             order_id = int(order.order_id)
             sleep_time = min(reprice_interval, max(0.1, deadline - time.time()))
-            time.sleep(sleep_time)
+            if fill_event is not None:
+                fired = fill_event.wait(timeout=sleep_time)
+                if fired:
+                    fill_event.clear()
+            else:
+                time.sleep(sleep_time)
 
             # Try to cancel — if it fails, order was likely filled
             cancelled = self.cancel_order(order_id, symbol)
@@ -1024,12 +1086,15 @@ class HyperliquidClient:
         reprice_interval: Optional[float] = None,
         fallback: str = "ioc",
         reduce_only: bool = False,
+        bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
+        fill_event: Optional[threading.Event] = None,
     ) -> Order:
         """Place a maker buy order. Convenience wrapper for maker_order().
 
         See maker_order() for full documentation.
         """
-        return self.maker_order(symbol, True, size, timeout, reprice_interval, fallback, reduce_only)
+        return self.maker_order(symbol, True, size, timeout, reprice_interval, fallback, reduce_only,
+                                bbo_cache=bbo_cache, fill_event=fill_event)
 
     def maker_sell(
         self,
@@ -1039,12 +1104,15 @@ class HyperliquidClient:
         reprice_interval: Optional[float] = None,
         fallback: str = "ioc",
         reduce_only: bool = False,
+        bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
+        fill_event: Optional[threading.Event] = None,
     ) -> Order:
         """Place a maker sell order. Convenience wrapper for maker_order().
 
         See maker_order() for full documentation.
         """
-        return self.maker_order(symbol, False, size, timeout, reprice_interval, fallback, reduce_only)
+        return self.maker_order(symbol, False, size, timeout, reprice_interval, fallback, reduce_only,
+                                bbo_cache=bbo_cache, fill_event=fill_event)
 
     def close(
         self,
@@ -2629,10 +2697,11 @@ class HyperliquidClient:
         }
 
     def get_optimal_limit_price(
-        self, 
-        symbol: str, 
-        side: str, 
-        urgency_factor: float = 0.5
+        self,
+        symbol: str,
+        side: str,
+        urgency_factor: float = 0.5,
+        bbo_cache: Optional[Dict[str, Dict[str, float]]] = None,
     ) -> float:
         """Get optimal limit price by analyzing order book and urgency factor.
         
@@ -2654,7 +2723,18 @@ class HyperliquidClient:
         if not 0.0 <= urgency_factor <= 1.0:
             raise ValueError("urgency_factor must be between 0.0 and 1.0")
 
-        order_book = self.get_order_book(symbol)
+        if bbo_cache is not None and symbol in bbo_cache:
+            cached = bbo_cache[symbol]
+            c_bid = cached.get("bid")
+            c_ask = cached.get("ask")
+            order_book = {
+                "bids": [{"price": c_bid}] if c_bid else [],
+                "asks": [{"price": c_ask}] if c_ask else [],
+                "best_bid": c_bid,
+                "best_ask": c_ask,
+            }
+        else:
+            order_book = self.get_order_book(symbol)
         current_mid = self.get_price(symbol)
 
         if side == "buy":
