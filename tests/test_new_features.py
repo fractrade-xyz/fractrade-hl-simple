@@ -319,25 +319,19 @@ class TestFundingHistory:
 # ── Funding Rate URL Fix ──────────────────────────────────────────────
 
 class TestFundingRatesFix:
-    def test_uses_base_url(self, mock_client):
-        """Verify get_funding_rates uses self.base_url instead of hardcoded URL."""
-        mock_client.base_url = "https://api.hyperliquid-testnet.xyz"
+    def test_uses_info_post(self, mock_client):
+        """Verify get_funding_rates uses self.info.post instead of raw requests."""
         mock_client.info.meta.return_value = {"universe": [{"name": "BTC"}]}
+        mock_client.info.post.return_value = [
+            ["BTC", [["HlPerp", {"fundingRate": "0.0001"}]]]
+        ]
 
-        with patch('fractrade_hl_simple.hyperliquid.requests.post') as mock_post:
-            mock_response = MagicMock()
-            mock_response.json.return_value = [
-                ["BTC", [["HlPerp", {"fundingRate": "0.0001"}]]]
-            ]
-            mock_response.raise_for_status.return_value = None
-            mock_post.return_value = mock_response
+        result = mock_client.get_funding_rates()
 
-            mock_client.get_funding_rates()
-
-            # Verify it used the testnet URL
-            mock_post.assert_called_once()
-            call_url = mock_post.call_args[0][0]
-            assert "testnet" in call_url
+        mock_client.info.post.assert_any_call("/info", {"type": "predictedFundings"})
+        assert len(result) == 1
+        assert result[0]["symbol"] == "BTC"
+        assert result[0]["funding_rate"] == 0.0001
 
 
 # ── Meta + Asset Context ──────────────────────────────────────────────
@@ -382,29 +376,22 @@ class TestMetaAssetContext:
 
 class TestPortfolio:
     def test_get_portfolio(self, mock_client):
-        with patch('fractrade_hl_simple.hyperliquid.requests.post') as mock_post:
-            mock_response = MagicMock()
-            mock_response.json.return_value = {"pnl": "1000.0", "volume": "50000.0"}
-            mock_response.raise_for_status.return_value = None
-            mock_post.return_value = mock_response
+        mock_client.info.post.return_value = {"pnl": "1000.0", "volume": "50000.0"}
 
-            result = mock_client.get_portfolio()
-            assert result["pnl"] == "1000.0"
+        result = mock_client.get_portfolio()
+        assert result["pnl"] == "1000.0"
 
-            call_kwargs = mock_post.call_args
-            assert call_kwargs.kwargs["json"]["type"] == "portfolio"
-            assert call_kwargs.kwargs["json"]["user"] == mock_client.public_address
+        mock_client.info.post.assert_any_call(
+            "/info", {"type": "portfolio", "user": mock_client.public_address}
+        )
 
     def test_get_portfolio_with_address(self, mock_client):
-        with patch('fractrade_hl_simple.hyperliquid.requests.post') as mock_post:
-            mock_response = MagicMock()
-            mock_response.json.return_value = {}
-            mock_response.raise_for_status.return_value = None
-            mock_post.return_value = mock_response
+        mock_client.info.post.return_value = {}
 
-            mock_client.get_portfolio("0xother_address")
-            call_kwargs = mock_post.call_args
-            assert call_kwargs.kwargs["json"]["user"] == "0xother_address"
+        mock_client.get_portfolio("0xother_address")
+        mock_client.info.post.assert_any_call(
+            "/info", {"type": "portfolio", "user": "0xother_address"}
+        )
 
     def test_get_portfolio_requires_auth_or_address(self):
         with patch('fractrade_hl_simple.hyperliquid.Info'), \

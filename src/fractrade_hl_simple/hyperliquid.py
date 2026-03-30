@@ -53,6 +53,7 @@ class HyperliquidClient:
         retry_delay: float = 1.0,
         cache_market_specs: bool = True,
         extended_universe: bool = False,
+        proxy: Optional[Dict[str, str]] = None,
     ):
         """Initialize HyperliquidClient.
 
@@ -84,6 +85,7 @@ class HyperliquidClient:
         self.retry_delay = retry_delay
         self.base_url = constants.TESTNET_API_URL if env == "testnet" else constants.MAINNET_API_URL
         self.perp_dexs = ["", "xyz"] if extended_universe else [""]
+        self._proxy = proxy
 
         # Initialize market specs
         cache_hit = (
@@ -99,6 +101,7 @@ class HyperliquidClient:
             self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs)
             HyperliquidClient._cached_meta = self.info.meta()
             HyperliquidClient._cached_spot_meta = self.info.spot_meta()
+        self._apply_proxy(self.info)
         if cache_hit:
             self.market_specs = HyperliquidClient._cached_market_specs
             self._market_specs_fetched_at = HyperliquidClient._cached_market_specs_at
@@ -162,6 +165,8 @@ class HyperliquidClient:
             vault_address=vault_address,
             perp_dexs=self.perp_dexs,
         )
+        self._apply_proxy(self.exchange)
+        self._apply_proxy(self.exchange.info)
 
     def is_authenticated(self) -> bool:
         """Check if the client is authenticated with valid credentials.
@@ -175,6 +180,11 @@ class HyperliquidClient:
             self.account.private_key is not None and
             self.account.public_address is not None
         )
+
+    def _apply_proxy(self, sdk_instance):
+        """Apply proxy settings to an SDK instance's requests session."""
+        if self._proxy and hasattr(sdk_instance, 'session'):
+            sdk_instance.session.proxies.update(self._proxy)
 
     def _with_retry(self, fn, *args, **kwargs):
         """Execute a function with exponential backoff on transient failures.
@@ -1984,65 +1994,50 @@ class HyperliquidClient:
             for rate in high_rates:
                 print(f"{rate['symbol']}: {rate['funding_rate']:.6f}")
         """
-        # API endpoint for funding rates
-        url = f"{self.base_url}/info"
-        
-        payload = json.dumps({
-            "type": "predictedFundings"
-        })
-        headers = {
-            'Content-Type': 'application/json'
-        }
-        
         try:
-            response = self._with_retry(requests.post, url, headers=headers, data=payload)
-            response.raise_for_status()
-            rates = response.json()
-            
+            rates = self._with_retry(self.info.post, "/info", {"type": "predictedFundings"})
+
             # Get market info to map symbols
             market_info = self.get_market_info()
             market_names = {market['name'] for market in market_info}
-            
+
             # Process funding rates
             funding_data = []
-            
+
             for rate in rates:
                 symbol_name = rate[0]
                 if symbol_name in market_names:
-                    # Extract funding rate from the nested structure
                     funding_rate = None
                     for item in rate[1]:
                         if item[0] == 'HlPerp':
                             funding_rate = item[1]['fundingRate']
                             break
-                    
+
                     if funding_rate is not None:
                         funding_data.append({
                             'symbol': symbol_name,
                             'funding_rate': float(funding_rate)
                         })
-            
+
             # If specific symbol requested, return just that rate
             if symbol is not None:
                 for data in funding_data:
                     if data['symbol'] == symbol:
                         return data['funding_rate']
                 raise ValueError(f"Symbol {symbol} not found in funding rates")
-            
+
             # Apply threshold filter if provided
             if threshold is not None:
                 funding_data = [
-                    data for data in funding_data 
+                    data for data in funding_data
                     if abs(data['funding_rate']) >= abs(threshold)
                 ]
-            
+
             # Sort by funding rate: highest positive to lowest negative
             funding_data.sort(key=lambda x: x['funding_rate'], reverse=True)
-            
+
             return funding_data
-            
-        except requests.RequestException as e:
-            raise ValueError(f"Failed to fetch funding rates: {str(e)}")
+
         except (KeyError, IndexError, ValueError) as e:
             raise ValueError(f"Failed to parse funding rates response: {str(e)}")
 
@@ -2993,15 +2988,8 @@ class HyperliquidClient:
                 raise RuntimeError("Address or authentication required")
             address = self.public_address
 
-        url = f"{self.base_url}/info"
         try:
-            resp = self._with_retry(
-                requests.post, url,
-                headers={"Content-Type": "application/json"},
-                json={"type": "portfolio", "user": address},
-            )
-            resp.raise_for_status()
-            return resp.json()
-        except requests.RequestException as e:
+            return self._with_retry(self.info.post, "/info", {"type": "portfolio", "user": address})
+        except Exception as e:
             raise ValueError(f"Failed to fetch portfolio: {str(e)}")
 

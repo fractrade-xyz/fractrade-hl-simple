@@ -2,6 +2,16 @@
 
 All notable changes to fractrade-hl-simple will be documented in this file.
 
+## [0.3.3] - 2026-03-27
+
+### Bug Fixes
+
+- **`get_funding_rates()` and `get_portfolio()` now use SDK session** — Previously used raw `requests.post`, bypassing the SDK's session (and any proxy/retry configuration). Now routes through `self.info.post()`.
+
+### New Features
+
+- **Proxy support** — `HyperliquidClient(proxy={"https": "http://user:pass@host:port"})` routes all API calls through the specified proxy. Applied to all internal SDK sessions.
+
 ## [0.3.2] - 2026-03-27
 
 ### Bug Fixes
