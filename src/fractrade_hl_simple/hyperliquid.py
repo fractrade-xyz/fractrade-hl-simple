@@ -161,6 +161,8 @@ class HyperliquidClient:
                 account_address = account.public_address
         self.exchange = Exchange(
             self.exchange_account, self.base_url,
+            meta=HyperliquidClient._cached_meta,
+            spot_meta=HyperliquidClient._cached_spot_meta,
             account_address=account_address,
             vault_address=vault_address,
             perp_dexs=self.perp_dexs,

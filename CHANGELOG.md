@@ -2,6 +2,12 @@
 
 All notable changes to fractrade-hl-simple will be documented in this file.
 
+## [0.3.4] - 2026-03-27
+
+### Performance
+
+- **Pass cached meta/spot_meta to Exchange() constructor** — Eliminates 2-3 redundant API calls per authenticated client creation. Exchange's internal Info() was re-fetching meta and spot_meta from the API even though they were already cached.
+
 ## [0.3.3] - 2026-03-27
 
 ### Bug Fixes
