@@ -6,6 +6,13 @@ already retried what it can. Where an exception replaces a type raised before (`
 ``RuntimeError``, requests' and the SDK's errors), it also inherits that type, so existing
 handlers keep catching it. The MCP server returns these fields unchanged.
 
+Two exceptions to that, on purpose: ``ActionOutcomeUnknownException`` and
+``OrderOutcomeUnknownException`` are neither requests' errors nor ``ValueError``, although an
+order, modify or transfer raised those for a lost answer before; a handler that sends again on
+them would execute the action twice. And ``get_portfolio()`` and ``get_funding_rates()`` no
+longer wrap every failure in ``ValueError``: network failures are ``NetworkException`` or
+``ServerErrorException``, as in every other read.
+
 Kept as they were, for existing handlers: ``maker_order``'s ``RuntimeError`` when it placed no
 order, and the ``RuntimeError`` for a market list without any market.
 """
@@ -283,6 +290,36 @@ class PositionNotClosedException(OrderException):
             message = (f"Closed {order.filled_size} of {order.filled_size + remaining} {symbol}; "
                        f"{remaining} still open (order {order.order_id})")
         super().__init__(message)
+
+class MakerOrderIncompleteException(OrderException):
+    """``maker_order()`` filled part of the size, then stopped on an error.
+
+    Its earlier attempts filled ``filled_size`` at ``average_price``; ``remaining`` is not
+    filled, and no order of the chase is left in the book. The error that stopped it is
+    ``__cause__``, e.g. Hyperliquid refusing the rest (below its minimum order value,
+    insufficient margin) or a failed read of the order book. Send at most the rest again,
+    never the whole size. When an order's outcome is not known, ``maker_order()`` raises
+    ``ActionOutcomeUnknownException`` instead. Its own (the chase stopped while an attempt was
+    in the book, e.g. its cancel failed, its fills could not be read, or an error that is not
+    the library's interrupted it after an order was sent) name the earlier fills; an order's
+    ``OrderOutcomeUnknownException`` comes as it is, with that order's cloid, so check the
+    account for the earlier fills.
+
+    Attributes:
+        symbol: The order's symbol.
+        filled_size: The size filled so far (Decimal).
+        average_price: Its average price (Decimal), or None if a price is not known.
+        remaining: The size not filled by the earlier attempts (Decimal).
+    """
+    code = "MAKER_ORDER_INCOMPLETE"
+    def __init__(self, symbol: str, filled_size, average_price, remaining):
+        self.symbol = symbol
+        self.filled_size = filled_size
+        self.average_price = average_price
+        self.remaining = remaining
+        at = f" at {average_price}" if average_price is not None else ""
+        super().__init__(f"maker_order filled {filled_size} {symbol}{at}, then stopped with {remaining} "
+                         "not filled; the error is the cause")
 
 class ClosePositionsIncompleteException(OrderException):
     """``close_all_positions()`` closed some positions, but not all.

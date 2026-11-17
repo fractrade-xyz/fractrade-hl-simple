@@ -1,5 +1,6 @@
 import logging
 import math
+import operator
 import os
 import re
 import secrets
@@ -29,6 +30,7 @@ from .exceptions import (
     ClosePositionsIncompleteException,
     OrderRejectedException,
     PositionNotClosedException,
+    MakerOrderIncompleteException,
     PositionNotFoundException,
     ProtectionOrderException,
     ProtectionReplacementIncompleteException,
@@ -53,7 +55,6 @@ from .models import (
     FeeRates,
     FillHistory,
     FundingPayment,
-    PERP_MARKETS,
     coin_market,
     HyperliquidAccount,
     Leverage,
@@ -141,6 +142,9 @@ _NETWORK_URLS = {"mainnet": constants.MAINNET_API_URL, "testnet": constants.TEST
 _ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 _INSUFFICIENT_MARGIN = "Insufficient margin to place order."  # PerpMargin, API docs "Error responses"
 _POST_ONLY_CROSSED = "Post only order would have immediately matched"  # BadAloPx, followed by the bbo
+# The error texts of rejected order statuses (info endpoint docs) that callers tell apart: an
+# order recovered by its cloid after a lost answer is reported with the same text.
+_REJECTION_TEXTS = {"perpMarginRejected": _INSUFFICIENT_MARGIN, "badAloPxRejected": _POST_ONLY_CROSSED}
 _PRIVATE_KEY = re.compile(r"(?:0x)?[0-9a-fA-F]{64}")
 _CLOID = re.compile(r"0x[0-9a-fA-F]{32}")  # a 128 bit hex string (exchange endpoint docs)
 _DIGITS = re.compile(r"[0-9]+")
@@ -165,11 +169,19 @@ def _sdk_dex(coin: str) -> str:
 
 
 def _order_id(order_id: Any) -> int:
-    """An order id (oid) as the SDK sends it, a number: an int, or the text of one."""
-    if isinstance(order_id, int) and not isinstance(order_id, bool) and order_id >= 0:
-        return order_id
-    if isinstance(order_id, str) and _DIGITS.fullmatch(order_id.strip()):
-        return int(order_id)
+    """An order id (oid) as the SDK sends it, a number: an integer of any type (int, numpy's),
+    or the text of one. A float is refused: int(10.9) would be another order."""
+    if isinstance(order_id, str):
+        if _DIGITS.fullmatch(order_id.strip()):
+            return int(order_id)
+    elif not isinstance(order_id, bool):
+        try:
+            oid = operator.index(order_id)  # integer types only, no float or Decimal
+        except TypeError:
+            pass
+        else:
+            if oid >= 0:
+                return oid
     raise InvalidArgumentException(f"order_id must be a whole number, got {order_id!r}")
 
 
@@ -231,6 +243,14 @@ def split_size(size: Decimal, legs: Sequence[Tuple[str, str, Any, Decimal]], siz
                 min(indexes, key=lambda i: Decimal(str(legs[i][2])))
             sizes[nearest] += share - sum(sizes[i] for i in indexes)
     return sizes
+
+
+def _average_price(parts: Sequence[Tuple[Decimal, Optional[Decimal]]]) -> Optional[Decimal]:
+    """Average price of (size, price) parts; None if a price is unknown or nothing filled."""
+    qty = sum((q for q, _ in parts), Decimal(0))
+    if not qty or any(px is None for _, px in parts):
+        return None
+    return sum(q * px for q, px in parts) / qty
 
 
 def _missing(legs: Sequence[Tuple[str, str, float, Decimal]], sizes: Sequence[Decimal]) -> List[Dict[str, Any]]:
@@ -711,8 +731,8 @@ class HyperliquidClient:
     def _attempt(self, fn, *args, **kwargs):
         """One attempt of a signed action. Signed actions wait while a stop loss / take
         profit replacement of the same key runs (it holds this reentrant lock around all its
-        steps, see _replace_protection). The wait before a retry is outside: nothing waits
-        for a backoff."""
+        steps, see _replace_protection, so they also wait through the replacement's own
+        retries). The wait before an action's own retry is outside the lock."""
         with _signer_state(self.exchange_account.address).operation_lock:
             return self._with_fresh_nonce(fn, *args, **kwargs)
 
@@ -859,7 +879,9 @@ class HyperliquidClient:
                     detail = "trigger order triggered, its outcome is not known yet"
                     continue
                 if status == "rejected" or status.endswith("Rejected"):
-                    return {"error": f"Order {cloid} was rejected ({status})"}
+                    text = _REJECTION_TEXTS.get(status)
+                    return {"error": f"{text} (order {cloid}: {status})" if text
+                            else f"Order {cloid} was rejected ({status})"}
                 if status == "filled" or status in ("canceled", "scheduledCancel") or status.endswith("Canceled"):
                     # "sz" is what was left when the order ended; the rest was filled.
                     executed = Decimal(str(order["origSz"])) - Decimal(str(order["sz"]))
@@ -1193,7 +1215,7 @@ class HyperliquidClient:
         if status is None:
             raise ActionOutcomeUnknownException(action, f"answered in no documented format: {response}")
         if "error" in status:
-            if status["error"] == _INSUFFICIENT_MARGIN:
+            if status["error"].startswith(_INSUFFICIENT_MARGIN):
                 raise InsufficientMarginException(action, status["error"])
             raise OrderRejectedException(action, status["error"])
         return status
@@ -1441,32 +1463,6 @@ class HyperliquidClient:
             )
         return closing_is_buy
 
-    @staticmethod
-    def _trigger_order(status: Dict[str, Any], symbol: str, is_buy: bool, size: float,
-                       order_type: Dict[str, Any], trigger_price: float, cloid: Cloid) -> Order:
-        """Order for a placed stop loss or take profit: resting, or filled if its trigger was
-        already crossed and it executed at once."""
-        order_data: Dict[str, Any] = {
-            "symbol": symbol,
-            "is_buy": is_buy,
-            "size": str(size),
-            "order_type": order_type,
-            "reduce_only": True,
-            "time_in_force": "Gtc",
-            "created_at": int(time.time() * 1000),
-            "trigger_price": str(trigger_price),
-            "type": {"tp": "take_profit", "sl": "stop_loss"}.get(order_type["trigger"].get("tpsl"), "unknown"),
-            "cloid": cloid.to_raw(),
-        }
-        if "resting" in status:
-            order_data.update(order_id=status["resting"]["oid"], status="open")
-        elif "filled" in status:
-            filled = status["filled"]
-            order_data.update(order_id=filled["oid"], status="filled",
-                              filled_size=str(filled["totalSz"]),
-                              average_fill_price=str(filled["avgPx"]))
-        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-
     def stop_loss(
         self,
         symbol: str,
@@ -1536,8 +1532,8 @@ class HyperliquidClient:
             order_type=order_type,
         )
         name = "stop loss" if tpsl == "sl" else "take profit"
-        status = self._order_status(response, f"{symbol} {name}")
-        return self._trigger_order(status, symbol, is_buy, size, order_type, trigger_price, order_cloid)
+        return self._order_from_response(response, symbol, is_buy, size, trigger_price, order_type, True,
+                                         f"{symbol} {name}", cloid=order_cloid)
 
     def open_long_position(
         self,
@@ -1848,7 +1844,54 @@ class HyperliquidClient:
         Raises:
             RuntimeError: If client is not authenticated
             ValueError: If parameters are invalid
+            MakerOrderIncompleteException: If the chase stopped on an error after part of the
+                size had filled (e.g. the rest was refused, below Hyperliquid's minimum order
+                value); it says how much filled, at which average price. The error is
+                ``__cause__``.
+            ActionOutcomeUnknownException: If an order's outcome is unknown, also when the
+                chase stopped while an attempt was in the book (e.g. its cancel failed: it
+                names that order), or an error that is not the library's (e.g. a signal
+                handler's) interrupted it after an order was sent. Check the account (earlier
+                attempts may have filled too) before trying again.
         """
+        maker_fills: List[tuple] = []  # (size, price) filled by each attempt so far
+        # "live": the attempt in the book, until it is canceled and its fill is counted;
+        # "sent": whether any order of the chase was sent.
+        progress: Dict[str, Any] = {"live": None, "sent": False}
+        try:
+            return self._maker_chase(symbol, is_buy, size, timeout, reprice_interval, fallback, reduce_only,
+                                     bbo_cache, fill_event, maker_fills, progress)
+        except ActionOutcomeUnknownException:
+            raise  # its contract already: check the account before trying again
+        except Exception as exc:
+            # The library's own errors come from known steps, so `progress` describes them. Any
+            # other one (a signal handler's, a bug) can come from any step, e.g. while an order
+            # is being sent or its fill counted: once an order was sent, nothing is certain.
+            live, foreign = progress["live"], not isinstance(exc, HyperliquidException)
+            if live is None and not maker_fills and not (foreign and progress["sent"]):
+                raise
+            requested = Decimal(str(self._format_size(symbol, size)))
+            filled = sum((qty for qty, _ in maker_fills), Decimal(0))
+            if live is not None:
+                raise ActionOutcomeUnknownException(
+                    f"{symbol} maker order {live.order_id} (cloid {live.cloid})",
+                    f"the chase stopped ({exc!r}) while it was in the book: it may still be there or have "
+                    f"filled; {filled} of {requested} filled by earlier attempts",
+                ) from exc
+            if foreign:
+                raise ActionOutcomeUnknownException(
+                    f"{symbol} maker order",
+                    f"the chase was interrupted ({exc!r}) after sending orders: one may be in the book or "
+                    f"have filled; {filled} of {requested} counted as filled",
+                ) from exc
+            raise MakerOrderIncompleteException(symbol, filled, _average_price(maker_fills), requested - filled) from exc
+
+    def _maker_chase(self, symbol: str, is_buy: bool, size: float, timeout: Optional[float],
+                     reprice_interval: Optional[float], fallback: str, reduce_only: bool,
+                     bbo_cache: Optional[Dict[str, Dict[str, float]]], fill_event: Optional[threading.Event],
+                     maker_fills: List[tuple], progress: Dict[str, Any]) -> Order:
+        """Body of maker_order; appends each attempt's maker fill to `maker_fills`, and keeps
+        in `progress` whether an order was sent and which attempt is in the book."""
         if not self.is_authenticated():
             raise AuthenticationRequiredException()
         if fallback not in ("ioc", "market", "cancel"):
@@ -1870,7 +1913,6 @@ class HyperliquidClient:
         remaining_size = size
         last_order = None
         attempts = 0
-        maker_fills: List[tuple] = []  # (size, price) filled by each attempt so far
         start_time = time.time()
         deadline = start_time + timeout
         last_spread_bps = None
@@ -1886,12 +1928,6 @@ class HyperliquidClient:
         def _maker_filled() -> Decimal:
             return sum((qty for qty, _ in maker_fills), Decimal(0))
 
-        def _average(parts: List[tuple]) -> Optional[Decimal]:
-            qty = sum((q for q, _ in parts), Decimal(0))
-            if not qty or any(px is None for _, px in parts):
-                return None
-            return sum(q * px for q, px in parts) / qty
-
         def _with_maker_fills(order: Order) -> Order:
             """Report the fills of every maker attempt on the order that is returned."""
             if not maker_fills:
@@ -1901,7 +1937,7 @@ class HyperliquidClient:
                 parts.append((Decimal(str(order.filled_size)), order.average_fill_price))
             order.size = Decimal(str(size))
             order.filled_size = sum((q for q, _ in parts), Decimal(0))
-            order.average_fill_price = _average(parts)
+            order.average_fill_price = _average_price(parts)
             return order
 
         while time.time() < deadline and remaining_size > 0:
@@ -1935,6 +1971,7 @@ class HyperliquidClient:
             attempts += 1
 
             # Place post_only order (Alo = Add Limit Only = post-only on HL)
+            progress["sent"] = True
             try:
                 order = self.create_order(
                     symbol=symbol,
@@ -1961,6 +1998,7 @@ class HyperliquidClient:
                 return _annotate(_with_maker_fills(order), is_maker=True)
 
             # Sleep for reprice interval, then cancel and check result
+            progress["live"] = order
             order_id = order.order_id
             sleep_time = min(reprice_interval, max(0.1, deadline - time.time()))
             if fill_event is not None:
@@ -1998,11 +2036,13 @@ class HyperliquidClient:
             avg_px = Decimal(str(avg_px_str)) if avg_px_str else None
             if attempt_filled > 0:
                 maker_fills.append((attempt_filled, avg_px))
+            progress["live"] = None  # canceled, and its fill is counted
+            if attempt_filled > 0:
                 remaining_size = max(0.0, float(Decimal(str(size)) - _maker_filled()))
                 logger.info(f"Maker fill: {attempt_filled} filled, {remaining_size} remaining")
                 if remaining_size <= 0:
                     return _annotate(
-                        self._make_filled_order(order_id, symbol, is_buy, size, order, _average(maker_fills)),
+                        self._make_filled_order(order_id, symbol, is_buy, size, order, _average_price(maker_fills)),
                         is_maker=True,
                     )
 
@@ -2015,6 +2055,7 @@ class HyperliquidClient:
                     return _annotate(_with_maker_fills(last_order), is_maker=True)
             logger.info(f"Maker chase timeout for {symbol}, falling back to {fallback} "
                        f"for remaining {formatted_remaining}")
+            progress["sent"] = True
             if fallback == "ioc":
                 fallback_order = self.create_order(
                     symbol=symbol,
@@ -2137,7 +2178,10 @@ class HyperliquidClient:
         Raises:
             RuntimeError: If client is not authenticated
             UnknownSymbolException: If symbol is not a market of the client (nothing is read)
-            Exception: If fetching orders fails or if any cancellation fails
+            OrdersNotCanceledException: Naming each order that is still open: the exchange did
+                not cancel it, or its market is unknown to the client (listed since the client
+                was created: refresh_market_specs(), then cancel again). The others are canceled.
+            Exception: If fetching orders fails
         """
         if not self.is_authenticated():
             raise AuthenticationRequiredException()
@@ -2149,15 +2193,23 @@ class HyperliquidClient:
         for dex in self._dexes_of(symbol):
             open_orders.extend(self._with_retry(self.info.open_orders, self.account.public_address, dex=dex))
 
-        # The default dex's open orders include the spot and outcome ones: only perp orders here.
-        open_orders = [order for order in open_orders if coin_market(order["coin"]) in PERP_MARKETS
+        # The default dex's open orders include the spot and outcome ones, which stay. Every
+        # other order counts as perp: one whose name no pattern knows must not stay open here.
+        open_orders = [order for order in open_orders if coin_market(order["coin"]) not in ("spot", "outcome")
                        and (not symbol or order["coin"] == symbol)]
 
-        if not open_orders:
-            return
-
-        # Bulk cancel in a single API call
-        self._cancel_all([{"coin": order["coin"], "oid": order["oid"]} for order in open_orders])
+        # An order on a market the client does not know cannot be signed: reported, not skipped.
+        failed = [{"symbol": order["coin"], "order_id": order["oid"],
+                   "reason": "market unknown to the client; call refresh_market_specs() and cancel again"}
+                  for order in open_orders if order["coin"] not in self.info.name_to_coin]
+        known = [order for order in open_orders if order["coin"] in self.info.name_to_coin]
+        if known:
+            try:
+                self._cancel_all([{"coin": order["coin"], "oid": order["oid"]} for order in known])  # one request
+            except OrdersNotCanceledException as exc:
+                failed = exc.failed + failed
+        if failed:
+            raise OrdersNotCanceledException(failed)
 
     @staticmethod
     def _parse_open_order(order_data: Dict[str, Any], symbol: str, market: Optional[str] = None) -> Order:
@@ -3488,6 +3540,11 @@ class HyperliquidClient:
         or its outcome is unknown, the old orders stay in place and the error is raised. If no
         stop loss exists yet, one is created.
 
+        While it runs, every other signed action of the same key in this process (orders,
+        cancels, closes, from any client or thread) waits, so none changes the position or its
+        orders between the steps. Under rate limiting or slow answers that wait includes this
+        method's retries, which can take tens of seconds.
+
         Args:
             symbol (str): The trading symbol
             new_price (float): The new stop loss trigger price
@@ -3513,7 +3570,7 @@ class HyperliquidClient:
         Places the new take profit first, sized to the live position, then cancels the old
         take profit orders. If the new order is rejected or its outcome is unknown, the old
         orders stay in place and the error is raised. If no take profit exists yet, one is
-        created.
+        created. Other signed actions of the key wait while it runs, as in update_stop_loss().
 
         Args:
             symbol (str): The trading symbol

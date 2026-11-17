@@ -25,9 +25,9 @@ from typing import Any, Optional
 
 from ..exceptions import (
     ActionOutcomeUnknownException, ActionRejectedException, ClientErrorException, ClosePositionsIncompleteException,
-    HyperliquidException, OrderOutcomeUnknownException, OrdersNotCanceledException, PositionNotClosedException,
-    ProtectionOrderException,
-    ProtectionReplacementIncompleteException, ServerErrorException, UnsupportedAccountModeException,
+    HyperliquidException, MakerOrderIncompleteException, OrderOutcomeUnknownException, OrdersNotCanceledException,
+    PositionNotClosedException, ProtectionOrderException, ProtectionReplacementIncompleteException,
+    ServerErrorException, UnsupportedAccountModeException,
 )
 from ..models import Order, Position
 from . import convert, keys
@@ -61,6 +61,7 @@ DETAILS: tuple[tuple[type[HyperliquidException], tuple[str, ...]], ...] = (
     (ProtectionOrderException, ("leg", "orders", "missing")),
     (ProtectionReplacementIncompleteException, ("new_order", "old_order_ids", "position")),
     (PositionNotClosedException, ("symbol", "order", "remaining", "reason")),
+    (MakerOrderIncompleteException, ("symbol", "filled_size", "average_price", "remaining")),
     (ClosePositionsIncompleteException, ("closed", "failed")),
     (OrdersNotCanceledException, ("failed",)),
     (UnsupportedAccountModeException, ("mode",)),

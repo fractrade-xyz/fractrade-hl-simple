@@ -690,11 +690,12 @@ class TestSpotSymbols:
         assert (order.type, order.trigger_price) == ("limit", None)
 
     def test_placed_orders_keep_their_order_type_strings(self):
-        status = {"resting": {"oid": 12}}
-        order = HyperliquidClient._trigger_order(status, "BTC", False, 0.1,
-                                                 {"trigger": {"triggerPx": 80000.0, "isMarket": True, "tpsl": "sl"}},
-                                                 80000.0, Cloid("0x" + "0" * 32))
+        response = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 12}}]}}}
+        order = HyperliquidClient._order_from_response(
+            response, "BTC", False, 0.1, 80000.0, {"trigger": {"triggerPx": 80000.0, "isMarket": True, "tpsl": "sl"}},
+            True, "BTC stop loss", cloid=Cloid("0x" + "0" * 32))
         assert order.order_type.trigger == {"triggerPx": Decimal("80000.0"), "isMarket": True, "tpsl": "sl"}
+        assert (order.type, order.trigger_price, order.reduce_only) == ("stop_loss", Decimal("80000.0"), True)
 
 
 class TestSpotOrders:
@@ -1419,6 +1420,7 @@ _SPECIAL_ARGUMENTS = {
     ProtectionReplacementIncompleteException: (_ORDER, ["5", "6"], "were kept"),
     exceptions.PositionNotClosedException: ("BTC", SimpleNamespace(order_id="7", filled_size=Decimal("0.6")), Decimal("0.4")),
     exceptions.ClosePositionsIncompleteException: ({"BTC": _ORDER}, {"ETH": "rejected"}),  # exceptions compare by identity
+    exceptions.MakerOrderIncompleteException: ("BTC", Decimal("0.0004"), Decimal("85000"), Decimal("0.0006")),
     exceptions.ActionRejectedException: ("BTC leverage update", "Invalid leverage value"),
     exceptions.OrderRejectedException: ("BTC order", "Order must have minimum value of $10."),
     exceptions.InsufficientMarginException: ("BTC order", "Insufficient margin to place order."),

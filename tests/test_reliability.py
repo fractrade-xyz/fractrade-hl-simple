@@ -32,6 +32,8 @@ from fractrade_hl_simple.exceptions import (
     ProtectionOrderException,
     ProtectionReplacementIncompleteException,
     OrderOutcomeUnknownException,
+    OrdersNotCanceledException,
+    MakerOrderIncompleteException,
     ServerErrorException,
 )
 
@@ -176,7 +178,7 @@ class TestCancelAllOrdersReliability:
         # canceled too, although spot_cancel_all_orders() exists for spot.
         mock_client.info.open_orders.return_value = [
             {"coin": "BTC", "oid": 1}, {"coin": "@107", "oid": 2}, {"coin": "PURR/USDC", "oid": 3},
-            {"coin": "#12", "oid": 4}, {"coin": "xyz:NVDA", "oid": 5},
+            {"coin": "#12", "oid": 4}, {"coin": "ETH", "oid": 5},
         ]
         mock_client.exchange.bulk_cancel.return_value = _cancel_response("success", "success")
         mock_client.cancel_all_orders()
@@ -219,7 +221,7 @@ class TestCancelAllOrdersReliability:
         mock_client.info.open_orders.return_value = [
             {"coin": "BTC", "oid": 1},
             {"coin": "ETH", "oid": 2},
-            {"coin": "SOL", "oid": 3},
+            {"coin": "BTC", "oid": 3},
         ]
         mock_client.exchange.bulk_cancel.return_value = _cancel_response(
             "success", "success", "success"
@@ -228,8 +230,28 @@ class TestCancelAllOrdersReliability:
         mock_client.exchange.bulk_cancel.assert_called_once_with([
             {"coin": "BTC", "oid": 1},
             {"coin": "ETH", "oid": 2},
-            {"coin": "SOL", "oid": 3},
+            {"coin": "BTC", "oid": 3},
         ])
+
+    def test_an_order_whose_name_no_pattern_knows_is_canceled_too(self, mock_client):
+        # A perp named e.g. "1000-PEPE" was taken for no perp and left open, silently, on the
+        # path meant to cancel everything.
+        mock_client.info.name_to_coin = {**mock_client.info.name_to_coin, "1000-PEPE": "1000-PEPE"}
+        mock_client.info.open_orders.return_value = [{"coin": "1000-PEPE", "oid": 1}, {"coin": "@107", "oid": 2}]
+        mock_client.exchange.bulk_cancel.return_value = _cancel_response("success")
+        mock_client.cancel_all_orders()
+        mock_client.exchange.bulk_cancel.assert_called_once_with([{"coin": "1000-PEPE", "oid": 1}])
+
+    def test_an_order_on_a_market_the_client_does_not_know_is_reported_after_the_others(self, mock_client):
+        # A market listed since the client was created: the SDK cannot sign its cancel, and
+        # failed with a bare KeyError that also left every other order open.
+        mock_client.info.open_orders.return_value = [{"coin": "BTC", "oid": 1}, {"coin": "NEWCOIN", "oid": 2}]
+        mock_client.exchange.bulk_cancel.return_value = _cancel_response("success")
+        with pytest.raises(OrdersNotCanceledException) as caught:
+            mock_client.cancel_all_orders()
+        mock_client.exchange.bulk_cancel.assert_called_once_with([{"coin": "BTC", "oid": 1}])
+        assert [(f["symbol"], f["order_id"]) for f in caught.value.failed] == [("NEWCOIN", 2)]
+        assert "refresh_market_specs" in caught.value.failed[0]["reason"]
 
     def test_no_api_call_when_no_orders(self, mock_client):
         """Should not call bulk_cancel when there are no orders."""
@@ -259,6 +281,20 @@ class TestRejections:
             "INSUFFICIENT_MARGIN", "Insufficient margin to place order.",
             "BTC order rejected: Insufficient margin to place order.")
         assert isinstance(error.value, ValueError) and isinstance(error.value, OrderException)
+
+    def test_a_margin_error_with_details_after_its_text(self, mock_client):
+        mock_client.exchange.order.return_value = _order_response(
+            {"error": "Insufficient margin to place order. asset=0"})
+        with pytest.raises(InsufficientMarginException):
+            mock_client.buy("BTC", 0.001, limit_price=80000.0)
+
+    def test_a_margin_rejection_found_by_cloid_after_a_lost_answer(self, mock_client):
+        # Reported with made-up text, it was a plain OrderRejectedException.
+        mock_client.exchange.order.side_effect = ServerError(502, "Bad Gateway")
+        mock_client.info.query_order_by_cloid.return_value = {"status": "order", "order": {
+            "order": {"oid": 5, "sz": "0.001", "origSz": "0.001"}, "status": "perpMarginRejected"}}
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"), pytest.raises(InsufficientMarginException):
+            mock_client.buy("BTC", 0.001, limit_price=80000.0)
 
     @pytest.mark.parametrize("response", [
         {"status": "ok", "response": {"type": "order", "data": {"statuses": [
@@ -726,7 +762,18 @@ class TestOrderIdTypes:
         assert mock_client.cancel_order(12345, "BTC") is True
         mock_client.exchange.cancel.assert_called_with("BTC", 12345)
 
-    @pytest.mark.parametrize("order_id", [10.9, True, -1, "12a", "", None])
+    def test_an_order_id_of_any_integer_type_is_taken(self, mock_client):
+        # numpy's integers (e.g. from a pandas column) are no int subclass: they were refused
+        # with "order_id must be a whole number, got 12345".
+        class NumpyLikeInt:
+            def __index__(self):
+                return 12345
+
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+        assert mock_client.cancel_order(NumpyLikeInt(), "BTC") is True
+        mock_client.exchange.cancel.assert_called_with("BTC", 12345)
+
+    @pytest.mark.parametrize("order_id", [10.9, 12345.0, True, -1, "12a", "", None])
     def test_an_id_that_is_no_whole_number_is_refused_before_anything_is_sent(self, mock_client, order_id):
         # int(10.9) is 10 and int(True) is 1: the cancel went to another order.
         with pytest.raises(InvalidArgumentException, match="order_id"):
@@ -1772,6 +1819,114 @@ class TestMakerOrder:
         with patch('fractrade_hl_simple.hyperliquid.time.sleep'), pytest.raises(InsufficientMarginException):
             mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=1)
         assert mock_client.exchange.order.call_count == 1
+
+    def test_a_failure_after_a_partial_fill_says_how_much_filled(self, mock_client):
+        # The first attempt fills 0.0009 of 0.001 at 85000; the exchange refuses the rest,
+        # 0.0001 (8.50 USD, below its minimum order value). The rejection came alone: a caller
+        # could take it for "nothing traded" and buy the whole size again.
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [
+            _order_response({"resting": {"oid": 1}}),
+            _order_response({"error": "Order must have minimum value of $10."})]
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+        mock_client.info.query_order_by_oid.return_value = {"status": "order", "order": {
+            "order": {"sz": "0.0001", "origSz": "0.001", "limitPx": "85000.0"}, "status": "canceled"}}
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'), \
+                pytest.raises(MakerOrderIncompleteException) as caught:
+            mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.5)
+        error = caught.value
+        assert (error.filled_size, error.average_price, error.remaining) == (
+            Decimal("0.0009"), Decimal("85000.0"), Decimal("0.0001"))
+        assert isinstance(error.__cause__, OrderRejectedException)
+
+    @pytest.mark.parametrize("filled_before", [False, True], ids=["first-attempt", "after-a-fill"])
+    def test_an_attempt_that_could_not_be_canceled_is_an_unknown_outcome(self, mock_client, filled_before):
+        # It may still be in the book, or have filled: no size can be reported as not filled.
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [_order_response({"resting": {"oid": 1}}),
+                                                  _order_response({"resting": {"oid": 2}})]
+        cancel_fails = requests.ConnectionError("down")
+        mock_client.exchange.cancel.side_effect = [_cancel_response("success"), cancel_fails] if filled_before \
+            else cancel_fails
+        mock_client.info.query_order_by_oid.return_value = {"status": "order", "order": {
+            "order": {"sz": "0.0006", "origSz": "0.001", "limitPx": "85000.0"}, "status": "canceled"}}
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'), \
+                pytest.raises(ActionOutcomeUnknownException, match="may still be there or have filled") as caught:
+            mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.5)
+        assert isinstance(caught.value.__cause__, NetworkException)
+        oid = 2 if filled_before else 1
+        cloid = mock_client.exchange.order.call_args_list[oid - 1].kwargs["cloid"].to_raw()
+        assert f"maker order {oid} (cloid {cloid})" in str(caught.value)
+        assert f"{'0.0004' if filled_before else '0'} of 0.001 filled by earlier attempts" in str(caught.value)
+
+    @pytest.mark.parametrize("filled_before", [False, True], ids=["first-attempt", "after-a-fill"])
+    def test_a_chase_interrupted_while_an_attempt_is_in_the_book_is_an_unknown_outcome(
+            self, mock_client, filled_before):
+        # E.g. an application's timeout signal during the wait: the attempt was never canceled.
+        # After a fill it was reported as incomplete with the rest "not filled".
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [_order_response({"resting": {"oid": 1}}),
+                                                  _order_response({"resting": {"oid": 2}})]
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+        mock_client.info.query_order_by_oid.return_value = {"status": "order", "order": {
+            "order": {"sz": "0.0006", "origSz": "0.001", "limitPx": "85000.0"}, "status": "canceled"}}
+        waits = []
+
+        def sleep(seconds):
+            if seconds >= 0.5:  # the wait while an attempt is in the book
+                waits.append(seconds)
+                if len(waits) == (2 if filled_before else 1):
+                    raise TimeoutError("the application's deadline")
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep', side_effect=sleep), \
+                pytest.raises(ActionOutcomeUnknownException, match="while it was in the book") as caught:
+            mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.5)
+        assert f"maker order {2 if filled_before else 1} " in str(caught.value)
+        assert mock_client.exchange.cancel.call_count == (1 if filled_before else 0)
+
+    def test_a_chase_interrupted_while_an_order_is_being_sent_is_an_unknown_outcome(self, mock_client):
+        # The second attempt's answer is lost; the application's timeout strikes while its
+        # status is looked up. It may be in the book or have filled, yet it was reported as
+        # incomplete with the rest "not filled".
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [_order_response({"resting": {"oid": 1}}), ServerError(502, "Bad Gateway")]
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+        mock_client.info.query_order_by_oid.return_value = {"status": "order", "order": {
+            "order": {"sz": "0.0006", "origSz": "0.001", "limitPx": "85000.0"}, "status": "canceled"}}
+
+        def sleep(seconds):
+            if seconds == 0.5:  # the first wait of the lookup by cloid (the chase waits 0.7)
+                raise TimeoutError("the application's deadline")
+
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep', side_effect=sleep), \
+                pytest.raises(ActionOutcomeUnknownException, match="interrupted") as caught:
+            mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.7)
+        assert "0.0004 of 0.001 counted as filled" in str(caught.value)
+        assert isinstance(caught.value.__cause__, TimeoutError)
+
+    def test_an_unknown_outcome_after_a_partial_fill_keeps_its_type(self, mock_client):
+        # "Check the account before trying again" stays the contract; the cloid stays readable.
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [_order_response({"resting": {"oid": 1}}), ServerError(502, "Bad Gateway")]
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+        mock_client.info.query_order_by_oid.return_value = {"status": "order", "order": {
+            "order": {"sz": "0.0006", "origSz": "0.001", "limitPx": "85000.0"}, "status": "canceled"}}
+        mock_client.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'), pytest.raises(OrderOutcomeUnknownException):
+            mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.5)
+
+    def test_a_post_only_crossing_found_by_cloid_after_a_lost_answer_is_repriced(self, mock_client):
+        # The status lookup's rejection had made-up text, so the chase took it for another
+        # rejection and stopped instead of repricing.
+        mock_client.info.l2_snapshot.return_value = self.BOOK
+        mock_client.exchange.order.side_effect = [
+            ServerError(502, "Bad Gateway"),
+            _order_response({"filled": {"oid": 2, "totalSz": "0.001", "avgPx": "85000.0"}})]
+        mock_client.info.query_order_by_cloid.return_value = {"status": "order", "order": {
+            "order": {"oid": 1, "sz": "0.001", "origSz": "0.001"}, "status": "badAloPxRejected"}}
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            order = mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=0.5)
+        assert order.status == "filled" and mock_client.exchange.order.call_count == 2
 
     def test_no_bid_retries(self, mock_client):
         """When order book has no bids, retries."""

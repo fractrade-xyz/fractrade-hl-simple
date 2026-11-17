@@ -518,6 +518,7 @@ Every failure is a `HyperliquidException` with a fixed `code` and `retryable`. `
 | `UnsupportedAccountModeException` | `UNSUPPORTED_ACCOUNT_MODE` | no | | no single balance for portfolio-margin accounts |
 | `PositionNotFoundException` | `POSITION_NOT_FOUND` | no | | no position for the symbol |
 | `PositionNotClosedException` | `POSITION_NOT_CLOSED` | no | | `close()` filled only part of the position; `order` and `remaining` say how much |
+| `MakerOrderIncompleteException` | `MAKER_ORDER_INCOMPLETE` | no | | `maker_order()` stopped on an error after part of the size filled; `filled_size`, `average_price` and `remaining` say how much, the error is `__cause__` |
 | `ClosePositionsIncompleteException` | `CLOSE_POSITIONS_INCOMPLETE` | no | | `close_all_positions()` did not close every position; `closed` and `failed` per symbol |
 | `AuthenticationRequiredException` | `AUTHENTICATION_REQUIRED` | no | `RuntimeError` | the method signs an action, but the client has no account (private key) |
 | `ActionRejectedException` | `ACTION_REJECTED` | no | `ValueError` | the exchange refused the action (leverage, margin, transfer); `.reason` is Hyperliquid's text |
