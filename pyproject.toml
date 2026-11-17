@@ -27,6 +27,15 @@ python-dotenv = "^1.0.1"
 # spotMeta (token indexes are no longer list positions; SDK issue #301).
 hyperliquid-python-sdk = ">=0.24.0,<1.0.0"
 dacite = "^1.9.1"
+# The MCP server (pip install "fractrade-hl-simple[mcp]"); the library itself does not need it.
+mcp = { version = ">=2.3,<3", optional = true }
+jsonschema = { version = ">=4.20", optional = true }  # the server checks tool arguments with it
+
+[tool.poetry.extras]
+mcp = ["mcp", "jsonschema"]
+
+[tool.poetry.scripts]
+fractrade-hl-mcp = "fractrade_hl_simple.mcp_server.__main__:main"
 
 
 [tool.poetry.group.dev.dependencies]
