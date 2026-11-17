@@ -3,14 +3,16 @@ import math
 import time
 from unittest.mock import patch, MagicMock
 from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
+from fractrade_hl_simple.exceptions import ServerErrorException, UnknownSymbolException
 
 
 @pytest.fixture
 def mock_client():
     """Create a fully mocked client — no API calls."""
     # Save and restore class-level cache so integration tests still work
-    saved = (HyperliquidClient._cached_market_specs, HyperliquidClient._cached_market_specs_at,
-             HyperliquidClient._cached_meta, HyperliquidClient._cached_spot_meta)
+    saved = (HyperliquidClient._cached_key, HyperliquidClient._cached_market_specs,
+             HyperliquidClient._cached_market_specs_at, HyperliquidClient._cached_meta,
+             HyperliquidClient._cached_spot_meta)
     HyperliquidClient._cached_market_specs = None
     HyperliquidClient._cached_market_specs_at = 0
     HyperliquidClient._cached_meta = None
@@ -27,10 +29,12 @@ def mock_client():
 
         client = HyperliquidClient(max_retries=0)
         client.info = mock_info
+        mock_info.name_to_coin = {name: name for name in client.market_specs}  # the SDK's symbol table
         yield client
 
-    (HyperliquidClient._cached_market_specs, HyperliquidClient._cached_market_specs_at,
-     HyperliquidClient._cached_meta, HyperliquidClient._cached_spot_meta) = saved
+    (HyperliquidClient._cached_key, HyperliquidClient._cached_market_specs,
+     HyperliquidClient._cached_market_specs_at, HyperliquidClient._cached_meta,
+     HyperliquidClient._cached_spot_meta) = saved
 
 
 @pytest.fixture
@@ -80,17 +84,26 @@ class TestOrderBook:
         assert order_book["bids"][0]["size"] == 1.5
         assert order_book["asks"][0]["size"] == 1.2
 
-    def test_get_order_book_invalid_response(self, mock_client):
-        """Test order book retrieval with invalid response"""
-        mock_client.info.l2_snapshot.return_value = {"invalid": "data"}
-        with pytest.raises(ValueError, match="Invalid order book response"):
+    def test_get_order_book_in_decimal_is_exactly_what_hyperliquid_sent(self, mock_client):
+        from decimal import Decimal
+        mock_client.info.l2_snapshot.return_value = {"coin": "BTC", "time": 1, "levels": [
+            [{"px": "0.121", "sz": "90071992.54740993", "n": 1}], [{"px": "0.123", "sz": "0.00001", "n": 2}]]}
+        book = mock_client.get_order_book("BTC", decimal=True)
+        assert (book["bids"][0]["size"], book["asks"][0]["size"]) == (Decimal("90071992.54740993"), Decimal("0.00001"))
+        assert (book["spread"], book["mid_price"]) == (Decimal("0.002"), Decimal("0.122"))
+        assert isinstance(mock_client.get_order_book("BTC")["bids"][0]["price"], float)  # the default stays float
+
+    def test_get_order_book_body_that_is_not_json(self, mock_client):
+        # The SDK returns this dict instead of raising (SDK api.py); retried, then a server error.
+        mock_client.info.l2_snapshot.return_value = {"error": "Could not parse JSON: <html>502</html>"}
+        with pytest.raises(ServerErrorException, match="not JSON"):
             mock_client.get_order_book("BTC")
 
-    def test_get_order_book_insufficient_levels(self, mock_client):
-        """Test order book retrieval with insufficient levels"""
-        mock_client.info.l2_snapshot.return_value = {"levels": [[]]}
-        with pytest.raises(ValueError, match="Insufficient order book levels"):
-            mock_client.get_order_book("BTC")
+    def test_get_order_book_unknown_symbol(self, mock_client):
+        # The SDK would raise KeyError for it; the library says what is wrong, before any request.
+        with pytest.raises(UnknownSymbolException, match="Unknown symbol 'BTCC'"):
+            mock_client.get_order_book("BTCC")
+        assert not mock_client.info.l2_snapshot.called
 
     def test_get_order_book_empty_levels(self, mock_client):
         """Test order book retrieval with empty levels"""

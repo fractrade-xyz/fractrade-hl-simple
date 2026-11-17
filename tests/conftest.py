@@ -20,7 +20,7 @@ def load_env():
 @pytest.fixture
 def sample_order():
     return Order(
-        order_id="123",
+        order_id=123,
         symbol="BTC",
         is_buy=True,
         size=Decimal("1.0"),

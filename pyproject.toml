@@ -23,16 +23,18 @@ classifiers = [
 python = "^3.12"
 requests = "^2.32.3"
 python-dotenv = "^1.0.1"
-hyperliquid-python-sdk = ">=0.22.0,<1.0.0"
+# 0.24.0 is the floor: SDK <= 0.22 cannot build a client against today's mainnet
+# spotMeta (token indexes are no longer list positions; SDK issue #301).
+hyperliquid-python-sdk = ">=0.24.0,<1.0.0"
 dacite = "^1.9.1"
 
 
 [tool.poetry.group.dev.dependencies]
-pytest = "^7.0.0"
+pytest = "^9.2.0"
 
 [tool.poetry.group.test.dependencies]
 requests-mock = "^1.12.1"
-pytest-mock = "^3.14.0"
+pytest-mock = "^3.17.0"
 
 [build-system]
 requires = ["poetry-core"]

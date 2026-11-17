@@ -1,14 +1,19 @@
 from typing import List, TypedDict, Optional, Dict, Union, Literal, Any
-from dataclasses import dataclass
+from dataclasses import MISSING, dataclass, fields
 import os
 from dotenv import load_dotenv
-from decimal import Decimal
+from collections.abc import Mapping
+from decimal import Decimal, InvalidOperation
 from dacite import Config as DaciteConfig
 import eth_account
 import logging
+import re
 
-# Load environment variables from .env file
-load_dotenv()
+def load_env_file() -> None:
+    """Load a .env file into os.environ (variables already set win). Called when credentials
+    or the network are read from the environment, never at import: importing the library
+    must not change the environment."""
+    load_dotenv()
 
 @dataclass(slots=True, kw_only=True)
 class HyperliquidAccount:
@@ -51,6 +56,7 @@ class HyperliquidAccount:
     
     @classmethod
     def from_env(cls) -> "HyperliquidAccount":
+        load_env_file()
         private_key = os.getenv("HYPERLIQUID_PRIVATE_KEY")
         if not private_key:
             raise ValueError("HYPERLIQUID_PRIVATE_KEY environment variable is required")
@@ -81,6 +87,18 @@ class Leverage:
     """Leverage configuration for a position."""
     type: Literal["cross", "isolated"]
     value: Decimal
+
+@dataclass(slots=True, kw_only=True)
+class FeeRates:
+    """The fee rates a wallet pays on a perp market (get_fee_rates), as fractions of an
+    order's value: 0.00045 is 0.045 %. A negative maker rate is a rebate."""
+    symbol: str
+    taker: Decimal                       # an order that takes liquidity: market orders, triggered stops
+    maker: Decimal                       # an order that rests and adds liquidity
+    dex: Optional[str] = None            # the HIP-3 dex, None for Hyperliquid's own perps
+    growth_mode: bool = False            # HIP-3 growth mode: protocol fees cut to a tenth
+    deployer_fee_scale: Optional[Decimal] = None  # HIP-3: the deployer's share of the protocol fee
+
 
 @dataclass(slots=True, kw_only=True)
 class CumFunding:
@@ -135,6 +153,43 @@ class MarginSummary:
     total_raw_usd: Decimal
 
 @dataclass(slots=True, kw_only=True)
+class SpotMarket:
+    """A spot pair with its current figures (Info spotMetaAndAssetCtxs). Prices and the day
+    volume are in the quote token, as Hyperliquid reports them; a figure Hyperliquid leaves out
+    (e.g. the mid price of a pair without orders) is None."""
+    symbol: str                      # as the spot methods name it: HYPE (quoted in USDC), HYPE/USDT0
+    coin: str                        # Hyperliquid's name of the pair: @107, PURR/USDC
+    base: str                        # the token traded: HYPE
+    quote: str                       # the token it is priced in: USDC, USDT0, USDH, USDE
+    size_decimals: int               # of the base token
+    mark_price: Optional[Decimal]
+    mid_price: Optional[Decimal]
+    previous_day_price: Optional[Decimal]
+    day_volume: Optional[Decimal]    # in the quote token
+
+
+@dataclass(slots=True, kw_only=True)
+class Market:
+    """A perp market with its current figures (Info metaAndAssetCtxs and
+    perpsAtOpenInterestCap). Prices and amounts are as Hyperliquid reports them; a figure
+    Hyperliquid leaves out (e.g. the mid price of a market without orders) is None."""
+    symbol: str                      # as Hyperliquid names it: BTC, xyz:NVDA
+    dex: Optional[str]               # the HIP-3 dex ("xyz"), None for the default dex
+    size_decimals: int
+    max_leverage: int
+    margin_mode: str                 # "cross", "no_cross", "strict_isolated" or "unknown"
+    delisted: bool
+    at_open_interest_cap: bool
+    mark_price: Optional[Decimal]
+    mid_price: Optional[Decimal]
+    oracle_price: Optional[Decimal]
+    previous_day_price: Optional[Decimal]
+    funding: Optional[Decimal]       # the current hourly funding rate
+    premium: Optional[Decimal]
+    open_interest: Optional[Decimal]  # in base units
+    day_volume_usd: Optional[Decimal]
+
+@dataclass(slots=True, kw_only=True)
 class SpotTokenBalance:
     """Represents the balance of a single token in spot trading."""
     token: str
@@ -152,6 +207,43 @@ class SpotState:
     raw_state: Dict[str, Any]  # Store the original API response
 
 @dataclass(slots=True, kw_only=True)
+class CollateralBalance:
+    """One token balance of the spot account (in unified and portfolio-margin accounts, the
+    collateral of every perp dex too)."""
+    token: str
+    market: str                  # "spot", or "outcome" for HIP-4 outcome balances (+12, o12)
+    total: Decimal
+    hold: Decimal                # held by open orders and, in unified accounts, by positions
+    available: Decimal           # total - hold
+    price: Optional[Decimal]     # USD; None if unpriced (outcome balances, no market)
+    usd_value: Optional[Decimal]
+
+
+@dataclass(slots=True, kw_only=True)
+class DexAccount:
+    """One perp dex (clearinghouse) of an account."""
+    dex: Optional[str]                # None for the default dex, "xyz"
+    account_value: Optional[Decimal]  # its own collateral and PnL: standard accounts only
+    withdrawable: Optional[Decimal]   # standard accounts only
+    margin_used: Decimal              # marginSummary.totalMarginUsed: cross and isolated
+    positions: List[Position]
+    cross_maintenance_margin_used: Optional[Decimal] = None  # as Hyperliquid reports it
+
+
+@dataclass(slots=True, kw_only=True)
+class AccountSummary:
+    """An account's balances, by its account mode. A figure that is not
+    established for the mode is None; `sources` says how each one was computed."""
+    mode: str                                # "standard", "unified", "portfolio_margin", "unknown"
+    account_value: Optional[Decimal]         # USD, PnL of open positions included
+    available_to_trade: Optional[Decimal]    # USDC free to back new orders (unified accounts)
+    margin_used: Optional[Decimal]
+    balances: List[CollateralBalance]
+    dexes: List[DexAccount]
+    sources: Dict[str, str]
+
+
+@dataclass(slots=True, kw_only=True)
 class UserState:
     asset_positions: List[AssetPosition]
     margin_summary: MarginSummary
@@ -159,6 +251,47 @@ class UserState:
     withdrawable: Decimal
     cross_maintenance_margin_used: Optional[Decimal] = None
     spot_state: Optional[SpotState] = None
+
+_PERP_NAME = re.compile(r"[A-Za-z0-9]+")                   # BTC, kPEPE
+_HIP3_NAME = re.compile(r"[a-z0-9]+:[A-Za-z0-9]+")         # xyz:NVDA
+_SPOT_NAME = re.compile(r"@\d+|[^/\s]+/[^/\s]+")           # @107, PURR/USDC
+_OUTCOME_NAME = re.compile(r"#\d+|\+\d+|o\d+")             # #12 (mids, orders), +12 / o12 (balances)
+
+MARKETS = ("perp", "hip3_perp", "spot", "outcome", "unknown")
+
+
+def _restore_with_market(obj: Any, state: Any) -> None:
+    """__setstate__ of Order and Fill. Their pickled state is (None, {field: value}) (slots);
+    one from before the market field lacks it, and its raw coin is not known any more (spot
+    symbols are renamed), so market is "unknown". An Order from before its order_id was a
+    number has it as text, which is converted."""
+    attributes, values = state  # attributes: the __dict__ of a subclass without slots, else None
+    restored = {f.name: f.default for f in fields(obj) if f.default is not MISSING}  # fields added since
+    restored.update(values)
+    restored.setdefault("market", "unknown")
+    restored["market"] = restored["market"] or "unknown"
+    order_id = restored.get("order_id")
+    if isinstance(order_id, str) and order_id.isascii() and order_id.isdigit():  # an Order pickled with a text id
+        restored["order_id"] = int(order_id)
+    for name, value in restored.items():
+        object.__setattr__(obj, name, value)
+    if attributes:
+        obj.__dict__.update(attributes)
+
+
+def coin_market(coin: str) -> str:
+    """The kind of market of a coin as Hyperliquid names it: "perp" (BTC,
+    kPEPE), "hip3_perp" (xyz:NVDA), "spot" (@107, PURR/USDC), "outcome" (HIP-4: #12, and +12
+    or o12 as balances) or "unknown". Applied to the raw coin, before any renaming."""
+    for market, pattern in (("outcome", _OUTCOME_NAME), ("spot", _SPOT_NAME), ("hip3_perp", _HIP3_NAME),
+                            ("perp", _PERP_NAME)):
+        if pattern.fullmatch(coin or ""):
+            return market
+    return "unknown"
+
+
+PERP_MARKETS = ("perp", "hip3_perp")  # coin_market() of a perp on any dex
+
 
 @dataclass(slots=True, kw_only=True)
 class Fill:
@@ -176,6 +309,14 @@ class Fill:
     fee: Optional[Decimal] = None
     start_position: Optional[Decimal] = None  # Position size before this fill
     fee_token: Optional[str] = None           # Token the fee was paid in
+    market: str = ""  # coin_market() of the raw coin; filled in from symbol when not given
+    trade_id: Optional[int] = None            # Hyperliquid's tid: one trade, one id
+
+    def __post_init__(self) -> None:
+        if not self.market:
+            self.market = coin_market(self.symbol)
+
+    __setstate__ = _restore_with_market
 
     def __repr__(self) -> str:
         return (
@@ -184,16 +325,42 @@ class Fill:
         )
 
 @dataclass(slots=True, kw_only=True)
+class FundingPayment:
+    """One funding payment of an account (Info userFunding): positive usdc was received,
+    negative was paid."""
+    time: int                  # ms since the epoch
+    symbol: str                # as Hyperliquid names it: BTC, xyz:NVDA
+    market: str                # coin_market() of the symbol
+    size: Decimal              # the position at the time: positive long, negative short
+    funding_rate: Decimal      # the hourly rate applied
+    usdc: Decimal
+
+
+@dataclass(slots=True, kw_only=True)
+class FillHistory:
+    """The fills of a time range, oldest first, and whether Hyperliquid's limits cut it short.
+
+    truncated_reason: "retention_window" (Hyperliquid keeps only the 10000 most recent fills
+    of an account, and older ones in the range are gone) or "same_millisecond_overflow" (more
+    than one response of fills share one millisecond; the rest of the range is not reachable).
+    """
+    fills: List[Fill]
+    truncated: bool
+    truncated_reason: Optional[str] = None
+
+
+@dataclass(slots=True, kw_only=True)
 class OrderType:
     """Order type specification. Only one of limit, market, or trigger is set."""
-    limit: Optional[Dict[str, Union[Decimal, bool]]] = None
+    limit: Optional[Dict[str, Union[Decimal, bool, str]]] = None      # e.g. {"tif": "Gtc"}
     market: Optional[Dict] = None
-    trigger: Optional[Dict[str, Union[Decimal, bool, str]]] = None
+    trigger: Optional[Dict[str, Union[Decimal, bool, str]]] = None    # triggerPx, isMarket, tpsl
 
 @dataclass(slots=True, kw_only=True)
 class Order:
     """An order on the exchange (open, filled, or cancelled)."""
-    order_id: str
+    order_id: int                  # Hyperliquid's order id (oid)
+    cloid: Optional[str] = None    # the client order id it was placed with (0x + 32 hex), if any
     symbol: str
     is_buy: bool
     size: Decimal
@@ -215,6 +382,13 @@ class Order:
     children: Optional[List[Dict[str, Any]]] = None       # Nested child orders (bracket orders)
     is_position_tpsl: Optional[bool] = None               # Whether this is a position TP/SL order
     trigger_condition: Optional[str] = None                # Trigger condition: "mark", "index", "last"
+    market: str = ""  # coin_market() of the raw coin; filled in from symbol when not given
+
+    def __post_init__(self) -> None:
+        if not self.market:
+            self.market = coin_market(self.symbol)
+
+    __setstate__ = _restore_with_market
 
     @property
     def remaining_size(self) -> Decimal:
@@ -236,10 +410,36 @@ class Order:
             f"[{self.status}] id={self.order_id})"
         )
 
+def _spec_value(value: Any) -> Any:
+    """A value of an order type's limit or trigger spec: numbers and numeric strings as
+    Decimal, other strings and bools as they are."""
+    if value is None or isinstance(value, (bool, Decimal)):
+        return value
+    try:
+        number = Decimal(str(value))
+    except InvalidOperation:
+        return value
+    return number if number.is_finite() else value
+
+
+def _order_type(data: Any) -> Any:
+    """An OrderType from its API form ({"limit": {"tif": "Gtc"}} or {"trigger": {...}}).
+
+    Built here, not by dacite: its int cast also applies to bool (a subclass of int), so any
+    string in these specs became True (tif "Alo", tpsl "sl"). Ordering the Union differently
+    does not help: typing caches Dict[str, Union[...]] regardless of the members' order."""
+    if not isinstance(data, Mapping):
+        return data
+    def spec(values: Optional[Mapping]) -> Optional[Dict[str, Any]]:
+        return None if values is None else {key: _spec_value(v) for key, v in values.items()}
+    return OrderType(limit=spec(data.get("limit")), market=data.get("market"), trigger=spec(data.get("trigger")))
+
+
 DACITE_CONFIG = DaciteConfig(
     cast=[Decimal, int],
     type_hooks={
         Decimal: lambda x: Decimal(str(x)) if x != "NaN" else None,
+        OrderType: _order_type,
     }
 )
 
@@ -280,292 +480,3 @@ def convert_api_response(response: dict) -> dict:
         else:
             converted[model_key] = value
     return converted
-
-# Fallback market specifications, used when the API is unreachable at init.
-# Updated 2026-03-23 (283 markets). Live specs are fetched from the API on client init.
-MARKET_SPECS = {
-    "0G": {"size_decimals": 0, "max_leverage": 3},
-    "2Z": {"size_decimals": 0, "max_leverage": 3},
-    "AAVE": {"size_decimals": 2, "max_leverage": 10},
-    "ACE": {"size_decimals": 2, "max_leverage": 3},
-    "ADA": {"size_decimals": 0, "max_leverage": 10},
-    "AERO": {"size_decimals": 0, "max_leverage": 3},
-    "AI": {"size_decimals": 1, "max_leverage": 3},
-    "AI16Z": {"size_decimals": 1, "max_leverage": 5},
-    "AIXBT": {"size_decimals": 0, "max_leverage": 3},
-    "ALGO": {"size_decimals": 0, "max_leverage": 5},
-    "ALT": {"size_decimals": 0, "max_leverage": 3},
-    "ANIME": {"size_decimals": 0, "max_leverage": 3},
-    "APE": {"size_decimals": 1, "max_leverage": 5},
-    "APEX": {"size_decimals": 0, "max_leverage": 3},
-    "APT": {"size_decimals": 2, "max_leverage": 10},
-    "AR": {"size_decimals": 2, "max_leverage": 5},
-    "ARB": {"size_decimals": 1, "max_leverage": 10},
-    "ARK": {"size_decimals": 0, "max_leverage": 3},
-    "ASTER": {"size_decimals": 0, "max_leverage": 5},
-    "ATOM": {"size_decimals": 2, "max_leverage": 5},
-    "AVAX": {"size_decimals": 2, "max_leverage": 10},
-    "AVNT": {"size_decimals": 0, "max_leverage": 5},
-    "AXS": {"size_decimals": 1, "max_leverage": 5},
-    "AZTEC": {"size_decimals": 0, "max_leverage": 3},
-    "BABY": {"size_decimals": 0, "max_leverage": 3},
-    "BADGER": {"size_decimals": 1, "max_leverage": 5},
-    "BANANA": {"size_decimals": 1, "max_leverage": 3},
-    "BCH": {"size_decimals": 3, "max_leverage": 10},
-    "BERA": {"size_decimals": 1, "max_leverage": 5},
-    "BIGTIME": {"size_decimals": 0, "max_leverage": 3},
-    "BIO": {"size_decimals": 0, "max_leverage": 3},
-    "BLAST": {"size_decimals": 0, "max_leverage": 3},
-    "BLUR": {"size_decimals": 0, "max_leverage": 3},
-    "BLZ": {"size_decimals": 0, "max_leverage": 5},
-    "BNB": {"size_decimals": 3, "max_leverage": 10},
-    "BNT": {"size_decimals": 0, "max_leverage": 3},
-    "BOME": {"size_decimals": 0, "max_leverage": 3},
-    "BRETT": {"size_decimals": 0, "max_leverage": 3},
-    "BSV": {"size_decimals": 2, "max_leverage": 3},
-    "BTC": {"size_decimals": 5, "max_leverage": 40},
-    "CAKE": {"size_decimals": 1, "max_leverage": 3},
-    "CANTO": {"size_decimals": 0, "max_leverage": 5},
-    "CATI": {"size_decimals": 0, "max_leverage": 3},
-    "CC": {"size_decimals": 0, "max_leverage": 3},
-    "CELO": {"size_decimals": 0, "max_leverage": 3},
-    "CFX": {"size_decimals": 0, "max_leverage": 5},
-    "CHILLGUY": {"size_decimals": 0, "max_leverage": 3},
-    "COMP": {"size_decimals": 2, "max_leverage": 5},
-    "CRV": {"size_decimals": 1, "max_leverage": 10},
-    "CYBER": {"size_decimals": 1, "max_leverage": 3},
-    "DASH": {"size_decimals": 2, "max_leverage": 5},
-    "DOGE": {"size_decimals": 0, "max_leverage": 10},
-    "DOOD": {"size_decimals": 0, "max_leverage": 3},
-    "DOT": {"size_decimals": 1, "max_leverage": 10},
-    "DYDX": {"size_decimals": 1, "max_leverage": 5},
-    "DYM": {"size_decimals": 1, "max_leverage": 3},
-    "EIGEN": {"size_decimals": 2, "max_leverage": 5},
-    "ENA": {"size_decimals": 0, "max_leverage": 10},
-    "ENS": {"size_decimals": 2, "max_leverage": 5},
-    "ETC": {"size_decimals": 2, "max_leverage": 5},
-    "ETH": {"size_decimals": 4, "max_leverage": 25},
-    "ETHFI": {"size_decimals": 1, "max_leverage": 5},
-    "FARTCOIN": {"size_decimals": 1, "max_leverage": 10},
-    "FET": {"size_decimals": 0, "max_leverage": 5},
-    "FIL": {"size_decimals": 1, "max_leverage": 5},
-    "FOGO": {"size_decimals": 0, "max_leverage": 3},
-    "FRIEND": {"size_decimals": 1, "max_leverage": 3},
-    "FTM": {"size_decimals": 0, "max_leverage": 10},
-    "FTT": {"size_decimals": 1, "max_leverage": 3},
-    "FXS": {"size_decimals": 1, "max_leverage": 5},
-    "GALA": {"size_decimals": 0, "max_leverage": 3},
-    "GAS": {"size_decimals": 1, "max_leverage": 3},
-    "GMT": {"size_decimals": 0, "max_leverage": 3},
-    "GMX": {"size_decimals": 2, "max_leverage": 3},
-    "GOAT": {"size_decimals": 0, "max_leverage": 3},
-    "GRASS": {"size_decimals": 1, "max_leverage": 3},
-    "GRIFFAIN": {"size_decimals": 0, "max_leverage": 3},
-    "HBAR": {"size_decimals": 0, "max_leverage": 5},
-    "HEMI": {"size_decimals": 0, "max_leverage": 3},
-    "HMSTR": {"size_decimals": 0, "max_leverage": 3},
-    "HPOS": {"size_decimals": 0, "max_leverage": 3},
-    "HYPE": {"size_decimals": 2, "max_leverage": 10},
-    "HYPER": {"size_decimals": 0, "max_leverage": 3},
-    "ICP": {"size_decimals": 1, "max_leverage": 5},
-    "ILV": {"size_decimals": 2, "max_leverage": 3},
-    "IMX": {"size_decimals": 1, "max_leverage": 5},
-    "INIT": {"size_decimals": 0, "max_leverage": 3},
-    "INJ": {"size_decimals": 1, "max_leverage": 10},
-    "IO": {"size_decimals": 1, "max_leverage": 3},
-    "IOTA": {"size_decimals": 0, "max_leverage": 3},
-    "IP": {"size_decimals": 1, "max_leverage": 3},
-    "JELLY": {"size_decimals": 0, "max_leverage": 3},
-    "JTO": {"size_decimals": 0, "max_leverage": 5},
-    "JUP": {"size_decimals": 0, "max_leverage": 10},
-    "KAITO": {"size_decimals": 0, "max_leverage": 5},
-    "KAS": {"size_decimals": 0, "max_leverage": 3},
-    "LAUNCHCOIN": {"size_decimals": 0, "max_leverage": 3},
-    "LAYER": {"size_decimals": 0, "max_leverage": 3},
-    "LDO": {"size_decimals": 1, "max_leverage": 10},
-    "LINEA": {"size_decimals": 0, "max_leverage": 3},
-    "LINK": {"size_decimals": 1, "max_leverage": 10},
-    "LISTA": {"size_decimals": 0, "max_leverage": 3},
-    "LIT": {"size_decimals": 0, "max_leverage": 5},
-    "LOOM": {"size_decimals": 0, "max_leverage": 10},
-    "LTC": {"size_decimals": 2, "max_leverage": 10},
-    "MANTA": {"size_decimals": 1, "max_leverage": 3},
-    "MATIC": {"size_decimals": 1, "max_leverage": 20},
-    "MAV": {"size_decimals": 0, "max_leverage": 3},
-    "MAVIA": {"size_decimals": 1, "max_leverage": 3},
-    "ME": {"size_decimals": 1, "max_leverage": 3},
-    "MEGA": {"size_decimals": 0, "max_leverage": 3},
-    "MELANIA": {"size_decimals": 1, "max_leverage": 3},
-    "MEME": {"size_decimals": 0, "max_leverage": 3},
-    "MERL": {"size_decimals": 0, "max_leverage": 3},
-    "MET": {"size_decimals": 0, "max_leverage": 3},
-    "MEW": {"size_decimals": 0, "max_leverage": 3},
-    "MINA": {"size_decimals": 0, "max_leverage": 3},
-    "MKR": {"size_decimals": 4, "max_leverage": 10},
-    "MNT": {"size_decimals": 1, "max_leverage": 5},
-    "MON": {"size_decimals": 0, "max_leverage": 5},
-    "MOODENG": {"size_decimals": 0, "max_leverage": 3},
-    "MORPHO": {"size_decimals": 1, "max_leverage": 5},
-    "MOVE": {"size_decimals": 0, "max_leverage": 3},
-    "MYRO": {"size_decimals": 0, "max_leverage": 3},
-    "NEAR": {"size_decimals": 1, "max_leverage": 10},
-    "NEIROETH": {"size_decimals": 0, "max_leverage": 5},
-    "NEO": {"size_decimals": 2, "max_leverage": 5},
-    "NFTI": {"size_decimals": 1, "max_leverage": 3},
-    "NIL": {"size_decimals": 0, "max_leverage": 3},
-    "NOT": {"size_decimals": 0, "max_leverage": 3},
-    "NTRN": {"size_decimals": 0, "max_leverage": 3},
-    "NXPC": {"size_decimals": 0, "max_leverage": 3},
-    "OGN": {"size_decimals": 0, "max_leverage": 3},
-    "OM": {"size_decimals": 1, "max_leverage": 3},
-    "OMNI": {"size_decimals": 2, "max_leverage": 3},
-    "ONDO": {"size_decimals": 0, "max_leverage": 10},
-    "OP": {"size_decimals": 1, "max_leverage": 10},
-    "ORBS": {"size_decimals": 0, "max_leverage": 3},
-    "ORDI": {"size_decimals": 2, "max_leverage": 3},
-    "OX": {"size_decimals": 0, "max_leverage": 3},
-    "PANDORA": {"size_decimals": 5, "max_leverage": 3},
-    "PAXG": {"size_decimals": 3, "max_leverage": 10},
-    "PENDLE": {"size_decimals": 0, "max_leverage": 5},
-    "PENGU": {"size_decimals": 0, "max_leverage": 5},
-    "PEOPLE": {"size_decimals": 0, "max_leverage": 3},
-    "PIXEL": {"size_decimals": 0, "max_leverage": 3},
-    "PNUT": {"size_decimals": 1, "max_leverage": 3},
-    "POL": {"size_decimals": 0, "max_leverage": 5},
-    "POLYX": {"size_decimals": 0, "max_leverage": 3},
-    "POPCAT": {"size_decimals": 0, "max_leverage": 3},
-    "PROMPT": {"size_decimals": 0, "max_leverage": 3},
-    "PROVE": {"size_decimals": 0, "max_leverage": 3},
-    "PUMP": {"size_decimals": 0, "max_leverage": 10},
-    "PURR": {"size_decimals": 0, "max_leverage": 3},
-    "PYTH": {"size_decimals": 0, "max_leverage": 5},
-    "RDNT": {"size_decimals": 0, "max_leverage": 5},
-    "RENDER": {"size_decimals": 1, "max_leverage": 5},
-    "REQ": {"size_decimals": 0, "max_leverage": 3},
-    "RESOLV": {"size_decimals": 0, "max_leverage": 3},
-    "REZ": {"size_decimals": 0, "max_leverage": 3},
-    "RLB": {"size_decimals": 0, "max_leverage": 3},
-    "RNDR": {"size_decimals": 1, "max_leverage": 20},
-    "RSR": {"size_decimals": 0, "max_leverage": 3},
-    "RUNE": {"size_decimals": 1, "max_leverage": 5},
-    "S": {"size_decimals": 0, "max_leverage": 5},
-    "SAGA": {"size_decimals": 1, "max_leverage": 3},
-    "SAND": {"size_decimals": 0, "max_leverage": 5},
-    "SCR": {"size_decimals": 1, "max_leverage": 3},
-    "SEI": {"size_decimals": 0, "max_leverage": 10},
-    "SHIA": {"size_decimals": 0, "max_leverage": 3},
-    "SKR": {"size_decimals": 0, "max_leverage": 3},
-    "SKY": {"size_decimals": 0, "max_leverage": 3},
-    "SNX": {"size_decimals": 1, "max_leverage": 3},
-    "SOL": {"size_decimals": 2, "max_leverage": 20},
-    "SOPH": {"size_decimals": 0, "max_leverage": 3},
-    "SPX": {"size_decimals": 1, "max_leverage": 5},
-    "STABLE": {"size_decimals": 0, "max_leverage": 3},
-    "STBL": {"size_decimals": 0, "max_leverage": 3},
-    "STG": {"size_decimals": 0, "max_leverage": 3},
-    "STRAX": {"size_decimals": 0, "max_leverage": 10},
-    "STRK": {"size_decimals": 1, "max_leverage": 5},
-    "STX": {"size_decimals": 1, "max_leverage": 5},
-    "SUI": {"size_decimals": 1, "max_leverage": 10},
-    "SUPER": {"size_decimals": 0, "max_leverage": 3},
-    "SUSHI": {"size_decimals": 1, "max_leverage": 3},
-    "SYRUP": {"size_decimals": 0, "max_leverage": 3},
-    "TAO": {"size_decimals": 3, "max_leverage": 5},
-    "TIA": {"size_decimals": 1, "max_leverage": 10},
-    "TNSR": {"size_decimals": 1, "max_leverage": 3},
-    "TON": {"size_decimals": 1, "max_leverage": 10},
-    "TRB": {"size_decimals": 2, "max_leverage": 3},
-    "TRUMP": {"size_decimals": 1, "max_leverage": 10},
-    "TRX": {"size_decimals": 0, "max_leverage": 10},
-    "TST": {"size_decimals": 0, "max_leverage": 3},
-    "TURBO": {"size_decimals": 0, "max_leverage": 3},
-    "UMA": {"size_decimals": 1, "max_leverage": 3},
-    "UNI": {"size_decimals": 1, "max_leverage": 10},
-    "UNIBOT": {"size_decimals": 3, "max_leverage": 3},
-    "USTC": {"size_decimals": 0, "max_leverage": 3},
-    "USUAL": {"size_decimals": 1, "max_leverage": 3},
-    "VINE": {"size_decimals": 0, "max_leverage": 3},
-    "VIRTUAL": {"size_decimals": 1, "max_leverage": 5},
-    "VVV": {"size_decimals": 2, "max_leverage": 3},
-    "W": {"size_decimals": 1, "max_leverage": 5},
-    "WCT": {"size_decimals": 0, "max_leverage": 3},
-    "WIF": {"size_decimals": 0, "max_leverage": 5},
-    "WLD": {"size_decimals": 1, "max_leverage": 10},
-    "WLFI": {"size_decimals": 0, "max_leverage": 5},
-    "XAI": {"size_decimals": 1, "max_leverage": 3},
-    "XLM": {"size_decimals": 0, "max_leverage": 5},
-    "XMR": {"size_decimals": 3, "max_leverage": 5},
-    "XPL": {"size_decimals": 0, "max_leverage": 10},
-    "XRP": {"size_decimals": 0, "max_leverage": 20},
-    "YGG": {"size_decimals": 0, "max_leverage": 3},
-    "YZY": {"size_decimals": 0, "max_leverage": 3},
-    "ZEC": {"size_decimals": 2, "max_leverage": 10},
-    "ZEN": {"size_decimals": 2, "max_leverage": 5},
-    "ZEREBRO": {"size_decimals": 0, "max_leverage": 3},
-    "ZETA": {"size_decimals": 1, "max_leverage": 3},
-    "ZK": {"size_decimals": 0, "max_leverage": 5},
-    "ZORA": {"size_decimals": 0, "max_leverage": 3},
-    "ZRO": {"size_decimals": 1, "max_leverage": 5},
-    "kBONK": {"size_decimals": 0, "max_leverage": 10},
-    "kDOGS": {"size_decimals": 0, "max_leverage": 3},
-    "kFLOKI": {"size_decimals": 0, "max_leverage": 5},
-    "kLUNC": {"size_decimals": 0, "max_leverage": 3},
-    "kNEIRO": {"size_decimals": 1, "max_leverage": 3},
-    "kPEPE": {"size_decimals": 0, "max_leverage": 10},
-    "kSHIB": {"size_decimals": 0, "max_leverage": 10},
-    # Extended universe (xyz dex) — commodities, stocks, indices, forex
-    "xyz:AAPL": {"size_decimals": 3, "max_leverage": 20},
-    "xyz:ALUMINIUM": {"size_decimals": 4, "max_leverage": 20},
-    "xyz:AMD": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:AMZN": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:BABA": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:BRENTOIL": {"size_decimals": 2, "max_leverage": 20},
-    "xyz:CL": {"size_decimals": 3, "max_leverage": 20},
-    "xyz:COIN": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:COPPER": {"size_decimals": 2, "max_leverage": 20},
-    "xyz:COST": {"size_decimals": 4, "max_leverage": 20},
-    "xyz:CRCL": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:CRWV": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:DKNG": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:DXY": {"size_decimals": 2, "max_leverage": 20},
-    "xyz:EUR": {"size_decimals": 1, "max_leverage": 50},
-    "xyz:EWJ": {"size_decimals": 3, "max_leverage": 20},
-    "xyz:EWY": {"size_decimals": 3, "max_leverage": 20},
-    "xyz:GME": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:GOLD": {"size_decimals": 4, "max_leverage": 25},
-    "xyz:GOOGL": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:HIMS": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:HOOD": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:HYUNDAI": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:INTC": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:JP225": {"size_decimals": 5, "max_leverage": 20},
-    "xyz:JPY": {"size_decimals": 2, "max_leverage": 50},
-    "xyz:KIOXIA": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:KR200": {"size_decimals": 4, "max_leverage": 20},
-    "xyz:LLY": {"size_decimals": 4, "max_leverage": 10},
-    "xyz:META": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:MSFT": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:MSTR": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:MU": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:NATGAS": {"size_decimals": 1, "max_leverage": 10},
-    "xyz:NFLX": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:NVDA": {"size_decimals": 3, "max_leverage": 20},
-    "xyz:ORCL": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:PALLADIUM": {"size_decimals": 4, "max_leverage": 20},
-    "xyz:PLATINUM": {"size_decimals": 4, "max_leverage": 20},
-    "xyz:PLTR": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:RIVN": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:SILVER": {"size_decimals": 2, "max_leverage": 25},
-    "xyz:SKHX": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:SMSN": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:SNDK": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:SOFTBANK": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:SP500": {"size_decimals": 3, "max_leverage": 50},
-    "xyz:TSLA": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:TSM": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:URANIUM": {"size_decimals": 3, "max_leverage": 10},
-    "xyz:URNM": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:USAR": {"size_decimals": 2, "max_leverage": 10},
-    "xyz:VIX": {"size_decimals": 2, "max_leverage": 3},
-    "xyz:XYZ100": {"size_decimals": 4, "max_leverage": 30},
-}

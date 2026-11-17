@@ -1,30 +1,66 @@
-import json
 import logging
+import math
+import os
+import re
+import secrets
 import threading
 import time
-from decimal import Decimal
-from typing import Any, Dict, List, Literal, Optional, Union
+import warnings
+from decimal import ROUND_DOWN, Decimal, InvalidOperation
+from typing import Any, Callable, Dict, List, Literal, Optional, Sequence, Tuple, Union
 
 import eth_account
 import requests
 from dacite import from_dict
 from hyperliquid.exchange import Exchange
-from hyperliquid.info import Info
+from hyperliquid.info import Info as _SdkInfo
 from hyperliquid.utils import constants
-from hyperliquid.utils.error import ClientError
+from hyperliquid.utils.error import ClientError, ServerError
+from hyperliquid.utils.types import Cloid
 
 from .exceptions import (
+    AddressRequiredException,
+    ActionOutcomeUnknownException,
+    OrderException,
+    OrdersNotCanceledException,
+    OrderOutcomeUnknownException,
+    ActionRejectedException,
+    AuthenticationRequiredException,
+    ClosePositionsIncompleteException,
+    OrderRejectedException,
+    PositionNotClosedException,
     PositionNotFoundException,
+    ProtectionOrderException,
+    ProtectionReplacementIncompleteException,
     RateLimitException,
     ServerErrorException,
     UnauthorizedException,
+    UnsupportedAccountModeException,
     ConfigurationException,
+    ClientErrorException,
+    HyperliquidException,
+    InsufficientMarginException,
+    InvalidArgumentException,
+    NetworkException,
+    TimeoutException,
+    UnknownSymbolException,
 )
 from .models import (
     DACITE_CONFIG,
-    MARKET_SPECS,
+    AccountSummary,
+    CollateralBalance,
+    DexAccount,
+    FeeRates,
+    FillHistory,
+    FundingPayment,
+    PERP_MARKETS,
+    coin_market,
     HyperliquidAccount,
+    Leverage,
+    Market,
     MarginSummary,
+    SpotMarket,
+    load_env_file,
     Order,
     OrderType,
     Position,
@@ -37,29 +73,323 @@ from .models import (
 logger = logging.getLogger("fractrade_hl_simple")
 logger.addHandler(logging.NullHandler())
 
+
+class _SignerState:
+    """Locks and last nonce of one signing key, shared by every client in the process.
+
+    `lock` serializes single signed actions; `operation_lock` serializes multi-step
+    operations (stop loss / take profit replacement) and is held around `lock`, never inside.
+    """
+
+    __slots__ = ("lock", "operation_lock", "last_nonce_ms")
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.operation_lock = threading.RLock()
+        self.last_nonce_ms = 0
+
+
+_signers: Dict[str, _SignerState] = {}
+_signers_lock = threading.Lock()
+
+
+def _signer_state(address: str) -> _SignerState:
+    with _signers_lock:
+        return _signers.setdefault(str(address).lower(), _SignerState())
+
+
+def _round_down(value: float, decimals: int) -> float:
+    """`value` rounded toward zero to `decimals` decimals, so an order is never larger than
+    requested (float round() can round up)."""
+    return float(Decimal(str(value)).quantize(Decimal(1).scaleb(-decimals), rounding=ROUND_DOWN))
+
+
+_MARGIN_MODES = {"noCross": "no_cross", "strictIsolated": "strict_isolated"}
+
+
+def _margin_mode(market: Dict[str, Any]) -> str:
+    """Margin mode of a perp market: "cross" (cross allowed), "no_cross" or "strict_isolated"
+    (isolated only), or "unknown" for a value this library does not know.
+
+    Markets without `marginMode` allow cross margin, unless the older `onlyIsolated` is set.
+    """
+    mode = market.get("marginMode")
+    if mode is None:
+        return "no_cross" if market.get("onlyIsolated") else "cross"
+    return _MARGIN_MODES.get(mode, "unknown")
+
+
+# Info `userAbstraction` values. "default" is undocumented; the account checked
+# with it (2026-11) kept its collateral in the perp account, as standard mode does.
+_ACCOUNT_MODES = {
+    "disabled": "standard",
+    "default": "standard",
+    "unifiedAccount": "unified",
+    "portfolioMargin": "portfolio_margin",
+}
+
+# The API URLs a client accepts, with the network each one is. The SDK signs for
+# mainnet only when its base_url is exactly MAINNET_API_URL and for testnet otherwise, so any
+# other URL, even with a trailing slash, would make mainnet reject every action.
+_NETWORKS = {
+    constants.MAINNET_API_URL: "mainnet",
+    constants.TESTNET_API_URL: "testnet",
+    constants.LOCAL_API_URL: None,
+}
+_NETWORK_URLS = {"mainnet": constants.MAINNET_API_URL, "testnet": constants.TESTNET_API_URL}
+
+_ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
+_INSUFFICIENT_MARGIN = "Insufficient margin to place order."  # PerpMargin, API docs "Error responses"
+_POST_ONLY_CROSSED = "Post only order would have immediately matched"  # BadAloPx, followed by the bbo
+_PRIVATE_KEY = re.compile(r"(?:0x)?[0-9a-fA-F]{64}")
+_CLOID = re.compile(r"0x[0-9a-fA-F]{32}")  # a 128 bit hex string (exchange endpoint docs)
+_DIGITS = re.compile(r"[0-9]+")
+
+
+def _perp_dexs(perp_dexs: Any, extended_universe: bool) -> List[str]:
+    """The perp dexes of a client, as the SDK's Info takes them: the default dex ("") first,
+    then the HIP-3 dexes asked for, each once."""
+    if perp_dexs is None:
+        return ["", "xyz"] if extended_universe else [""]
+    if extended_universe:
+        raise InvalidArgumentException("pass extended_universe=True or perp_dexs, not both")
+    if isinstance(perp_dexs, (str, bytes)) or not isinstance(perp_dexs, (list, tuple)) \
+            or not all(isinstance(dex, str) for dex in perp_dexs):
+        raise InvalidArgumentException(f"perp_dexs must be a list of dex names such as ['xyz'], got {perp_dexs!r}")
+    return list(dict.fromkeys(["", *perp_dexs]))
+
+
+def _sdk_dex(coin: str) -> str:
+    """The perp dex of a market name, as the SDK finds it: "xyz" for xyz:NVDA, "" otherwise."""
+    return coin.split(":")[0] if ":" in coin else ""
+
+
+def _order_id(order_id: Any) -> int:
+    """An order id (oid) as the SDK sends it, a number: an int, or the text of one."""
+    if isinstance(order_id, int) and not isinstance(order_id, bool) and order_id >= 0:
+        return order_id
+    if isinstance(order_id, str) and _DIGITS.fullmatch(order_id.strip()):
+        return int(order_id)
+    raise InvalidArgumentException(f"order_id must be a whole number, got {order_id!r}")
+
+
+MIN_ORDER_USD = Decimal(10)  # Hyperliquid's minimum order value
+_TIMES_IN_FORCE = ("Gtc", "Ioc", "Alo")  # of a limit order (exchange endpoint docs)
+
+
+def _protection_legs(kind: str, price: Optional[float],
+                     levels: Optional[Sequence[Tuple[float, float]]]) -> List[Tuple[str, str, float, Decimal]]:
+    """(name, kind, price, fraction) per stop loss or take profit of an open_*_position call:
+    the single price (the whole position, named `kind`) or the list (named kind_1, kind_2,
+    ...). Raises InvalidArgumentException for both, a price that is not a positive number, a
+    fraction outside (0, 1], or fractions adding up to more than 1."""
+    if price is not None and levels is not None:
+        raise InvalidArgumentException(f"pass {kind}_price or {kind}s, not both")
+    if price is not None:
+        if not _positive_number(price):
+            raise InvalidArgumentException(f"{kind}_price must be a positive number, got {price!r}")
+        return [(kind, kind, price, Decimal(1))]
+    if levels is None:
+        return []
+    legs: List[Tuple[str, str, float, Decimal]] = []
+    for number, level in enumerate(levels, start=1):
+        try:
+            level_price, fraction_value = level
+        except (TypeError, ValueError):
+            raise InvalidArgumentException(f"{kind}s: each is (price, fraction), got {level!r}") from None
+        if not _positive_number(level_price):
+            raise InvalidArgumentException(f"{kind}s: price must be a positive number, got {level_price!r}")
+        fraction = Decimal(str(fraction_value)) if isinstance(fraction_value, (int, float)) and \
+            not isinstance(fraction_value, bool) else Decimal("NaN")
+        if not fraction.is_finite() or not 0 < fraction <= 1:
+            raise InvalidArgumentException(f"{kind}s: fraction must be above 0 and at most 1, got {fraction_value!r}")
+        legs.append((f"{kind}_{number}", kind, level_price, fraction))
+    if not legs:
+        raise InvalidArgumentException(f"{kind}s is empty: pass at least one, or none")
+    if sum(fraction for _, _, _, fraction in legs) > 1:
+        raise InvalidArgumentException(f"{kind}s: the fractions add up to more than 1")
+    return legs
+
+
+def split_size(size: Decimal, legs: Sequence[Tuple[str, str, Any, Decimal]], size_decimals: int,
+               is_long: bool) -> List[Decimal]:
+    """The size of each leg (name, kind, price, fraction) of a long or short position: its
+    fraction of `size`, rounded down to the lot size; per kind, the leg nearest the entry (the
+    first the price reaches: a long's highest stop loss and lowest take profit) takes what
+    rounding left, so the legs of a kind cover their share (their fractions' sum of `size`,
+    rounded down) exactly. Given to the nearest stop, the cheapest per unit, the loss if
+    every stop fills (moves and fees, and slippage estimated for all the stops together)
+    only grows with `size`: a partial fill never loses more at its stops than the full size."""
+    step = Decimal(1).scaleb(-size_decimals)
+    sizes = [(size * fraction).quantize(step, ROUND_DOWN) for _, _, _, fraction in legs]
+    for kind in ("stop_loss", "take_profit"):
+        indexes = [i for i, leg in enumerate(legs) if leg[1] == kind]
+        if indexes:
+            share = (size * sum(legs[i][3] for i in indexes)).quantize(step, ROUND_DOWN)
+            highest = (kind == "stop_loss") == is_long  # a long's stops, a short's take profits: below the price
+            nearest = max(indexes, key=lambda i: Decimal(str(legs[i][2]))) if highest else \
+                min(indexes, key=lambda i: Decimal(str(legs[i][2])))
+            sizes[nearest] += share - sum(sizes[i] for i in indexes)
+    return sizes
+
+
+def _missing(legs: Sequence[Tuple[str, str, float, Decimal]], sizes: Sequence[Decimal]) -> List[Dict[str, Any]]:
+    """The legs not placed, for ProtectionOrderException: name, kind, price, size."""
+    return [{"leg": name, "kind": kind, "price": price, "size": leg_size.normalize(), "outcome_unknown": False,
+             "cloid": None} for (name, kind, price, _), leg_size in zip(legs, sizes) if leg_size > 0]
+
+
+def _positive_number(value: Any) -> bool:
+    """True for a finite number above 0 (int, float, Decimal, numpy numbers); not for text or bool."""
+    if isinstance(value, (bool, str, bytes)):
+        return False
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return False
+    return math.isfinite(number) and number > 0
+
+
+def _cloid(cloid: Any) -> Cloid:
+    """A client order id as the SDK sends it, from its text: "0x" and 32 hex digits. The SDK's
+    Cloid checks only the prefix and the length, not that it is hex."""
+    if not (isinstance(cloid, str) and _CLOID.fullmatch(cloid)):
+        raise InvalidArgumentException(f"cloid must be 0x followed by 32 hex digits, got {cloid!r}")
+    return Cloid(cloid)
+
+
+def _order_cloid(cloid: Any) -> Cloid:
+    """The client order id to place an order with: the caller's, else a new random one."""
+    return Cloid("0x" + secrets.token_hex(16)) if cloid is None else _cloid(cloid)
+
+
+def _is_unparsed(response: Any) -> bool:
+    """True for the dict the SDK returns instead of raising when a response body is not JSON."""
+    return (isinstance(response, dict) and set(response) == {"error"}
+            and str(response["error"]).startswith("Could not parse JSON"))
+
+
+def _spot_symbol(base: str, quote: str) -> str:
+    """The symbol the spot methods use for a pair: the base token for a pair quoted in USDC
+    ("PURR"), else "BASE/QUOTE" ("HYPE/USDT0")."""
+    return base if quote == "USDC" else f"{base}/{quote}"
+
+
+def _decimal(value: Any) -> Optional[Decimal]:
+    """A number Hyperliquid sends as a string, as Decimal; None stays None."""
+    return None if value is None else Decimal(str(value))
+
+
+_NOT_JSON = "Hyperliquid answered with a body that is not JSON (e.g. an HTML error page)"
+
+
+class Info(_SdkInfo):
+    """The SDK's Info, raising ServerErrorException where the SDK would return its
+    {"error": "Could not parse JSON: ..."} dict for a response body that is not JSON. Every
+    request of the SDK's Info goes through post(), its own startup requests included, so the
+    SDK's parsing never sees that dict. The body is not kept: it is no message.
+
+    `proxies` are set on the session before its first request: the SDK's Info already sends
+    requests while it is created, before a caller could set them.
+
+    A dex of perp_dexs that the network does not have raises InvalidArgumentException: the
+    SDK fails with a bare KeyError while it is created. Only a dex missing from the network's
+    list of dexes (the perpDexs answer the SDK reads then) is reported so; any other KeyError
+    is raised as it is.
+
+    `startup_metadata` keeps the default dex's meta ("meta") and the spot meta ("spotMeta")
+    as the SDK fetched them while it was created, so they need no second request."""
+
+    def __init__(self, *args: Any, proxies: Optional[Dict[str, str]] = None, **kwargs: Any) -> None:
+        self._pending_proxies = proxies  # read by post(), which the SDK's __init__ already calls
+        self._listed_dexes: Optional[set] = None  # set by post() from the perpDexs answer
+        self.startup_metadata: Dict[str, Any] = {}  # set by post() while the SDK's __init__ runs
+        self._starting = True
+        try:
+            super().__init__(*args, **kwargs)
+        except KeyError as e:
+            missing = e.args[0] if len(e.args) == 1 else None
+            if not (self._listed_dexes is not None and missing in (kwargs.get("perp_dexs") or ())
+                    and missing not in self._listed_dexes):
+                raise
+            network = _NETWORKS.get(self.base_url) or self.base_url
+            raise InvalidArgumentException(
+                f"{missing!r} is not a perp dex on {network}; get_perp_dexs() lists them") from e
+        finally:
+            self._starting = False
+
+    def post(self, url_path: str, payload: Any = None) -> Any:
+        proxies = self.__dict__.pop("_pending_proxies", None)
+        if proxies:
+            self.session.proxies.update(proxies)
+        response = super().post(url_path, payload)
+        if _is_unparsed(response):
+            raise ServerErrorException(_NOT_JSON, 200)
+        kind = payload.get("type") if isinstance(payload, dict) else None
+        if kind == "perpDexs" and isinstance(response, list):
+            self._listed_dexes = {dex.get("name") for dex in response if isinstance(dex, dict)}
+        elif (self.__dict__.get("_starting") and isinstance(response, dict)
+              and (kind == "spotMeta" or (kind == "meta" and payload.get("dex", "") == ""))):
+            self.startup_metadata[kind] = response
+        return response
+
+
+def _collateral(balance: SpotTokenBalance) -> CollateralBalance:
+    """A spot balance of get_spot_balance as collateral; a price of 0 means unpriced there."""
+    market = "outcome" if coin_market(balance.token) == "outcome" else "spot"
+    priced = market == "spot" and balance.price > 0
+    return CollateralBalance(
+        token=balance.token, market=market, total=balance.amount, hold=balance.hold,
+        available=balance.amount - balance.hold, price=balance.price if priced else None,
+        usd_value=balance.usd_value if priced else None)
+
+
+def _library_error(error: Exception) -> HyperliquidException:
+    """The library exception for a failure requests or the SDK raised."""
+    if isinstance(error, HyperliquidException):
+        return error
+    if isinstance(error, requests.Timeout):
+        return TimeoutException(f"Hyperliquid did not answer in time: {error}")
+    if isinstance(error, ServerError):
+        return ServerErrorException(f"Hyperliquid server error (HTTP {error.status_code})", error.status_code)
+    if isinstance(error, ClientError):
+        return ClientErrorException(
+            f"Hyperliquid rejected the request (HTTP {error.status_code}): {error.error_message}",
+            error.status_code, error.error_code, error.error_message, error.header, error.error_data)
+    return NetworkException(f"Hyperliquid could not be reached: {error}")
+
+
 class HyperliquidClient:
+    # Metadata cached for the next client of the same network and dex list (_cached_key).
+    _cached_key: Optional[tuple] = None
     _cached_market_specs: Optional[Dict[str, Dict]] = None
     _cached_market_specs_at: float = 0
     _cached_meta: Optional[Any] = None
     _cached_spot_meta: Optional[Any] = None
+    _cache_lock = threading.Lock()  # read and publish the _cached_* fields together
     _CACHE_TTL: float = 86400  # 24 hours
 
     def __init__(
         self,
         account: Optional[HyperliquidAccount] = None,
-        env: str = "mainnet",
+        env: Optional[str] = None,
         default_slippage: float = 0.05,
         max_retries: int = 3,
         retry_delay: float = 1.0,
         cache_market_specs: bool = True,
         extended_universe: bool = False,
         proxy: Optional[Dict[str, str]] = None,
+        request_timeout: float = 10.0,
+        *,
+        base_url: Optional[str] = None,
+        trust_env: bool = True,
+        perp_dexs: Optional[List[str]] = None,
     ):
         """Initialize HyperliquidClient.
 
         Args:
             account (Optional[HyperliquidAccount]): Account credentials. If None, tries to load from environment.
-            env (str): The environment to use, either "mainnet" or "testnet". Defaults to "mainnet".
+            env (Optional[str]): Deprecated, use base_url. "mainnet" or "testnet".
             default_slippage (float): Default slippage for market orders (0.05 = 5%). Defaults to 0.05.
             max_retries (int): Maximum number of retries for transient failures. 0 to disable. Defaults to 3.
             retry_delay (float): Base delay in seconds between retries (exponential backoff). Defaults to 1.0.
@@ -68,90 +398,150 @@ class HyperliquidClient:
                 fresh specs on init.
             extended_universe (bool): If True, enables trading of stocks, commodities, indices, and forex
                 (xyz: symbols like xyz:TSLA, xyz:GOLD). Off by default to avoid extra API overhead.
+                The same as perp_dexs=["xyz"].
+            request_timeout (float): Seconds to wait for each HTTP request. Defaults to 10.
+            base_url (Optional[str]): The API to use, as in the Hyperliquid SDK: one of the
+                constants MAINNET_API_URL, TESTNET_API_URL or LOCAL_API_URL from
+                hyperliquid.utils.constants. If None, the network named by the HYPERLIQUID_ENV
+                environment variable ("mainnet" or "testnet"), else mainnet.
+            perp_dexs (Optional[List[str]]): The HIP-3 dexes (builder-deployed perps) this client
+                reads and trades besides the default dex, as the SDK's Info takes them, e.g.
+                ["xyz", "para"]; their markets are named with the dex as prefix (para:TOTAL2).
+                The default dex is always included. Each dex adds requests to creating the
+                client and to every read of positions, of all open orders or of all prices
+                (a symbol's price and open orders read only its dex). get_perp_dexs()
+                lists the dexes of the network. Not together with extended_universe=True.
+            trust_env (bool): Like requests' Session.trust_env, for this library's settings.
+                True (default): settings not passed are read from the environment and a .env
+                file: the credentials when account is None, the network when base_url is None.
+                False: none of them is read; without account the client has no key, and reads
+                take the wallet as address=. HTTP settings such as proxy variables are still
+                applied by requests itself; pass proxy= to set a proxy explicitly.
 
         Raises:
-            ValueError: If env is not 'mainnet' or 'testnet'
+            ValueError: If base_url is not one of those constants, env is not 'mainnet' or
+                'testnet', both are passed, or another parameter is out of range; a dex of
+                perp_dexs that the network does not have (InvalidArgumentException)
         """
         # Validate parameters
-        if env not in ["mainnet", "testnet"]:
-            raise ValueError("env must be either 'mainnet' or 'testnet'")
+        if env is not None:
+            warnings.warn("env is deprecated; pass base_url=constants.MAINNET_API_URL or "
+                          "constants.TESTNET_API_URL (from hyperliquid.utils import constants)",
+                          DeprecationWarning, stacklevel=2)
+            if base_url is not None:
+                raise InvalidArgumentException("pass base_url or env, not both")
+        if trust_env and ((base_url is None and env is None) or account is None):
+            load_env_file()  # configured from the environment: honour a .env file, as before
+        if base_url is None:
+            if env is None:
+                env = (os.environ.get("HYPERLIQUID_ENV") if trust_env else None) or "mainnet"
+                env = env.strip().lower()
+            if env not in _NETWORK_URLS:
+                raise InvalidArgumentException("env and HYPERLIQUID_ENV must be either 'mainnet' or 'testnet'")
+            base_url = _NETWORK_URLS[env]
+        elif not isinstance(base_url, str) or base_url not in _NETWORKS:
+            raise InvalidArgumentException(
+                f"base_url must be one of the constants MAINNET_API_URL ({constants.MAINNET_API_URL}), "
+                f"TESTNET_API_URL ({constants.TESTNET_API_URL}) or LOCAL_API_URL "
+                f"({constants.LOCAL_API_URL}) from hyperliquid.utils.constants, got {base_url!r}; "
+                "with any other URL the SDK would sign for testnet")
         if not 0 < default_slippage <= 0.5:
-            raise ValueError("default_slippage must be between 0 (exclusive) and 0.5 (inclusive)")
+            raise InvalidArgumentException("default_slippage must be between 0 (exclusive) and 0.5 (inclusive)")
+        if not 0 < request_timeout <= 120:
+            raise InvalidArgumentException("request_timeout must be between 0 (exclusive) and 120 seconds")
+        if not isinstance(max_retries, int) or isinstance(max_retries, bool) or max_retries < 0:
+            raise InvalidArgumentException(f"max_retries must be a whole number of at least 0, got {max_retries!r}")
+        if isinstance(retry_delay, bool) or not (_positive_number(retry_delay) or retry_delay == 0):
+            raise InvalidArgumentException(f"retry_delay must be a number of seconds of at least 0, got {retry_delay!r}")
+        self.request_timeout = request_timeout
 
         # Set up environment
-        self.env = env
+        self.base_url = base_url
+        self.env = _NETWORKS[base_url]  # "mainnet", "testnet", or None for a local node
         self.default_slippage = default_slippage
         self.max_retries = max_retries
-        self.retry_delay = retry_delay
-        self.base_url = constants.TESTNET_API_URL if env == "testnet" else constants.MAINNET_API_URL
-        self.perp_dexs = ["", "xyz"] if extended_universe else [""]
+        self.retry_delay = float(retry_delay)  # time.sleep takes no Decimal
+        self.perp_dexs = _perp_dexs(perp_dexs, extended_universe)
         self._proxy = proxy
 
-        # Initialize market specs
+        # Initialize market specs. Cached metadata is reused only by a client for the same
+        # network and dex list: the SDK derives asset ids from it, so metadata of another
+        # network or dex list would send orders to the wrong market.
+        self._cache_key = (self.base_url, tuple(self.perp_dexs))
+        with HyperliquidClient._cache_lock:
+            cached = (HyperliquidClient._cached_key, HyperliquidClient._cached_meta,
+                      HyperliquidClient._cached_spot_meta, HyperliquidClient._cached_market_specs,
+                      HyperliquidClient._cached_market_specs_at)
+        cached_key, cached_meta, cached_spot_meta, cached_specs, cached_specs_at = cached
         cache_hit = (
             cache_market_specs
-            and HyperliquidClient._cached_market_specs is not None
-            and time.time() - HyperliquidClient._cached_market_specs_at < self._CACHE_TTL
+            and cached_key == self._cache_key
+            and cached_specs is not None
+            and cached_meta is not None
+            and time.time() - cached_specs_at < self._CACHE_TTL
         )
-        if cache_hit and HyperliquidClient._cached_meta is not None:
-            self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs,
-                            meta=HyperliquidClient._cached_meta,
-                            spot_meta=HyperliquidClient._cached_spot_meta)
-        else:
-            self.info = Info(self.base_url, skip_ws=True, perp_dexs=self.perp_dexs)
-            HyperliquidClient._cached_meta = self.info.meta()
-            HyperliquidClient._cached_spot_meta = self.info.spot_meta()
-        self._apply_proxy(self.info)
         if cache_hit:
-            self.market_specs = HyperliquidClient._cached_market_specs
-            self._market_specs_fetched_at = HyperliquidClient._cached_market_specs_at
+            self._meta, self._spot_meta = cached_meta, cached_spot_meta
+            self.info = self._make_info(meta=self._meta, spot_meta=self._spot_meta)
+            self.market_specs, self._market_specs_fetched_at = cached_specs, cached_specs_at
         else:
-            try:
-                self.market_specs = self._fetch_market_specs()
-                self._market_specs_fetched_at = time.time()
+            self.info = self._new_info()
+            self._meta, self._spot_meta = self._startup_metadata(self.info)
+            # As in the SDK, a client is not created without its markets: a failure (after the
+            # retries) is raised as it is.
+            self.market_specs = self._fetch_market_specs()
+            self._market_specs_fetched_at = time.time()
+            with HyperliquidClient._cache_lock:
+                HyperliquidClient._cached_key = self._cache_key
+                HyperliquidClient._cached_meta = self._meta
+                HyperliquidClient._cached_spot_meta = self._spot_meta
                 HyperliquidClient._cached_market_specs = self.market_specs
                 HyperliquidClient._cached_market_specs_at = self._market_specs_fetched_at
-            except Exception as e:
-                logging.warning(f"Failed to fetch market specs: {e}. Using default specs.")
-                self.market_specs = MARKET_SPECS
-                self._market_specs_fetched_at = 0
 
-        # Try to set up authenticated client
-        try:
-            if account is not None:
-                self._setup_authenticated_client(account)
-            else:
-                # Try loading from environment
-                env_account = HyperliquidAccount.from_env()
-                self._setup_authenticated_client(env_account)
-        except (ValueError, KeyError, TypeError) as e:
-            # If authentication fails, log warning and continue in unauthenticated mode
-            logging.debug(
-                f"Running in unauthenticated mode. Only public endpoints available. Error: {str(e)}"
-            )
+        # A key that is given must work, as in the SDK (whose signing account cannot be created
+        # from a bad key): an unusable account raises here, never a silent read-only client.
+        # Without a key in the environment, the client reads public data only.
+        if account is not None:
+            self._setup_authenticated_client(account)
+        elif trust_env and os.environ.get("HYPERLIQUID_PRIVATE_KEY"):
+            try:
+                self._setup_authenticated_client(HyperliquidAccount.from_env())
+            except ValueError as e:  # the account's problem, or from_env's missing address
+                raise ConfigurationException(
+                    f"HYPERLIQUID_PRIVATE_KEY is set, but the account in the environment is unusable: {e}") from None
 
     def _setup_authenticated_client(self, account: HyperliquidAccount):
-        """Set up authenticated client with account details."""
-        # Validate account
-        if not isinstance(account, HyperliquidAccount):
-            raise TypeError("account must be an instance of HyperliquidAccount")
-        
-        if not account.public_address:
-            raise ValueError("public_address is required")
-        
-        if not account.private_key:
-            raise ValueError("private_key is required")
+        """Set up the account the client signs with.
 
-        # Set up authenticated client
+        Raises:
+            InvalidArgumentException: A ValueError, for an account that cannot sign. The message
+                never contains the key.
+        """
+        if not isinstance(account, HyperliquidAccount):
+            raise InvalidArgumentException("account must be a HyperliquidAccount")
+        if not account.public_address:
+            raise InvalidArgumentException("public_address is required")
+        if not _ADDRESS.fullmatch(str(account.public_address)):
+            raise InvalidArgumentException("public_address must be 0x followed by 40 hex characters")
+        if not account.private_key:
+            raise InvalidArgumentException("private_key is required")
+        # Checked here: eth_account accepts 63 hex characters (a key missing one) as another key.
+        if not isinstance(account.private_key, str) or not _PRIVATE_KEY.fullmatch(account.private_key):
+            raise InvalidArgumentException("private_key must be 64 hex characters, with or without 0x")
+        try:
+            exchange_account = eth_account.Account.from_key(account.private_key)
+        except ValueError:  # e.g. zero: 64 hex characters, but no private key
+            raise InvalidArgumentException("private_key is not a valid private key") from None
         self.account = account
-        self.exchange_account = eth_account.Account.from_key(account.private_key)
+        self.exchange_account = exchange_account
         self.public_address = account.public_address
 
         # Initialize exchange
-        # When using an API wallet, the signing key address differs from the
-        # trading account address. Pass account_address so the SDK sends
-        # orders on behalf of the correct account.
-        # For sub-accounts (vaults), the SDK needs vault_address instead.
+        # With an API wallet the signing key's address differs from the trading account's.
+        # The exchange routes an action by its signer (an API wallet's actions go to the
+        # account that approved it); the SDK uses account_address only for its own lookups
+        # and never sends it. A vault or sub-account is named in each signed action
+        # (vault_address).
         account_address = None
         vault_address = None
         if self.exchange_account.address.lower() != account.public_address.lower():
@@ -161,14 +551,38 @@ class HyperliquidClient:
                 account_address = account.public_address
         self.exchange = Exchange(
             self.exchange_account, self.base_url,
-            meta=HyperliquidClient._cached_meta,
-            spot_meta=HyperliquidClient._cached_spot_meta,
+            meta=self._meta,
+            spot_meta=self._spot_meta,
             account_address=account_address,
             vault_address=vault_address,
-            perp_dexs=self.perp_dexs,
+            timeout=self.request_timeout,
         )
+        # Without perp_dexs, the SDK's Exchange builds an Info from the metadata passed, without
+        # any request; it then uses the client's Info, which knows every market of this client
+        # (those of its HIP-3 dexes too) and reports failures as library exceptions.
+        self.exchange.info.session.close()  # the SDK's temporary Info, never used for a request
+        self.exchange.info = self.info
         self._apply_proxy(self.exchange)
-        self._apply_proxy(self.exchange.info)
+
+    def _new_info(self) -> Info:
+        """A new SDK Info for this client's network and dexes, with their current markets. The SDK
+        builds its symbol tables while it is created (requests, retried like any other)."""
+        return self._make_info()
+
+    def _startup_metadata(self, info: Info) -> Tuple[Any, Any]:
+        """The default dex's meta and the spot meta of a new Info: those the SDK fetched while
+        creating it, else (an SDK that fetches them otherwise) requested now."""
+        fetched = info.startup_metadata
+        meta = fetched["meta"] if "meta" in fetched else self._with_retry(info.meta)
+        spot_meta = fetched["spotMeta"] if "spotMeta" in fetched else self._with_retry(info.spot_meta)
+        return meta, spot_meta
+
+    def _make_info(self, **metadata: Any) -> Info:
+        """An SDK Info for this client's network and dexes (`metadata`: the default dex's meta
+        and spot_meta, if known). A dex the network does not have raises
+        InvalidArgumentException (see Info)."""
+        return self._with_retry(Info, self.base_url, skip_ws=True, perp_dexs=self.perp_dexs,
+                                timeout=self.request_timeout, proxies=self._proxy, **metadata)
 
     def is_authenticated(self) -> bool:
         """Check if the client is authenticated with valid credentials.
@@ -183,6 +597,40 @@ class HyperliquidClient:
             self.account.public_address is not None
         )
 
+    def _require_symbol(self, symbol: str) -> None:
+        """Raise UnknownSymbolException unless `symbol` is a market of this client."""
+        if symbol not in self.info.name_to_coin:
+            raise self._unknown_symbol(symbol)
+
+    def _unknown_symbol(self, symbol: str) -> UnknownSymbolException:
+        dex = _sdk_dex(str(symbol))
+        hint = (f"; markets of the {dex} dex need perp_dexs including {dex!r}"
+                if dex and dex not in self.perp_dexs else "")
+        return UnknownSymbolException(f"Unknown symbol {symbol!r}{hint}")
+
+    def _dexes_of(self, symbol: Optional[str]) -> List[str]:
+        """The dexes to read for `symbol`: its own (none if the client does not cover it), or
+        every dex of the client without a symbol."""
+        if not symbol:
+            return self.perp_dexs
+        dex = _sdk_dex(str(symbol))
+        return [dex] if dex in self.perp_dexs else []
+
+    def _address(self, address: Optional[str]) -> str:
+        """The wallet a read is about: `address`, else the client's own account.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account.
+            InvalidArgumentException: If address is not 0x followed by 40 hex characters.
+        """
+        if address is None:
+            if not self.is_authenticated():
+                raise AddressRequiredException()
+            address = self.public_address
+        if not isinstance(address, str) or not _ADDRESS.fullmatch(address):
+            raise InvalidArgumentException("Invalid address format")
+        return address
+
     def _apply_proxy(self, sdk_instance):
         """Apply proxy settings to an SDK instance's requests session."""
         if self._proxy and hasattr(sdk_instance, 'session'):
@@ -190,6 +638,9 @@ class HyperliquidClient:
 
     def _with_retry(self, fn, *args, **kwargs):
         """Execute a function with exponential backoff on transient failures.
+
+        For reads and idempotent actions only. Orders, modifies, transfers and margin changes
+        go through _signed(), which never retries a request the exchange may have executed.
 
         Args:
             fn: The function to call.
@@ -200,15 +651,19 @@ class HyperliquidClient:
             The return value of fn.
 
         Raises:
-            The last exception if all retries are exhausted, or immediately
-            for non-retryable errors.
+            RateLimitException, ServerErrorException, NetworkException or TimeoutException
+            when all retries are exhausted; ClientErrorException for any other HTTP 4xx;
+            any other error at once.
         """
         last_exception = None
         attempts = self.max_retries + 1  # first attempt + retries
 
         for attempt in range(attempts):
             try:
-                return fn(*args, **kwargs)
+                result = fn(*args, **kwargs)
+                if _is_unparsed(result):  # the Exchange's requests (Info raises it itself)
+                    raise ServerErrorException(_NOT_JSON, 200)
+                return result
             except ClientError as e:
                 if e.status_code == 429:
                     last_exception = e
@@ -217,10 +672,10 @@ class HyperliquidClient:
                         logger.warning(f"Rate limited, retry {attempt + 1}/{self.max_retries} after {wait:.1f}s")
                         time.sleep(wait)
                     else:
-                        raise RateLimitException(f"Rate limited after {self.max_retries} retries")
+                        raise RateLimitException(f"Rate limited after {self.max_retries} retries") from e
                 else:
-                    raise
-            except (requests.ConnectionError, requests.Timeout,
+                    raise _library_error(e) from e
+            except (requests.ConnectionError, requests.Timeout, ServerError,
                     RateLimitException, ServerErrorException) as e:
                 last_exception = e
                 if attempt < self.max_retries:
@@ -228,31 +683,291 @@ class HyperliquidClient:
                     logger.warning(f"Retry {attempt + 1}/{self.max_retries} after {wait:.1f}s: {e}")
                     time.sleep(wait)
                 else:
-                    raise
+                    error = _library_error(e)
+                    if error is e:
+                        raise
+                    raise error from e
+            except requests.RequestException as e:  # other transport errors: not retried
+                raise _library_error(e) from e
             except (ValueError, TypeError, UnauthorizedException,
                     ConfigurationException, RuntimeError):
                 raise
 
         raise last_exception  # pragma: no cover – safety fallback
 
+    def _signed(self, action: str, fn, *args, idempotent: bool = False, **kwargs):
+        """Send a signed action.
+
+        Idempotent actions (cancel, leverage) are retried like reads. Any other action is
+        retried only when the request provably was not processed: HTTP 429 or a connect
+        timeout. Every other failure after sending, including a response that is not valid
+        JSON, raises ActionOutcomeUnknownException instead: the exchange may have executed the
+        action, and a retry would sign a new one that executes again.
+        """
+        if idempotent:
+            return self._with_retry(self._attempt, fn, *args, **kwargs)
+        return self._signed_once(action, fn, *args, **kwargs)
+
+    def _attempt(self, fn, *args, **kwargs):
+        """One attempt of a signed action. Signed actions wait while a stop loss / take
+        profit replacement of the same key runs (it holds this reentrant lock around all its
+        steps, see _replace_protection). The wait before a retry is outside: nothing waits
+        for a backoff."""
+        with _signer_state(self.exchange_account.address).operation_lock:
+            return self._with_fresh_nonce(fn, *args, **kwargs)
+
+    def _signed_once(self, action: str, fn, *args, **kwargs):
+        """The retry loop of _signed() for non-idempotent actions."""
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = self._attempt(fn, *args, **kwargs)
+            except requests.ConnectTimeout as e:
+                if attempt == self.max_retries:
+                    raise _library_error(e) from e  # TimeoutException: not processed, can be sent again
+            except ClientError as e:
+                if e.status_code != 429:
+                    raise _library_error(e) from e  # ClientErrorException: the request was refused
+                if attempt == self.max_retries:
+                    raise RateLimitException(f"Rate limited after {self.max_retries} retries") from e
+            except (requests.RequestException, ServerError) as e:
+                raise ActionOutcomeUnknownException(action, str(e)) from e
+            else:
+                if _is_unparsed(response):  # the SDK turns a body that is not JSON into this dict
+                    raise ActionOutcomeUnknownException(action, response["error"])
+                return response
+            wait = self.retry_delay * (2 ** attempt)
+            logger.warning(f"{action} was not processed, retry {attempt + 1}/{self.max_retries} after {wait:.1f}s")
+            time.sleep(wait)
+
+    @staticmethod
+    def _action_result(result: Any, action: str) -> Any:
+        """The exchange's answer to an action other than an order (a transfer, a leverage or
+        margin change): "ok" is done, "err" is refused (ActionRejectedException with its
+        text); any other answer leaves open whether it was done (ActionOutcomeUnknownException)."""
+        if isinstance(result, dict) and result.get("status") == "ok":
+            return result
+        if isinstance(result, dict) and result.get("status") == "err":
+            raise ActionRejectedException(action, str(result.get("response")))
+        raise ActionOutcomeUnknownException(action, f"answered in no documented format: {result}")
+
+    def _with_fresh_nonce(self, fn, *args, **kwargs):
+        """Call a signing SDK method with this signer's lock held and an unused nonce.
+
+        The SDK uses the current time in milliseconds as the nonce, so two actions from one
+        signer in the same millisecond collide. This waits until the clock has moved past the
+        last action of the signer, across all clients in the process.
+        """
+        signer = _signer_state(self.exchange_account.address)
+        with signer.lock:
+            # If the clock was set back, stop waiting after a second: the exchange accepts a
+            # lower nonce that was never used and is above the smallest of the signer's 100
+            # highest nonces (nonce docs).
+            give_up = time.monotonic() + 1.0
+            while time.time_ns() // 1_000_000 <= signer.last_nonce_ms and time.monotonic() < give_up:
+                time.sleep(0.0005)
+            try:
+                return fn(*args, **kwargs)
+            finally:
+                signer.last_nonce_ms = max(signer.last_nonce_ms, time.time_ns() // 1_000_000)
+
+    def _place_order(self, symbol: str, cloid: Cloid, **order) -> Any:
+        """Send one order with its client order id and return the exchange response.
+
+        If the outcome is unknown after sending, the order is looked up by its client order
+        id and the response is rebuilt from what the exchange reports, so callers parse it the
+        same way. The order is never sent twice.
+        """
+        try:
+            response = self._signed(f"{symbol} order", self.exchange.order, name=symbol, cloid=cloid, **order)
+        except ActionOutcomeUnknownException as exc:
+            cause: Exception = exc
+        else:
+            if self._is_definite_order_response(response):
+                return response
+            cause = ValueError(f"unexpected order response: {response}")
+        status = self._reconcile_order(symbol, cloid, cause)
+        return {"status": "ok", "response": {"type": "order", "data": {"statuses": [status]}}}
+
+    @staticmethod
+    def _statuses(response: Any) -> Optional[List[Any]]:
+        """The order statuses of an "ok" answer to an order action, else None."""
+        try:
+            statuses = response["response"]["data"]["statuses"] if response.get("status") == "ok" else None
+        except (KeyError, TypeError, AttributeError):
+            return None
+        return statuses if isinstance(statuses, list) else None
+
+    @classmethod
+    def _documented_status(cls, response: Any) -> Optional[Dict[str, Any]]:
+        """The first order status of an "ok" answer if it is in the documented format, else None."""
+        statuses = cls._statuses(response)
+        status = statuses[0] if statuses else None
+        return status if cls._is_documented_status(status) else None
+
+    @staticmethod
+    def _is_documented_status(status: Any) -> bool:
+        """True for an order status in the documented format: {"resting": {"oid"}},
+        {"filled": {"oid", "totalSz", "avgPx"}} or {"error": text}."""
+        if not isinstance(status, dict):
+            return False
+        def order_id(value: Any) -> bool:
+            return isinstance(value, int) and not isinstance(value, bool)
+
+        def amount(value: Any) -> bool:  # a decimal string or number, as the docs show them
+            try:
+                return not isinstance(value, bool) and Decimal(str(value)).is_finite()
+            except (InvalidOperation, ValueError, TypeError):
+                return False
+
+        if isinstance(status.get("error"), str):
+            return True
+        resting, filled = status.get("resting"), status.get("filled")
+        if isinstance(resting, dict) and order_id(resting.get("oid")):
+            return True
+        return (isinstance(filled, dict) and order_id(filled.get("oid"))
+                and amount(filled.get("totalSz")) and amount(filled.get("avgPx")))
+
+    @classmethod
+    def _is_definite_order_response(cls, response: Any) -> bool:
+        """True if the exchange answered with the order's status: resting, filled, or an
+        explicit rejection. Anything else leaves open whether the order was placed."""
+        if isinstance(response, dict) and response.get("status") == "err":
+            return True
+        return cls._documented_status(response) is not None
+
+    def _reconcile_order(self, symbol: str, cloid: Cloid, cause: Exception) -> Dict[str, Any]:
+        """Status entry ({"resting" | "filled" | "error": ...}) for an order whose placement
+        response was lost, from the order status looked up by client order id.
+
+        Raises OrderOutcomeUnknownException if the order is not found, or its status is not
+        one of the documented ones.
+        """
+        detail = str(cause)
+        for delay in (0.5, 1.0, 2.0):
+            time.sleep(delay)
+            try:
+                result = self.info.query_order_by_cloid(self.public_address, cloid)
+                if result.get("status") != "order":  # "unknownOid": not known (yet)
+                    detail = f"order not found ({result.get('status')})"
+                    continue
+                order = result["order"]["order"]
+                oid = order["oid"]
+                status = result["order"]["status"]
+                if status == "open":
+                    return {"resting": {"oid": oid}}
+                if status == "triggered":  # a trigger order that fired and is executing
+                    detail = "trigger order triggered, its outcome is not known yet"
+                    continue
+                if status == "rejected" or status.endswith("Rejected"):
+                    return {"error": f"Order {cloid} was rejected ({status})"}
+                if status == "filled" or status in ("canceled", "scheduledCancel") or status.endswith("Canceled"):
+                    # "sz" is what was left when the order ended; the rest was filled.
+                    executed = Decimal(str(order["origSz"])) - Decimal(str(order["sz"]))
+                    if executed <= 0:
+                        return {"error": f"Order {cloid} was {status} without a fill"}
+                    fills = [f for f in self.info.user_fills(self.public_address) if f.get("oid") == oid]
+                    total = sum((Decimal(str(f["sz"])) for f in fills), Decimal(0))
+                    if total < executed:
+                        detail = f"order {status}, {executed} filled, but only {total} of it is in the fills yet"
+                        continue
+                    notional = sum(Decimal(str(f["px"])) * Decimal(str(f["sz"])) for f in fills)
+                    return {"filled": {"oid": oid, "totalSz": str(total), "avgPx": str(notional / total)}}
+                detail = f"unrecognized order status {status!r}"
+                break
+            except Exception as exc:
+                detail = f"order status lookup failed: {exc}"
+        raise OrderOutcomeUnknownException(symbol, str(cloid), detail) from cause
+
+    # Per-order cancel error when the order is no longer open (exchange endpoint docs).
+    _ORDER_GONE = "Order was never placed, already canceled, or filled"
+
+    def _cancel_outcomes(self, response: Any, count: int) -> List[str]:
+        """Outcome of each order in a cancel response, in request order: "canceled", "gone"
+        (never placed, already canceled or filled) or the exchange's error text.
+
+        Raises OrderException if the response does not confirm the request at all (error
+        status, a body that is not JSON, or a status list of the wrong length).
+        """
+        try:
+            statuses = response["response"]["data"]["statuses"] if response["status"] == "ok" else None
+        except (KeyError, TypeError):
+            statuses = None
+        if not isinstance(statuses, list) or len(statuses) != count:
+            raise OrderException(f"Cancel was not confirmed by the exchange: {response}")
+        outcomes = []
+        for status in statuses:
+            error = status.get("error") if isinstance(status, dict) else None
+            if status == "success":
+                outcomes.append("canceled")
+            elif isinstance(error, str) and error.startswith(self._ORDER_GONE):
+                outcomes.append("gone")
+            else:
+                outcomes.append(str(error if error is not None else status))
+        return outcomes
+
+    def _cancel_all(self, cancels: List[Dict[str, Any]]) -> None:
+        """Bulk-cancel orders ({"coin", "oid"}); raise OrdersNotCanceledException naming each
+        one that the exchange did not cancel. Orders that are already gone count as done."""
+        response = self._signed("cancel", self.exchange.bulk_cancel, cancels, idempotent=True)
+        failed = [
+            {"symbol": cancel["coin"], "order_id": cancel["oid"], "reason": outcome}
+            for cancel, outcome in zip(cancels, self._cancel_outcomes(response, len(cancels)))
+            if outcome not in ("canceled", "gone")
+        ]
+        if failed:
+            raise OrdersNotCanceledException(failed)
+
+    def _cancel_one(self, coin: str, order: Union[int, Cloid]) -> bool:
+        """Cancel one order by its order id or its client order id: True if canceled, False
+        if it was already gone (never placed, already canceled or filled). Raises
+        OrderException for any other result.
+
+        A cancel is sent again when its answer was lost (it is idempotent). The exchange then
+        answers that the order is gone, although the first attempt may have canceled it: the
+        order's status tells which ("canceled", or filled).
+        """
+        self._require_symbol(coin)  # else the SDK fails with a bare KeyError while signing
+        cancel = self.exchange.cancel_by_cloid if isinstance(order, Cloid) else self.exchange.cancel
+        attempts = 0
+
+        def send(*args: Any) -> Any:
+            nonlocal attempts
+            attempts += 1
+            return cancel(*args)
+
+        response = self._signed("cancel", send, coin, order, idempotent=True)
+        outcome = self._cancel_outcomes(response, 1)[0]
+        if outcome == "gone" and attempts > 1:
+            return self._was_canceled(coin, order)
+        if outcome in ("canceled", "gone"):
+            return outcome == "canceled"
+        raise OrderException(f"Order {order} for {coin} was not canceled: {outcome}")
+
+    def _was_canceled(self, coin: str, order: Union[int, Cloid]) -> bool:
+        """True if the order's status is "canceled" (a cancel, not a fill or another end). If
+        the status cannot be read, False: the order is not open, how it ended is not known."""
+        query = self.info.query_order_by_cloid if isinstance(order, Cloid) else self.info.query_order_by_oid
+        try:
+            result = self._with_retry(query, self.public_address, order)
+            return result["status"] == "order" and result["order"]["status"] == "canceled"
+        except Exception as exc:
+            logger.warning(f"Order {order} for {coin} is not open; how it ended could not be read: {exc}")
+            return False
+
     _SENTINEL_DEX = object()  # Used to detect "dex not explicitly passed"
 
     def get_user_state(self, address: Optional[str] = None, dex: object = _SENTINEL_DEX) -> UserState:
         """Get the state of any user by their address.
 
-        When extended_universe=True and dex is not specified, merges positions and
-        margin summaries across all perp dexes (default + xyz). Pass dex="" or dex="xyz"
-        explicitly to query a single clearinghouse.
+        When dex is not specified, merges positions and margin summaries across the client's
+        perp dexes (perp_dexs: the default dex, plus xyz with extended_universe=True). Pass
+        dex="" or dex="xyz" explicitly to query a single clearinghouse.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+            ValueError: If address is not 0x followed by 40 hex characters
         """
-        if address is None and not self.is_authenticated():
-            raise ValueError("Address required when client is not authenticated")
-
-        if address is None:
-            address = self.public_address
-
-        # Add address validation
-        if not address.startswith("0x") or len(address) != 42:
-            raise ValueError("Invalid address format")
+        address = self._address(address)
 
         # If dex explicitly specified, query single clearinghouse
         if dex is not self._SENTINEL_DEX:
@@ -293,64 +1008,64 @@ class HyperliquidClient:
         """Get user state from a single clearinghouse."""
         response = self._with_retry(self.info.user_state, address, dex=dex)
 
+        # clearinghouseState as documented: these fields are always there. Read directly, so a
+        # response in another shape shows as an error instead of an account with zero balances.
+        def summary(raw: Dict[str, Any]) -> Dict[str, Any]:
+            return {"account_value": raw["accountValue"], "total_margin_used": raw["totalMarginUsed"],
+                    "total_ntl_pos": raw["totalNtlPos"], "total_raw_usd": raw["totalRawUsd"]}
+
         formatted_response = {
             "asset_positions": [],
-            "margin_summary": {
-                "account_value": response.get("marginSummary", {}).get("accountValue", "0"),
-                "total_margin_used": response.get("marginSummary", {}).get("totalMarginUsed", "0"),
-                "total_ntl_pos": response.get("marginSummary", {}).get("totalNtlPos", "0"),
-                "total_raw_usd": response.get("marginSummary", {}).get("totalRawUsd", "0")
-            },
-            "cross_margin_summary": {
-                "account_value": response.get("crossMarginSummary", {}).get("accountValue", "0"),
-                "total_margin_used": response.get("crossMarginSummary", {}).get("totalMarginUsed", "0"),
-                "total_ntl_pos": response.get("crossMarginSummary", {}).get("totalNtlPos", "0"),
-                "total_raw_usd": response.get("crossMarginSummary", {}).get("totalRawUsd", "0")
-            },
-            "withdrawable": response.get("withdrawable", "0"),
+            "margin_summary": summary(response["marginSummary"]),
+            "cross_margin_summary": summary(response["crossMarginSummary"]),
+            "withdrawable": response["withdrawable"],
             "cross_maintenance_margin_used": response.get("crossMaintenanceMarginUsed"),
         }
 
-        if "assetPositions" in response:
-            formatted_response["asset_positions"] = []
-            for pos in response.get("assetPositions", []):
-                pos_data = pos["position"]
-                position_dict = {
-                    "symbol": pos_data["coin"],
-                    "entry_price": pos_data.get("entryPx"),
-                    "leverage": {
-                        "type": pos_data["leverage"]["type"],
-                        "value": pos_data["leverage"]["value"]
-                    },
-                    "liquidation_price": pos_data.get("liquidationPx"),
-                    "margin_used": pos_data["marginUsed"],
-                    "max_trade_sizes": pos_data.get("maxTradeSzs"),
-                    "position_value": pos_data["positionValue"],
-                    "return_on_equity": pos_data["returnOnEquity"],
-                    "size": pos_data["szi"],
-                    "unrealized_pnl": pos_data["unrealizedPnl"],
-                    "max_leverage": pos_data.get("maxLeverage"),
+        # assetPositions is always there (an empty list without positions)
+        for pos in response["assetPositions"]:
+            pos_data = pos["position"]
+            position_dict = {
+                "symbol": pos_data["coin"],
+                "entry_price": pos_data.get("entryPx"),
+                "leverage": {
+                    "type": pos_data["leverage"]["type"],
+                    "value": pos_data["leverage"]["value"]
+                },
+                "liquidation_price": pos_data.get("liquidationPx"),
+                "margin_used": pos_data["marginUsed"],
+                "max_trade_sizes": pos_data.get("maxTradeSzs"),
+                "position_value": pos_data["positionValue"],
+                "return_on_equity": pos_data["returnOnEquity"],
+                "size": pos_data["szi"],
+                "unrealized_pnl": pos_data["unrealizedPnl"],
+                "max_leverage": pos_data.get("maxLeverage"),
+            }
+            cf = pos_data.get("cumFunding")
+            if cf and isinstance(cf, dict):
+                position_dict["cum_funding"] = {
+                    "all_time": cf.get("allTime", "0"),
+                    "since_open": cf.get("sinceOpen", "0"),
+                    "since_change": cf.get("sinceChange", "0"),
                 }
-                cf = pos_data.get("cumFunding")
-                if cf and isinstance(cf, dict):
-                    position_dict["cum_funding"] = {
-                        "all_time": cf.get("allTime", "0"),
-                        "since_open": cf.get("sinceOpen", "0"),
-                        "since_change": cf.get("sinceChange", "0"),
-                    }
-                formatted_response["asset_positions"].append({
-                    "position": position_dict,
-                    "type": pos["type"]
-                })
+            formatted_response["asset_positions"].append({
+                "position": position_dict,
+                "type": pos["type"]
+            })
 
         return from_dict(data_class=UserState, data=formatted_response, config=DACITE_CONFIG)
         
         
-    def get_positions(self) -> List[Position]:
-        """Get current open positions across all perp dexes."""
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        state = self.get_user_state()
+    def get_positions(self, *, address: Optional[str] = None) -> List[Position]:
+        """Get current open positions across all perp dexes.
+
+        Args:
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+        """
+        state = self.get_user_state(self._address(address))
         return [pos.position for pos in state.asset_positions]
         
     def _format_price(self, symbol: str, price: float) -> float:
@@ -382,43 +1097,180 @@ class HyperliquidClient:
             Formatted size as float.
         """
         sz_decimals = self.market_specs.get(symbol, {}).get("size_decimals", 0)
-        return round(size, sz_decimals)
+        return _round_down(size, sz_decimals)
 
     def _validate_and_format_order(
         self,
         symbol: str,
         size: float,
-        limit_price: Optional[float]
+        limit_price: float
     ) -> tuple[float, float]:
         """Validate and format order size and price using Hyperliquid SDK logic.
 
         - Sizes are rounded to sz_decimals (from market specs)
         - Prices are rounded to 5 significant figures, then to (6 - sz_decimals) decimal places
-        - Validates minimum position sizes based on market specs
+        - Validates minimum position sizes based on market specs, and that the price (limit or
+          trigger, always required) is a positive number that stays one after rounding: not 0,
+          not infinite (InvalidArgumentException)
+
+        Rounded values come back unchanged, so preparing an order twice changes nothing.
         """
-        # Auto-refresh stale market specs
-        self._ensure_fresh_market_specs()
-
-        # Validate minimum position size
-        if symbol in self.market_specs:
-            specs = self.market_specs[symbol]
-            size_decimals = specs.get("size_decimals", 0)
-
-            min_size = 1.0 / (10 ** size_decimals) if size_decimals > 0 else 1
-            if size < min_size:
-                raise ValueError(
-                    f"Minimum position size for {symbol} is {min_size} "
-                    f"(size_decimals={size_decimals}). Got: {size}"
-                )
+        self._check_order_size(symbol, size)
 
         # Format size to sz_decimals
         size = self._format_size(symbol, size)
 
         # Format price using SDK-matching logic
-        if limit_price is not None:
-            limit_price = self._format_price(symbol, limit_price)
+        if not _positive_number(limit_price):
+            raise InvalidArgumentException(f"price must be a positive number, got {limit_price!r}")
+        price = self._format_price(symbol, limit_price)
+        if not _positive_number(price):  # rounds to 0, or overflows to infinity
+            raise InvalidArgumentException(f"price {limit_price!r} rounds to {price} at {symbol}'s price precision")
 
-        return size, limit_price
+        return size, price
+
+    def _check_order_size(self, symbol: str, size: float) -> None:
+        """Raise UnknownSymbolException (a ValueError) for an unknown symbol, ValueError for a
+        size below the minimum. No request: the markets are those known when the client was
+        created or last refreshed."""
+        if symbol not in self.market_specs or symbol not in self.info.name_to_coin:
+            # Sent anyway, it would have 0 size decimals, or fail inside the SDK (KeyError).
+            error = self._unknown_symbol(symbol)
+            raise UnknownSymbolException(
+                f"{error}; a market listed after the client was created needs refresh_market_specs()")
+        if not _positive_number(size):
+            raise InvalidArgumentException(f"size must be a positive number, got {size!r}")
+        size_decimals = self.market_specs[symbol].get("size_decimals", 0)
+        min_size = 1.0 / (10 ** size_decimals) if size_decimals > 0 else 1
+        if size < min_size:
+            raise InvalidArgumentException(
+                f"Minimum position size for {symbol} is {min_size} "
+                f"(size_decimals={size_decimals}). Got: {size}"
+            )
+
+    @staticmethod
+    def _resolve_time_in_force(time_in_force: str, post_only: bool) -> str:
+        """Time in force for a limit order. post_only is Hyperliquid's "Alo" (add liquidity only)."""
+        if time_in_force not in _TIMES_IN_FORCE:
+            raise InvalidArgumentException(f"time_in_force must be Gtc, Ioc or Alo, got {time_in_force!r}")
+        if not post_only:
+            return time_in_force
+        if time_in_force == "Ioc":
+            raise InvalidArgumentException("post_only cannot be used with IOC orders")
+        return "Alo"
+
+    def _mid_price(self, symbol: str) -> float:
+        current_price = self.get_price(symbol)
+        logger.debug(f"Current price for {symbol}: {current_price}")
+        if current_price <= 0:
+            raise HyperliquidException(f"Invalid current price for {symbol}: {current_price}")
+        return current_price
+
+    def _with_slippage(self, price: float, is_buy: bool, slippage: Optional[float]) -> float:
+        """Worst acceptable price for a market order at `price` (matching SDK logic)."""
+        effective_slippage = slippage if slippage is not None else self.default_slippage
+        if not 0 < effective_slippage <= 0.5:
+            raise InvalidArgumentException("slippage must be between 0 (exclusive) and 0.5 (inclusive)")
+        return price * (1 + effective_slippage) if is_buy else price * (1 - effective_slippage)
+
+    def _market_limit_price(self, symbol: str, is_buy: bool, slippage: Optional[float]) -> float:
+        """Limit price for a market order: current mid price plus slippage."""
+        return self._with_slippage(self._mid_price(symbol), is_buy, slippage)
+
+    @classmethod
+    def _order_status(cls, response: Any, action: str) -> Dict[str, Any]:
+        """The status of the order in the exchange's answer: {"resting": ...} or {"filled": ...}.
+
+        Raises:
+            InsufficientMarginException: The exchange refused the order for lack of margin.
+            OrderRejectedException: The exchange refused it for another reason (its text).
+            ActionOutcomeUnknownException: The answer is in no documented format: the order
+                may still have been placed or changed.
+        """
+        if isinstance(response, dict) and response.get("status") == "err":  # refused as a whole
+            raise OrderRejectedException(action, str(response.get("response")))
+        status = cls._documented_status(response)
+        if status is None:
+            raise ActionOutcomeUnknownException(action, f"answered in no documented format: {response}")
+        if "error" in status:
+            if status["error"] == _INSUFFICIENT_MARGIN:
+                raise InsufficientMarginException(action, status["error"])
+            raise OrderRejectedException(action, status["error"])
+        return status
+
+    @classmethod
+    def _order_from_response(cls, response: Any, symbol: str, is_buy: bool, size: float, limit_price: float,
+                             order_type: Dict[str, Any], reduce_only: bool, action: str,
+                             market: Optional[str] = None, cloid: Optional[Cloid] = None) -> Order:
+        """The Order of the exchange's answer to an order or a modify (the SDK sends a modify
+        as batchModify): the first entry of its statuses, as the exchange endpoint documents
+        it for orders. Rejections and unknown outcomes raise, see _order_status. `cloid`: the
+        client order id the order was sent with."""
+        status = cls._order_status(response, action)
+        trigger = order_type.get("trigger")
+        order_data: Dict[str, Any] = {
+            "symbol": symbol,
+            "is_buy": is_buy,
+            "size": str(size),
+            "order_type": order_type,
+            "reduce_only": reduce_only,
+            "time_in_force": order_type["limit"].get("tif", "Gtc") if "limit" in order_type else "Gtc",
+            "created_at": int(time.time() * 1000),
+            "limit_price": str(limit_price),
+            "type": "limit" if trigger is None else {"tp": "take_profit", "sl": "stop_loss"}.get(trigger.get("tpsl"), "unknown"),
+        }
+        if trigger is not None and "triggerPx" in trigger:
+            order_data["trigger_price"] = str(trigger["triggerPx"])
+        if market is not None:
+            order_data["market"] = market
+        if cloid is not None:
+            order_data["cloid"] = cloid.to_raw()
+        if "resting" in status:
+            order_data.update(order_id=status["resting"]["oid"], status="open")
+        else:
+            filled = status["filled"]
+            order_data.update(order_id=filled["oid"], status="filled", filled_size=str(filled["totalSz"]),
+                              average_fill_price=str(filled["avgPx"]))
+        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
+
+    def prepare_order(
+        self,
+        symbol: str,
+        size: float,
+        is_buy: bool,
+        limit_price: Optional[float] = None,
+        slippage: Optional[float] = None,
+    ) -> tuple[float, float]:
+        """The size and limit price create_order() sends for these arguments, without sending
+        anything: to check an order before it is placed.
+
+        The size is rounded down to the market's lot step, the price rounded as the SDK rounds
+        it (5 significant figures, which can round up). Without limit_price it is the price of
+        a market order: the mid price plus or minus the slippage (slippage=, else the client's
+        default_slippage), read now. create_order() prepares every order with this method, and
+        prepared values come back unchanged, so placing the returned size and price (with
+        time_in_force="Ioc" for a market order) sends the same order.
+
+        Args:
+            symbol (str): Trading pair symbol (e.g., "BTC")
+            size (float): Order size in base currency
+            is_buy (bool): True for a buy, False for a sell (the side of a market order's price)
+            limit_price (Optional[float]): The limit price; None for a market order
+            slippage (Optional[float]): For a market order, overrides default_slippage
+
+        Returns:
+            tuple[float, float]: (size, limit_price) as they are signed
+
+        Raises:
+            UnknownSymbolException: If the symbol is not a market of the client (no request)
+            InvalidArgumentException: If the size or price is not a positive number, the size
+                is below the market's minimum, the price rounds to 0, or the slippage is not
+                above 0 and at most 0.5
+        """
+        self._check_order_size(symbol, size)  # before the price is read: no request for bad input
+        if limit_price is None:
+            limit_price = self._market_limit_price(symbol, is_buy, slippage)
+        return self._validate_and_format_order(symbol, size, limit_price)
 
     def create_order(
         self,
@@ -428,8 +1280,10 @@ class HyperliquidClient:
         limit_price: Optional[float] = None,
         reduce_only: bool = False,
         post_only: bool = False,
-        time_in_force: Literal["Gtc", "Ioc", "Alo"] = "Gtc",
+        time_in_force: Optional[Literal["Gtc", "Ioc", "Alo"]] = None,
         slippage: Optional[float] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Create an order with simplified parameters.
         
@@ -437,52 +1291,44 @@ class HyperliquidClient:
             symbol (str): Trading pair symbol (e.g., "BTC")
             is_buy (bool): True for buy orders, False for sell orders
             size (float): Order size in base currency
-            limit_price (Optional[float]): Price for limit orders. If None, uses market price with 0.5% slippage
+            limit_price (Optional[float]): Price for limit orders. If None, a market order: the mid
+                price plus or minus the slippage (slippage=, else the client's default_slippage)
             reduce_only (bool): Whether the order should only reduce position
-            post_only (bool): Whether the order should only be maker (only valid for limit orders)
-            time_in_force (str): Order time in force - "Gtc" (Good till Cancel), 
-                                "Ioc" (Immediate or Cancel), "Alo" (Add Limit Only)
-            
+            post_only (bool): Whether the order should only be maker (only valid for limit orders).
+                Sent as time in force "Alo"; the exchange rejects the order if it would match immediately.
+            time_in_force (Optional[str]): "Gtc" (Good till Cancel), "Ioc" (Immediate or Cancel),
+                "Alo" (Add Limit Only). Default: "Ioc" without limit_price (a market order, as in
+                the SDK's market_open and buy()/sell()), "Gtc" with one.
+            slippage (Optional[float]): For a market order, overrides default_slippage.
+            cloid (Optional[str]): Client order id to place the order with: "0x" and 32 hex digits,
+                unique per order. If None, a random one. It is the order's ``cloid``; look the order
+                up or cancel it by it with get_order_status_by_cloid() and cancel_order_by_cloid().
+
         Returns:
             Order: Order response from the exchange
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
+        order_cloid = _order_cloid(cloid)
+        if time_in_force is None:
+            time_in_force = "Ioc" if limit_price is None else "Gtc"
+        time_in_force = self._resolve_time_in_force(time_in_force, post_only)
 
-        # For market orders, get current price and add slippage (matching SDK logic)
-        if limit_price is None:
-            # Get midprice like SDK does
-            current_price = self.get_price(symbol)
-            logger.debug(f"Current price for {symbol}: {current_price}")
-            
-            # Check if price is valid
-            if current_price <= 0:
-                raise ValueError(f"Invalid current price for {symbol}: {current_price}")
-                
-            effective_slippage = slippage if slippage is not None else self.default_slippage
-            if not 0 < effective_slippage <= 0.5:
-                raise ValueError("slippage must be between 0 (exclusive) and 0.5 (inclusive)")
-            limit_price = current_price * (1 + effective_slippage) if is_buy else current_price * (1 - effective_slippage)
-
-        # Validate and format size and price (handles all rounding)
-        size, limit_price = self._validate_and_format_order(symbol, size, limit_price)
+        # The size and price to sign: rounded, and for a market order the mid ± slippage
+        size, limit_price = self.prepare_order(symbol, size, is_buy, limit_price, slippage)
         logger.debug(f"Formatted order: symbol={symbol}, size={size}, limit_price={limit_price}")
 
         # Construct order type (matching SDK)
         order_type = {"limit": {"tif": time_in_force}}
-        if post_only:
-            if time_in_force == "Ioc":
-                raise ValueError("post_only cannot be used with IOC orders")
-            order_type["limit"]["postOnly"] = True
 
         # Debug logging
         logger.debug(f"Order type structure: {order_type}")
         logger.debug(f"Order parameters: symbol={symbol}, size={size}, limit_price={limit_price}, is_buy={is_buy}")
 
         try:
-            response = self._with_retry(
-                self.exchange.order,
-                name=symbol,
+            response = self._place_order(
+                symbol,
+                order_cloid,
                 is_buy=is_buy,
                 sz=size,
                 limit_px=limit_price,
@@ -490,60 +1336,10 @@ class HyperliquidClient:
                 reduce_only=reduce_only,
             )
 
-            # Debug logging
             logger.debug(f"Order response: {response}")
-            
-            # Check for error response
-            if isinstance(response, dict):
-                # Check if response has status field
-                if response.get("status") != "ok":
-                    raise ValueError(f"Order failed with status: {response.get('status')}")
-                
-                # Check for response.data structure
-                if "response" in response and "data" in response["response"]:
-                    statuses = response["response"]["data"].get("statuses", [])
-                    if statuses and "error" in statuses[0]:
-                        raise ValueError(f"Order error: {statuses[0]['error']}")
-                    
-                    # Extract order details from the response
-                    if statuses and "resting" in statuses[0]:
-                        order_data = {
-                            "order_id": str(statuses[0]["resting"]["oid"]),
-                            "symbol": symbol,
-                            "is_buy": is_buy,
-                            "size": str(size),
-                            "order_type": order_type,
-                            "reduce_only": reduce_only,
-                            "status": "open",
-                            "time_in_force": time_in_force,
-                            "created_at": int(time.time() * 1000),
-                            "limit_price": str(limit_price)
-                        }
-                        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-                    elif statuses and "filled" in statuses[0]:
-                        filled_sz = statuses[0]["filled"].get("totalSz", size)
-                        order_data = {
-                            "order_id": str(statuses[0]["filled"]["oid"]),
-                            "symbol": symbol,
-                            "is_buy": is_buy,
-                            "size": str(size),
-                            "filled_size": str(filled_sz),
-                            "average_fill_price": str(statuses[0]["filled"]["avgPx"]),
-                            "order_type": order_type,
-                            "reduce_only": reduce_only,
-                            "status": "filled",
-                            "time_in_force": time_in_force,
-                            "created_at": int(time.time() * 1000),
-                            "limit_price": str(limit_price)
-                        }
-                        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-                else:
-                    # Try alternative response format
-                    logger.debug(f"Trying alternative response format: {response}")
-                    raise ValueError(f"Unexpected response structure: {response}")
-            
-            raise ValueError(f"Unexpected response format: {type(response)} - {response}")
-        
+            return self._order_from_response(response, symbol, is_buy, size, limit_price, order_type, reduce_only,
+                                             f"{symbol} order", cloid=order_cloid)
+
         except ValueError:
             raise
         except Exception as e:
@@ -559,6 +1355,8 @@ class HyperliquidClient:
         reduce_only: bool = False,
         post_only: bool = False,
         slippage: Optional[float] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Simple buy order function.
 
@@ -569,6 +1367,7 @@ class HyperliquidClient:
             reduce_only (bool): Whether the order should only reduce position
             post_only (bool): Whether the order should only be maker (only for limit orders)
             slippage (Optional[float]): Slippage for market orders. Overrides default_slippage if set.
+            cloid (Optional[str]): Client order id, see create_order().
 
         Returns:
             Order: Order response from the exchange
@@ -583,6 +1382,7 @@ class HyperliquidClient:
             post_only=post_only,
             time_in_force=time_in_force,
             slippage=slippage,
+            cloid=cloid,
         )
 
     def sell(
@@ -593,6 +1393,8 @@ class HyperliquidClient:
         reduce_only: bool = False,
         post_only: bool = False,
         slippage: Optional[float] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Simple sell order function.
 
@@ -603,6 +1405,7 @@ class HyperliquidClient:
             reduce_only (bool): Whether the order should only reduce position
             post_only (bool): Whether the order should only be maker (only for limit orders)
             slippage (Optional[float]): Slippage for market orders. Overrides default_slippage if set.
+            cloid (Optional[str]): Client order id, see create_order().
 
         Returns:
             Order: Order response from the exchange
@@ -617,14 +1420,61 @@ class HyperliquidClient:
             post_only=post_only,
             time_in_force=time_in_force,
             slippage=slippage,
+            cloid=cloid,
         )
+
+    def _closing_side(self, symbol: str, is_buy: Optional[bool]) -> bool:
+        """Side (is_buy) of an order that reduces the current position in `symbol`.
+
+        Raises PositionNotFoundException if there is no position, and ValueError if an
+        explicit `is_buy` would not reduce it.
+        """
+        position = next((p for p in self.get_positions() if p.symbol == symbol), None)
+        if position is None or position.size == 0:
+            raise PositionNotFoundException(f"No position found for {symbol}")
+        closing_is_buy = position.is_short
+        if is_buy is not None and is_buy != closing_is_buy:
+            side = "short" if position.is_short else "long"
+            raise InvalidArgumentException(
+                f"is_buy={is_buy} does not close the {side} {symbol} position; "
+                "omit is_buy to derive the side from the position"
+            )
+        return closing_is_buy
+
+    @staticmethod
+    def _trigger_order(status: Dict[str, Any], symbol: str, is_buy: bool, size: float,
+                       order_type: Dict[str, Any], trigger_price: float, cloid: Cloid) -> Order:
+        """Order for a placed stop loss or take profit: resting, or filled if its trigger was
+        already crossed and it executed at once."""
+        order_data: Dict[str, Any] = {
+            "symbol": symbol,
+            "is_buy": is_buy,
+            "size": str(size),
+            "order_type": order_type,
+            "reduce_only": True,
+            "time_in_force": "Gtc",
+            "created_at": int(time.time() * 1000),
+            "trigger_price": str(trigger_price),
+            "type": {"tp": "take_profit", "sl": "stop_loss"}.get(order_type["trigger"].get("tpsl"), "unknown"),
+            "cloid": cloid.to_raw(),
+        }
+        if "resting" in status:
+            order_data.update(order_id=status["resting"]["oid"], status="open")
+        elif "filled" in status:
+            filled = status["filled"]
+            order_data.update(order_id=filled["oid"], status="filled",
+                              filled_size=str(filled["totalSz"]),
+                              average_fill_price=str(filled["avgPx"]))
+        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
 
     def stop_loss(
         self,
         symbol: str,
         size: float,
         trigger_price: float,
-        is_buy: bool = False
+        is_buy: Optional[bool] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Place a stop loss order.
 
@@ -632,68 +1482,21 @@ class HyperliquidClient:
             symbol (str): Trading pair symbol (e.g., "BTC")
             size (float): Order size in base currency
             trigger_price (float): Price at which the stop loss triggers
-            is_buy (bool): True for shorts' SL, False for longs' SL (default)
+            is_buy (Optional[bool]): Side of the order. Omit it to derive the side from the
+                position (sell for a long, buy for a short); a value that would not close the
+                position raises ValueError.
+            cloid (Optional[str]): Client order id, see create_order().
         """
-        # Get current position to determine direction
-        positions = self.get_positions()
-        position = next((p for p in positions if p.symbol == symbol), None)
-        if not position:
-            raise PositionNotFoundException(f"No position found for {symbol}")
-
-        # Validate and format size and trigger price (handles all rounding)
-        size, trigger_price = self._validate_and_format_order(symbol, size, trigger_price)
-
-        order_type = {
-            "trigger": {
-                "triggerPx": trigger_price,
-                "isMarket": True,
-                "tpsl": "sl"
-            }
-        }
-
-        response = self._with_retry(
-            self.exchange.order,
-            name=symbol,
-            is_buy=is_buy,
-            sz=size,
-            limit_px=trigger_price,
-            reduce_only=True,
-            order_type=order_type,
-        )
-
-        # Error handling and response formatting
-        if isinstance(response, dict):
-            if response.get("status") != "ok":
-                raise ValueError(f"Failed to place stop loss order: {response}")
-            
-            statuses = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-            if "error" in statuses:
-                raise ValueError(f"Stop loss order error: {statuses['error']}")
-            
-            # Format response data
-            if "resting" in statuses:
-                order_data = {
-                    "order_id": str(statuses["resting"]["oid"]),
-                    "symbol": symbol,
-                    "is_buy": is_buy,
-                    "size": str(size),
-                    "order_type": order_type,
-                    "reduce_only": True,
-                    "status": "open",
-                    "time_in_force": "Gtc",
-                    "created_at": int(time.time() * 1000),
-                    "trigger_price": str(trigger_price)
-                }
-                return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-        
-        raise ValueError("Unexpected response format")
+        return self._protection_order("sl", symbol, size, trigger_price, is_buy, cloid)
 
     def take_profit(
         self,
         symbol: str,
         size: float,
         trigger_price: float,
-        is_buy: bool = False
+        is_buy: Optional[bool] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Place a take profit order.
 
@@ -701,60 +1504,40 @@ class HyperliquidClient:
             symbol (str): Trading pair symbol (e.g., "BTC")
             size (float): Order size in base currency
             trigger_price (float): Price at which the take profit triggers
-            is_buy (bool): True for shorts' TP, False for longs' TP (default)
+            is_buy (Optional[bool]): Side of the order. Omit it to derive the side from the
+                position (sell for a long, buy for a short); a value that would not close the
+                position raises ValueError.
+            cloid (Optional[str]): Client order id, see create_order().
         """
-        positions = self.get_positions()
-        position = next((p for p in positions if p.symbol == symbol), None)
-        if not position:
-            raise PositionNotFoundException(f"No position found for {symbol}")
+        return self._protection_order("tp", symbol, size, trigger_price, is_buy, cloid)
 
+    def _protection_order(self, tpsl: str, symbol: str, size: float, trigger_price: float,
+                          is_buy: Optional[bool], cloid: Optional[str]) -> Order:
+        """Shared implementation of stop_loss ("sl") and take_profit ("tp")."""
+        if not self.is_authenticated():
+            raise AuthenticationRequiredException()
+        order_cloid = _order_cloid(cloid)
+        return self._place_trigger(tpsl, symbol, size, trigger_price, self._closing_side(symbol, is_buy), order_cloid)
+
+    def _place_trigger(self, tpsl: str, symbol: str, size: float, trigger_price: float,
+                       is_buy: bool, order_cloid: Cloid) -> Order:
+        """Place a reduce-only market trigger order ("sl" or "tp") on the side `is_buy`, which
+        the caller derived from the position."""
         # Validate and format size and trigger price (handles all rounding)
         size, trigger_price = self._validate_and_format_order(symbol, size, trigger_price)
-
-        order_type = {
-            "trigger": {
-                "triggerPx": trigger_price,
-                "isMarket": True,
-                "tpsl": "tp"
-            }
-        }
-
-        response = self._with_retry(
-            self.exchange.order,
-            name=symbol,
+        order_type = {"trigger": {"triggerPx": trigger_price, "isMarket": True, "tpsl": tpsl}}
+        response = self._place_order(
+            symbol,
+            order_cloid,
             is_buy=is_buy,
             sz=size,
             limit_px=trigger_price,
             reduce_only=True,
             order_type=order_type,
         )
-
-        # Error handling and response formatting
-        if isinstance(response, dict):
-            if response.get("status") != "ok":
-                raise ValueError(f"Failed to place take profit order: {response}")
-            
-            statuses = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-            if "error" in statuses:
-                raise ValueError(f"Take profit order error: {statuses['error']}")
-            
-            # Format response data
-            if "resting" in statuses:
-                order_data = {
-                    "order_id": str(statuses["resting"]["oid"]),
-                    "symbol": symbol,
-                    "is_buy": is_buy,
-                    "size": str(size),
-                    "order_type": order_type,
-                    "reduce_only": True,
-                    "status": "open",
-                    "time_in_force": "Gtc",
-                    "created_at": int(time.time() * 1000),
-                    "trigger_price": str(trigger_price)
-                }
-                return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-        
-        raise ValueError("Unexpected response format")
+        name = "stop loss" if tpsl == "sl" else "take profit"
+        status = self._order_status(response, f"{symbol} {name}")
+        return self._trigger_order(status, symbol, is_buy, size, order_type, trigger_price, order_cloid)
 
     def open_long_position(
         self,
@@ -764,34 +1547,54 @@ class HyperliquidClient:
         take_profit_price: Optional[float] = None,
         limit_price: Optional[float] = None,
         slippage: Optional[float] = None,
+        *,
+        stop_losses: Optional[Sequence[Tuple[float, float]]] = None,
+        take_profits: Optional[Sequence[Tuple[float, float]]] = None,
+        time_in_force: Optional[Literal["Gtc", "Ioc", "Alo"]] = None,
     ) -> Dict[str, Order]:
         """Open a long position with optional stop loss and take profit orders.
 
         Args:
             symbol (str): Trading pair symbol (e.g., "BTC")
             size (float): Position size
-            stop_loss_price (Optional[float]): Stop loss price level
-            take_profit_price (Optional[float]): Take profit price level
+            stop_loss_price (Optional[float]): Stop loss price level, for the whole position
+            take_profit_price (Optional[float]): Take profit price level, for the whole position
             limit_price (Optional[float]): Limit price for entry, None for market order
             slippage (Optional[float]): Slippage for market entry. Overrides default_slippage if set.
+            stop_losses: Instead of stop_loss_price, several stop losses as (price, fraction):
+                [(95, 0.5), (90, 0.5)] closes half the position at each. The fractions add up
+                to at most 1.
+            take_profits: Instead of take_profit_price, several take profits, the same way.
+            time_in_force: With limit_price, "Gtc" (default) rests until filled; "Ioc" fills
+                what it can at once and cancels the rest (a market entry with a price limit).
+
+        Each stop loss and take profit is placed once the entry fills, for its fraction of the
+        filled size: rounded down to the lot size, the one nearest the entry of the stop losses
+        (and of the take profits) taking what rounding left, so together they cover their share
+        exactly, and a partial fill never loses more at its stops than the full size would.
 
         Returns:
-            Dict[str, Order]: Dictionary containing entry order and optional sl/tp orders
+            Dict[str, Order]: "entry", then "stop_loss" and "take_profit" with the single
+            prices, or "stop_loss_1", "stop_loss_2", ... and "take_profit_1", ... with lists.
+
+        Raises:
+            ValueError: If a stop loss or take profit price is on the wrong side of the entry
+                price (of a limit entry, or the mid if the limit is above it, as it can fill
+                at once; else of the mid), the fractions add up to
+                more than 1, or one would be worth less than Hyperliquid's minimum order
+                value of 10 USD at its price. Checked before any order is sent.
+            ProtectionOrderException: If the entry was placed but a stop loss or take profit
+                was not: placing it raised an error (an unknown outcome is marked, with its
+                cloid: it may still arrive), or it executed at once because the price had
+                already crossed it. It carries the orders placed and those missing.
+
+        A level whose share rounds to 0 at a small partial fill is not placed (its part goes
+        to the nearest of its kind, so the coverage stays): compare the returned keys.
         """
-        orders = {"entry": self.buy(symbol, size, limit_price, slippage=slippage)}
-
-        reference_price = limit_price or float(orders["entry"].limit_price or 0) or self.get_price(symbol)
-        if stop_loss_price:
-            if stop_loss_price >= reference_price:
-                raise ValueError("Stop loss price must be below entry price for longs")
-            orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price)
-
-        if take_profit_price:
-            if take_profit_price <= reference_price:
-                raise ValueError("Take profit price must be above entry price for longs")
-            orders["take_profit"] = self.take_profit(symbol, size, take_profit_price)
-
-        return orders
+        return self._open_position(
+            symbol, size, True, stop_loss_price, take_profit_price, limit_price, slippage,
+            stop_losses, take_profits, time_in_force
+        )
 
     def open_short_position(
         self,
@@ -801,44 +1604,157 @@ class HyperliquidClient:
         take_profit_price: Optional[float] = None,
         limit_price: Optional[float] = None,
         slippage: Optional[float] = None,
+        *,
+        stop_losses: Optional[Sequence[Tuple[float, float]]] = None,
+        take_profits: Optional[Sequence[Tuple[float, float]]] = None,
+        time_in_force: Optional[Literal["Gtc", "Ioc", "Alo"]] = None,
     ) -> Dict[str, Order]:
-        """Open a short position with optional stop loss and take profit orders.
+        """Open a short position with optional stop loss and take profit orders, as
+        open_long_position (stop losses above the entry, take profits below it).
 
         Args:
             symbol (str): Trading pair symbol (e.g., "BTC")
             size (float): Position size
-            stop_loss_price (Optional[float]): Stop loss price level
-            take_profit_price (Optional[float]): Take profit price level
+            stop_loss_price (Optional[float]): Stop loss price level, for the whole position
+            take_profit_price (Optional[float]): Take profit price level, for the whole position
             limit_price (Optional[float]): Limit price for entry, None for market order
             slippage (Optional[float]): Slippage for market entry. Overrides default_slippage if set.
+            stop_losses, take_profits, time_in_force: as in open_long_position.
 
         Returns:
-            Dict[str, Order]: Dictionary containing entry order and optional sl/tp orders
+            Dict[str, Order]: as open_long_position.
+
+        Raises:
+            ValueError: If a stop loss or take profit price is on the wrong side of the entry
+                price, or as open_long_position. Checked before any order is sent.
+            ProtectionOrderException: If the entry was placed but placing a stop loss or take
+                profit raised an error; it carries the orders that were placed and those missing.
         """
-        orders = {"entry": self.sell(symbol, size, limit_price, slippage=slippage)}
+        return self._open_position(
+            symbol, size, False, stop_loss_price, take_profit_price, limit_price, slippage,
+            stop_losses, take_profits, time_in_force
+        )
 
-        reference_price = limit_price or float(orders["entry"].limit_price or 0) or self.get_price(symbol)
-        if stop_loss_price:
-            if stop_loss_price <= reference_price:
-                raise ValueError("Stop loss price must be above entry price for shorts")
-            orders["stop_loss"] = self.stop_loss(symbol, size, stop_loss_price)
+    def _open_position(
+        self,
+        symbol: str,
+        size: float,
+        is_long: bool,
+        stop_loss_price: Optional[float],
+        take_profit_price: Optional[float],
+        limit_price: Optional[float],
+        slippage: Optional[float],
+        stop_losses: Optional[Sequence[Tuple[float, float]]] = None,
+        take_profits: Optional[Sequence[Tuple[float, float]]] = None,
+        time_in_force: Optional[str] = None,
+    ) -> Dict[str, Order]:
+        """Shared implementation of open_long_position and open_short_position."""
+        if not self.is_authenticated():
+            raise AuthenticationRequiredException()
+        if time_in_force is not None and (limit_price is None or time_in_force not in _TIMES_IN_FORCE):
+            raise InvalidArgumentException("time_in_force is Gtc, Ioc or Alo, and only with limit_price")
+        legs = (_protection_legs("stop_loss", stop_loss_price, stop_losses)
+                + _protection_legs("take_profit", take_profit_price, take_profits))
+        self._check_order_size(symbol, size)
+        return self._open_position_with_specs(symbol, size, is_long, legs, limit_price, slippage, time_in_force)
 
-        if take_profit_price:
-            if take_profit_price >= reference_price:
-                raise ValueError("Take profit price must be below entry price for shorts")
-            orders["take_profit"] = self.take_profit(symbol, size, take_profit_price)
+    def _open_position_with_specs(
+        self,
+        symbol: str,
+        size: float,
+        is_long: bool,
+        legs: List[Tuple[str, str, float, Decimal]],
+        limit_price: Optional[float],
+        slippage: Optional[float],
+        time_in_force: Optional[str] = None,
+    ) -> Dict[str, Order]:
+        """Body of _open_position. `legs`: (name, kind, price, fraction) per stop loss and
+        take profit."""
+        # Everything is checked before anything is placed, at the prices that will be sent:
+        # the stop loss and take profit against a resting limit entry's price, or for an entry
+        # that executes at once (market, or a limit with Ioc) against the mid price (the
+        # entry's own limit includes the slippage allowance, which is no price it fills at).
+        # A limit beyond the mid (a buy above it, a sell below) can fill at once, near the
+        # mid (it does once it reaches the other side of the book): the nearer of the two is
+        # the reference, so a level is never checked against a price the entry may beat.
+        if limit_price is not None and time_in_force != "Ioc":
+            entry_price = limit_price
+            time_in_force = time_in_force or "Gtc"
+            reference = limit_price
+            if legs:
+                mid = self._mid_price(symbol)
+                reference = min(limit_price, mid) if is_long else max(limit_price, mid)
+        else:
+            reference = self._mid_price(symbol)
+            entry_price = limit_price if limit_price is not None else self._with_slippage(reference, is_long, slippage)
+            time_in_force = "Ioc"
+        entry_px = self._format_price(symbol, reference)
+        decimals = self.market_specs[symbol].get("size_decimals", 0)
+        # The levels at their prices as sent (rounding can make two equal: the remainder then
+        # goes to the same one as the MCP server's plan), and the size as the entry is sent.
+        sent = [(name, kind, self._format_price(symbol, price), fraction) for name, kind, price, fraction in legs]
+        planned = split_size(Decimal(str(_round_down(size, decimals))), sent, decimals, is_long)
+        for (name, kind, price, fraction), leg_size in zip(legs, planned):
+            label = name.replace("_", " ").capitalize()
+            px = self._format_price(symbol, price)
+            if not _positive_number(px):  # rounds to 0, or overflows to infinity
+                raise InvalidArgumentException(f"{label} price rounds to {px} at {symbol}'s price precision")
+            below = (kind == "stop_loss") == is_long  # a long's stop and a short's take profit: below
+            if (px >= entry_px) if below else (px <= entry_px):
+                raise InvalidArgumentException(
+                    f"{label} price must be {'below' if below else 'above'} entry price for "
+                    f"{'longs' if is_long else 'shorts'}")
+            # Hyperliquid refuses an order worth less than 10 USD (reduce-only ones closing a
+            # whole position may be exempt; nothing here relies on it): refused now, not after
+            # the entry filled.
+            if leg_size * Decimal(str(px)) < MIN_ORDER_USD:
+                raise InvalidArgumentException(
+                    f"{label} would be {leg_size} at {px}, worth less than Hyperliquid's minimum order of "
+                    f"{MIN_ORDER_USD} USD")
 
-        return orders
+        entry = self.create_order(
+            symbol, size, is_long, limit_price=entry_price, time_in_force=time_in_force
+        )
+        orders = {"entry": entry}
+        if not legs:
+            return orders
+        if entry.status != "filled":
+            raise ProtectionOrderException(legs[0][0], orders, _missing(legs, planned)) from ValueError(
+                "the entry order is resting, not filled, so there is no position to protect "
+                "yet; place the stop loss and take profit after it fills"
+            )
 
-    def _check_order_filled(self, order_id: int) -> bool:
-        """Check if an order has been filled via the order status API."""
+        # A market entry can fill only partly: protect the filled size.
+        filled = Decimal(str(entry.filled_size)) if entry.filled_size else Decimal(str(size))
+        sizes = split_size(filled, sent, decimals, is_long)
         try:
-            status = self.get_order_status(order_id)
-            order_info = status.get("order", {})
-            return order_info.get("status") == "filled"
-        except Exception as e:
-            logger.debug(f"Error checking order status {order_id}: {e}")
-            return False
+            # One read for all levels: the position must be on the entry's side (an opposite
+            # position the entry only reduced has nothing these orders protect).
+            closing_is_buy = self._closing_side(symbol, not is_long)
+        except Exception as exc:
+            raise ProtectionOrderException(legs[0][0], orders, _missing(legs, sizes)) from exc
+        for index, ((name, kind, price, _), leg_size) in enumerate(zip(legs, sizes)):
+            if leg_size <= 0:  # a fraction too small for the filled size: its part went to the last one
+                logger.warning("%s: %s at %s rounds to 0 for the filled size %s and is not placed",
+                               symbol, name, price, filled)
+                continue
+            try:
+                placed = self._place_trigger("sl" if kind == "stop_loss" else "tp", symbol, float(leg_size),
+                                             price, closing_is_buy, _order_cloid(None))
+            except Exception as exc:
+                missing = _missing(legs[index:], sizes[index:])
+                if isinstance(exc, OrderOutcomeUnknownException) and missing:  # it may still arrive
+                    missing[0].update(outcome_unknown=True, cloid=exc.cloid)
+                raise ProtectionOrderException(name, orders, missing) from exc
+            orders[name] = placed
+            if placed.status != "open":  # it executed at once: the price had already crossed it
+                left = leg_size - Decimal(str(placed.filled_size or 0))
+                rest = _missing(legs[index:index + 1], [left]) + _missing(legs[index + 1:], sizes[index + 1:])
+                raise ProtectionOrderException(name, orders, rest) from ValueError(
+                    f"the {name.replace('_', ' ')} at {price} executed at once ({placed.status}, "
+                    f"{placed.filled_size} of {leg_size}): the price had already crossed it; the rest of the "
+                    "position has not all its protection")
+        return orders
 
     def _make_filled_order(self, order_id: int, symbol: str, is_buy: bool, size: float,
                            order: Order, avg_fill_price: Optional[Decimal] = None) -> Order:
@@ -846,7 +1762,8 @@ class HyperliquidClient:
         logger.info(f"Maker order filled: {symbol} {'buy' if is_buy else 'sell'} {size}"
                     f"{f' @ {avg_fill_price}' if avg_fill_price else ''}")
         return Order(
-            order_id=str(order_id),
+            order_id=order_id,
+            cloid=order.cloid,
             symbol=symbol,
             is_buy=is_buy,
             size=Decimal(str(size)),
@@ -933,9 +1850,13 @@ class HyperliquidClient:
             ValueError: If parameters are invalid
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
         if fallback not in ("ioc", "market", "cancel"):
-            raise ValueError("fallback must be 'ioc', 'market', or 'cancel'")
+            raise InvalidArgumentException("fallback must be 'ioc', 'market', or 'cancel'")
+        # Invalid input (unknown symbol, size below the minimum) raises here. Inside the chase
+        # a ValueError means the exchange rejected the post-only order, which is retried.
+        self._check_order_size(symbol, size)
+        size = self._format_size(symbol, size)  # the size that can be traded, e.g. 0.001009 -> 0.001
 
         # Auto-detect timing from spread if not specified
         if timeout is None or reprice_interval is None:
@@ -949,6 +1870,7 @@ class HyperliquidClient:
         remaining_size = size
         last_order = None
         attempts = 0
+        maker_fills: List[tuple] = []  # (size, price) filled by each attempt so far
         start_time = time.time()
         deadline = start_time + timeout
         last_spread_bps = None
@@ -959,6 +1881,27 @@ class HyperliquidClient:
             order.attempts = attempts
             order.elapsed = round(time.time() - start_time, 2)
             order.spread_bps = last_spread_bps
+            return order
+
+        def _maker_filled() -> Decimal:
+            return sum((qty for qty, _ in maker_fills), Decimal(0))
+
+        def _average(parts: List[tuple]) -> Optional[Decimal]:
+            qty = sum((q for q, _ in parts), Decimal(0))
+            if not qty or any(px is None for _, px in parts):
+                return None
+            return sum(q * px for q, px in parts) / qty
+
+        def _with_maker_fills(order: Order) -> Order:
+            """Report the fills of every maker attempt on the order that is returned."""
+            if not maker_fills:
+                return order
+            parts = list(maker_fills)
+            if order.filled_size:
+                parts.append((Decimal(str(order.filled_size)), order.average_fill_price))
+            order.size = Decimal(str(size))
+            order.filled_size = sum((q for q, _ in parts), Decimal(0))
+            order.average_fill_price = _average(parts)
             return order
 
         while time.time() < deadline and remaining_size > 0:
@@ -1003,7 +1946,9 @@ class HyperliquidClient:
                     time_in_force="Alo",
                 )
                 last_order = order
-            except ValueError as e:
+            except OrderRejectedException as e:
+                if not e.reason.startswith(_POST_ONLY_CROSSED):
+                    raise  # e.g. insufficient margin: no later attempt can succeed
                 # post_only rejected (would cross spread) — retry at next interval
                 logger.debug(f"Post-only rejected for {symbol}: {e}")
                 time.sleep(min(reprice_interval, max(0.1, deadline - time.time())))
@@ -1013,10 +1958,10 @@ class HyperliquidClient:
             if order.status == "filled":
                 logger.info(f"Maker order filled immediately: {symbol} {'buy' if is_buy else 'sell'} "
                            f"{order.filled_size} @ {order.average_fill_price}")
-                return _annotate(order, is_maker=True)
+                return _annotate(_with_maker_fills(order), is_maker=True)
 
             # Sleep for reprice interval, then cancel and check result
-            order_id = int(order.order_id)
+            order_id = order.order_id
             sleep_time = min(reprice_interval, max(0.1, deadline - time.time()))
             if fill_event is not None:
                 fired = fill_event.wait(timeout=sleep_time)
@@ -1025,47 +1970,49 @@ class HyperliquidClient:
             else:
                 time.sleep(sleep_time)
 
-            # Try to cancel — if it fails, order was likely filled
-            cancelled = self.cancel_order(order_id, symbol)
-
-            # Single status check: detect fill or partial fill
+            # Cancel, then read how much this attempt filled. Never reprice or fall back
+            # without knowing: an unnoticed fill would be bought or sold a second time.
+            self.cancel_order(order_id, symbol)
             try:
                 status = self.get_order_status(order_id)
-                order_info = status.get("order", {})
-                order_detail = order_info.get("order", {})
+                order_info = status["order"]
+                order_detail = order_info["order"]
+                state = order_info["status"]
+                # The attempt must have ended (filled or canceled), and its sizes must say how
+                # much of it filled; "sz" is what was left when it ended.
+                if state == "filled":
+                    attempt_filled = Decimal(str(formatted_size))
+                elif state in ("canceled", "scheduledCancel") or state.endswith("Canceled"):
+                    attempt_filled = Decimal(str(order_detail["origSz"])) - Decimal(str(order_detail["sz"]))
+                else:
+                    raise ValueError(f"order status is {state!r}, not ended")
+            except Exception as e:
+                raise ActionOutcomeUnknownException(
+                    f"{symbol} maker order {order_id}",
+                    f"canceled, but how much it filled could not be read ({e}); "
+                    f"{_maker_filled()} of {size} filled by earlier attempts",
+                ) from e
 
-                # Extract fill price from status response
-                avg_px_str = order_detail.get("avgPx") or order_detail.get("limitPx")
-                avg_px = Decimal(str(avg_px_str)) if avg_px_str else None
-
-                if order_info.get("status") == "filled":
+            # A maker (Alo) order fills at its limit price
+            avg_px_str = order_detail.get("avgPx") or order_detail.get("limitPx")
+            avg_px = Decimal(str(avg_px_str)) if avg_px_str else None
+            if attempt_filled > 0:
+                maker_fills.append((attempt_filled, avg_px))
+                remaining_size = max(0.0, float(Decimal(str(size)) - _maker_filled()))
+                logger.info(f"Maker fill: {attempt_filled} filled, {remaining_size} remaining")
+                if remaining_size <= 0:
                     return _annotate(
-                        self._make_filled_order(order_id, symbol, is_buy, remaining_size, order, avg_px),
+                        self._make_filled_order(order_id, symbol, is_buy, size, order, _average(maker_fills)),
                         is_maker=True,
                     )
-
-                # Check for partial fills
-                orig_sz = Decimal(str(order_detail.get("origSz", formatted_size)))
-                current_sz = Decimal(str(order_detail.get("sz", formatted_size)))
-                partial_filled = orig_sz - current_sz
-                if partial_filled > 0:
-                    remaining_size = float(Decimal(str(remaining_size)) - partial_filled)
-                    remaining_size = max(0, remaining_size)
-                    logger.info(f"Partial fill detected: {partial_filled} filled, {remaining_size} remaining")
-                    if remaining_size <= 0:
-                        return _annotate(
-                            self._make_filled_order(order_id, symbol, is_buy, size, order, avg_px),
-                            is_maker=True,
-                        )
-            except Exception as e:
-                logger.debug(f"Error checking order status after cancel: {e}")
 
         # Timeout reached — apply fallback for remaining size
         if remaining_size > 0 and fallback != "cancel":
             formatted_remaining = self._format_size(symbol, remaining_size)
             if formatted_remaining <= 0:
                 if last_order is not None:
-                    return _annotate(last_order, is_maker=True)
+                    last_order.status = "canceled"  # every attempt was canceled after its fills
+                    return _annotate(_with_maker_fills(last_order), is_maker=True)
             logger.info(f"Maker chase timeout for {symbol}, falling back to {fallback} "
                        f"for remaining {formatted_remaining}")
             if fallback == "ioc":
@@ -1077,16 +2024,17 @@ class HyperliquidClient:
                     reduce_only=reduce_only,
                     time_in_force="Ioc",
                 )
-                return _annotate(fallback_order, is_maker=False)
+                return _annotate(_with_maker_fills(fallback_order), is_maker=False)
             elif fallback == "market":
                 if is_buy:
                     fallback_order = self.buy(symbol, formatted_remaining, reduce_only=reduce_only)
                 else:
                     fallback_order = self.sell(symbol, formatted_remaining, reduce_only=reduce_only)
-                return _annotate(fallback_order, is_maker=False)
+                return _annotate(_with_maker_fills(fallback_order), is_maker=False)
 
         if last_order is not None:
-            return _annotate(last_order, is_maker=False)
+            last_order.status = "canceled"  # the last attempt was canceled when the chase ended
+            return _annotate(_with_maker_fills(last_order), is_maker=False)
 
         raise RuntimeError(f"maker_order failed: no order placed for {symbol}")
 
@@ -1140,11 +2088,16 @@ class HyperliquidClient:
             slippage (Optional[float]): Slippage for market close. Overrides default_slippage if set.
 
         Returns:
-            Order: Order response for the closing order
+            Order: The closing order, filled for the whole position.
 
         Raises:
-            ValueError: If no position exists for the symbol
+            PositionNotFoundException: If no position exists for the symbol
+            PositionNotClosedException: If the order filled only part of the position (it is
+                immediate-or-cancel: the rest was canceled) or was rejected; it carries the order
+                (None if rejected; the rejection is __cause__) and the size still open
         """
+        if not self.is_authenticated():
+            raise AuthenticationRequiredException()
         if position is None:
             positions = self.get_positions()
             position = next((p for p in positions if p.symbol == symbol), None)
@@ -1152,74 +2105,145 @@ class HyperliquidClient:
         if not position:
             raise PositionNotFoundException(f"No open position found for {symbol}")
 
-        size = abs(float(position.size))
-        is_buy = float(position.size) < 0  # Buy to close shorts, sell to close longs
+        size = abs(Decimal(str(position.size)))
+        is_buy = position.size < 0  # Buy to close shorts, sell to close longs
 
-        order = self.create_order(
-            symbol=symbol,
-            size=size,
-            is_buy=is_buy,
-            reduce_only=True,
-            time_in_force="Ioc",  # Market order
-            slippage=slippage,
-        )
-
-        if order.status != "filled":
-            logger.warning(
-                f"close({symbol}) IOC order {order.order_id} was NOT filled "
-                f"(status={order.status}). Position may still be open!"
+        try:
+            order = self.create_order(
+                symbol=symbol,
+                size=float(size),
+                is_buy=is_buy,
+                reduce_only=True,
+                time_in_force="Ioc",  # Market order
+                slippage=slippage,
             )
+        except OrderRejectedException as rejection:  # e.g. no liquidity within the slippage
+            raise PositionNotClosedException(symbol, None, size, rejection.reason) from rejection
 
+        # Hyperliquid reports a partly filled IOC order as filled too, with the smaller size.
+        remaining = size - (order.filled_size or Decimal(0))
+        if remaining > 0:
+            raise PositionNotClosedException(symbol, order, remaining)
         return order
 
     def cancel_all_orders(self, symbol: Optional[str] = None) -> None:
-        """Cancel all open orders, optionally filtered by symbol.
+        """Cancel all open perp orders on the client's dexes (perp_dexs), stop losses and take
+        profits included, optionally of one symbol (then only its dex is read). Spot orders are
+        left open: spot_cancel_all_orders() cancels those.
 
         Args:
             symbol (Optional[str]): If provided, only cancels orders for this symbol
 
         Raises:
             RuntimeError: If client is not authenticated
+            UnknownSymbolException: If symbol is not a market of the client (nothing is read)
             Exception: If fetching orders fails or if any cancellation fails
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
 
         # Let this propagate on failure - trader MUST know if we can't fetch orders
         open_orders = []
-        for dex in self.perp_dexs:
+        if symbol:  # a misspelled one would match no order and cancel nothing, silently
+            self._require_symbol(symbol)
+        for dex in self._dexes_of(symbol):
             open_orders.extend(self._with_retry(self.info.open_orders, self.account.public_address, dex=dex))
 
-        if symbol:
-            open_orders = [order for order in open_orders if order["coin"] == symbol]
+        # The default dex's open orders include the spot and outcome ones: only perp orders here.
+        open_orders = [order for order in open_orders if coin_market(order["coin"]) in PERP_MARKETS
+                       and (not symbol or order["coin"] == symbol)]
 
         if not open_orders:
             return
 
         # Bulk cancel in a single API call
-        cancel_requests = [{"coin": order["coin"], "oid": order["oid"]} for order in open_orders]
-        self._with_retry(self.exchange.bulk_cancel, cancel_requests)
+        self._cancel_all([{"coin": order["coin"], "oid": order["oid"]} for order in open_orders])
 
-    def get_open_orders(self, symbol: Optional[str] = None) -> List[Order]:
-        """Get all open orders for the authenticated user.
-        
+    @staticmethod
+    def _parse_open_order(order_data: Dict[str, Any], symbol: str, market: Optional[str] = None) -> Order:
+        """An order of a frontendOpenOrders response, the same format for perp and spot:
+        trigger orders (stop loss, take profit) with their trigger fields, else limit orders.
+        `market` overrides the one derived from the symbol (spot orders are named by token)."""
+        # Determine order type (limit, market, trigger)
+        order_type = {}
+        order_type_str = "unknown"
+
+        # Check if it's a trigger order (stop loss or take profit)
+        if order_data.get("isTrigger", False):
+            tpsl = None
+            name = order_data.get("orderType") or ""  # Stop Market, Stop Limit, Take Profit Market/Limit
+            if "Take Profit" in order_data.get("orderType", ""):
+                tpsl = "tp"
+                order_type_str = "take_profit"
+            elif "Stop" in order_data.get("orderType", ""):
+                tpsl = "sl"
+                order_type_str = "stop_loss"
+
+            order_type["trigger"] = {
+                "triggerPx": order_data.get("triggerPx"),
+                "isMarket": "Limit" not in name,
+                "tpsl": tpsl
+            }
+        else:
+            order_type["limit"] = {
+                "tif": order_data.get("tif", "Gtc"),
+                "px": order_data.get("limitPx")
+            }
+            order_type_str = "limit"
+
+        is_buy = order_data.get("side") == "B"
+        # "sz" is what is still open, "origSz" the size the order was placed with
+        remaining = Decimal(str(order_data.get("sz", 0)))
+        original = Decimal(str(order_data.get("origSz", remaining)))
+
+        order_dict = {
+            "order_id": order_data["oid"],
+            "cloid": order_data.get("cloid"),
+            "symbol": symbol,
+            "is_buy": is_buy,
+            "size": original,
+            "order_type": order_type,
+            "reduce_only": order_data.get("reduceOnly", False),
+            "status": "open",
+            "time_in_force": order_data.get("tif", "Gtc") or "Gtc",
+            "created_at": order_data.get("timestamp", 0),
+            "filled_size": original - remaining,
+            "type": order_type_str,
+            "children": order_data.get("children") or None,
+            "is_position_tpsl": order_data.get("isPositionTpsl"),
+            "trigger_condition": order_data.get("triggerCondition"),
+        }
+
+        if "limitPx" in order_data:
+            order_dict["limit_price"] = Decimal(str(order_data["limitPx"]))
+        if order_data.get("isTrigger") and "triggerPx" in order_data:  # else "0.0", a placeholder
+            order_dict["trigger_price"] = Decimal(str(order_data["triggerPx"]))
+        if market is not None:
+            order_dict["market"] = market
+        return from_dict(data_class=Order, data=order_dict, config=DACITE_CONFIG)
+
+    def get_open_orders(self, symbol: Optional[str] = None, *, address: Optional[str] = None) -> List[Order]:
+        """Get all open orders of a wallet, by default the client's account.
+
         Args:
-            symbol (Optional[str]): If provided, only returns orders for this symbol
-            
+            symbol (Optional[str]): If provided, only returns orders for this symbol (and reads
+                only its dex)
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
-            List[Order]: List of open orders
-            
+            List[Order]: List of open orders, on the client's dexes (spot orders come with the
+                default dex)
+
         Raises:
-            RuntimeError: If client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+        address = self._address(address)
 
         # Get open orders from the API - let errors propagate
         open_orders_response = []
-        for dex in self.perp_dexs:
+        for dex in self._dexes_of(symbol):
             open_orders_response.extend(self._with_retry(
-                self.info.frontend_open_orders, self.account.public_address, dex=dex
+                self.info.frontend_open_orders, address, dex=dex
             ))
 
         # Filter by symbol if provided
@@ -1227,109 +2251,199 @@ class HyperliquidClient:
             open_orders_response = [order for order in open_orders_response if order["coin"] == symbol]
 
         # Convert API response to our Order model
-        orders = []
-        for order_data in open_orders_response:
-            try:
-                # Determine order type (limit, market, trigger)
-                order_type = {}
-                order_type_str = "unknown"
-
-                # Check if it's a trigger order (stop loss or take profit)
-                if order_data.get("isTrigger", False):
-                    tpsl = None
-                    if "Take Profit" in order_data.get("orderType", ""):
-                        tpsl = "tp"
-                        order_type_str = "take_profit"
-                    elif "Stop" in order_data.get("orderType", ""):
-                        tpsl = "sl"
-                        order_type_str = "stop_loss"
-
-                    order_type["trigger"] = {
-                        "triggerPx": order_data.get("triggerPx"),
-                        "isMarket": True,
-                        "tpsl": tpsl
-                    }
-                else:
-                    order_type["limit"] = {
-                        "tif": order_data.get("tif", "Gtc"),
-                        "px": order_data.get("limitPx")
-                    }
-                    order_type_str = "limit"
-
-                is_buy = order_data.get("side") == "B"
-
-                order_dict = {
-                    "order_id": str(order_data.get("oid", "")),
-                    "symbol": order_data.get("coin", ""),
-                    "is_buy": is_buy,
-                    "size": Decimal(str(order_data.get("sz", 0))),
-                    "order_type": order_type,
-                    "reduce_only": order_data.get("reduceOnly", False),
-                    "status": "open",
-                    "time_in_force": order_data.get("tif", "Gtc") or "Gtc",
-                    "created_at": order_data.get("timestamp", 0),
-                    "filled_size": Decimal(str(order_data.get("origSz", 0))) - Decimal(str(order_data.get("sz", 0))),
-                    "type": order_type_str,
-                    "children": order_data.get("children") or None,
-                    "is_position_tpsl": order_data.get("isPositionTpsl"),
-                    "trigger_condition": order_data.get("triggerCondition"),
-                }
-
-                if "limitPx" in order_data:
-                    order_dict["limit_price"] = Decimal(str(order_data["limitPx"]))
-                if "triggerPx" in order_data:
-                    order_dict["trigger_price"] = Decimal(str(order_data["triggerPx"]))
-
-                order = from_dict(data_class=Order, data=order_dict, config=DACITE_CONFIG)
-                orders.append(order)
-            except Exception as e:
-                logger.error(f"Error processing order data: {e}, order_data: {order_data}")
-
-        return orders
+        return [self._parse_open_order(order_data, order_data.get("coin", "")) for order_data in open_orders_response]
 
     def get_price(self, symbol: Optional[str] = None) -> Union[float, Dict[str, float]]:
-        """Get current price(s). No authentication required."""
+        """Get current price(s), the mids. No authentication required. For one symbol only its
+        dex's mids are read, as the SDK reads a market order's price; without one, those of
+        every dex of the client (spot mids come with the default dex)."""
         prices: Dict[str, float] = {}
-        for dex in self.perp_dexs:
+        for dex in self._dexes_of(symbol):
             response = self._with_retry(self.info.all_mids, dex=dex)
             prices.update({sym: float(price) for sym, price in response.items()})
 
         if symbol is not None:
             if symbol not in prices:
-                raise ValueError(f"Symbol {symbol} not found. Available symbols: {', '.join(sorted(prices.keys()))}")
+                raise self._unknown_symbol(symbol)
             return prices[symbol]
 
         return prices
 
+    def get_account_mode(self, address: Optional[str] = None) -> str:
+        """How an account holds its collateral.
+
+        Returns:
+            "standard": spot and each perp dex have their own balance.
+            "unified": one balance per token in the spot account, shared by spot and the perp
+                positions of every dex.
+            "portfolio_margin": unified, plus borrowing against collateral.
+            "unknown": "dexAbstraction" (discontinued by Hyperliquid) or a mode this library
+                does not know.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+        """
+        address = self._address(address)
+        mode = self._with_retry(self.info.query_user_abstraction_state, address)
+        return _ACCOUNT_MODES.get(mode, "unknown") if isinstance(mode, str) else "unknown"
+
+    def get_user_role(self, address: Optional[str] = None) -> Dict[str, Any]:
+        """What an address is on Hyperliquid (the SDK's user_role), as Hyperliquid answers it:
+        {"role": "user"}, {"role": "agent", "data": {"user": <the account it trades for>}},
+        {"role": "vault"}, {"role": "subAccount", "data": {"master": <its master>}}, or
+        {"role": "missing"} for an address Hyperliquid does not know (e.g. an API wallet that
+        expired or was removed).
+
+        An order signed with an API wallet's key trades the account in "data.user": check it
+        before trading with a key whose account you did not set up yourself.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+        """
+        return self._with_retry(self.info.user_role, self._address(address))
+
+    def get_leverage(self, symbol: str, *, address: Optional[str] = None) -> Leverage:
+        """The leverage a wallet uses on a perp market: cross or isolated margin and its value,
+        as set with set_leverage (or in the Hyperliquid app), else the market's default.
+        Hyperliquid's documented activeAssetData request. No authentication required.
+
+        Raises:
+            UnknownSymbolException: If the symbol is not a market of the client (no request)
+            AddressRequiredException: Without address on a client without an account
+            HyperliquidException: If Hyperliquid answers in no documented format
+        """
+        self._require_symbol(symbol)
+        answer = self._with_retry(self.info.post, "/info",
+                                  {"type": "activeAssetData", "user": self._address(address), "coin": symbol})
+        leverage = answer.get("leverage") if isinstance(answer, dict) else None
+        kind = leverage.get("type") if isinstance(leverage, dict) else None
+        value = leverage.get("value") if isinstance(leverage, dict) else None
+        if kind not in ("cross", "isolated") or isinstance(value, bool) or not isinstance(value, (int, float, str)):
+            raise HyperliquidException(f"activeAssetData for {symbol} answered in no documented format: {answer!r}")
+        try:
+            number = Decimal(str(value))
+        except InvalidOperation:
+            number = Decimal("NaN")
+        if not number.is_finite() or number <= 0:
+            raise HyperliquidException(f"activeAssetData for {symbol} answered a leverage of {value!r}")
+        return Leverage(type=kind, value=number)
+
+    def get_fee_rates(self, symbol: str, *, address: Optional[str] = None) -> FeeRates:
+        """The fee rates a wallet pays on a perp market, as fractions of an order's value
+        (0.00045 is 0.045 %): taker for an order that takes liquidity (a market order, a
+        triggered stop), maker for one that rests and adds it. Hyperliquid's documented
+        userFees request: userCrossRate and userAddRate, the wallet's tier and discounts.
+
+        On a HIP-3 dex they are scaled as Hyperliquid's fee documentation describes, by the
+        market's growthMode and deployerFeeScale s: growth mode cuts the protocol's fees and
+        rebates to a tenth; the deployer adds s times the protocol's fee (s at most 1), or,
+        above 1, the protocol's fee is raised to the deployer's, so 2 × s times. A maker rebate
+        (a negative rate) is only cut by growth mode. No authentication required.
+
+        Raises:
+            UnknownSymbolException: If the symbol is not a market of the client (no request)
+            AddressRequiredException: Without address on a client without an account
+            HyperliquidException: If Hyperliquid answers in no documented format
+        """
+        self._require_symbol(symbol)
+        spec = self.market_specs.get(symbol, {})
+        answer = self._with_retry(self.info.post, "/info", {"type": "userFees", "user": self._address(address)})
+        try:
+            taker, maker = Decimal(str(answer["userCrossRate"])), Decimal(str(answer["userAddRate"]))
+        except (KeyError, TypeError, InvalidOperation):
+            raise HyperliquidException(f"userFees answered in no documented format: {answer!r}") from None
+        if not taker.is_finite() or not maker.is_finite():
+            raise HyperliquidException(f"userFees answered rates that are no numbers: {answer!r}")
+        dex = _sdk_dex(symbol) or None
+        growth = bool(spec.get("growth_mode"))
+        scale_text = spec.get("deployer_fee_scale")
+        scale = None
+        if dex is not None:  # every HIP-3 market has one (2026-11): without it the fee is not established
+            try:
+                scale = Decimal(str(scale_text)) if scale_text is not None else None
+            except InvalidOperation:
+                scale = None
+            if scale is None or not scale.is_finite() or scale < 0:
+                raise HyperliquidException(f"{symbol}: deployerFeeScale {scale_text!r} is no fee scale, so its "
+                                           "fee rates are not established")
+
+        def scaled(rate: Decimal) -> Decimal:
+            if dex is None:
+                return rate
+            protocol = rate / 10 if growth else rate
+            if rate < 0 or scale is None:  # a rebate: only growth mode applies (scale: set on every HIP-3 dex)
+                return protocol
+            return protocol * (1 + scale) if scale <= 1 else protocol * 2 * scale
+
+        return FeeRates(symbol=symbol, taker=scaled(taker), maker=scaled(maker), dex=dex,
+                        growth_mode=growth if dex is not None else False, deployer_fee_scale=scale)
+
+    def get_perp_dexs(self) -> List[Dict[str, Any]]:
+        """The HIP-3 dexes of the network (the SDK's perp_dexs), the names perp_dexs= takes:
+        [{"name": "xyz", "full_name": "XYZ"}, ...], in Hyperliquid's order. The default dex is
+        not listed. Every dex Hyperliquid lists is in it, also one whose markets are all
+        delisted. No authentication required."""
+        return [{"name": dex["name"], "full_name": dex.get("fullName")}
+                for dex in self._with_retry(self.info.perp_dexs) if dex]
+
+    def _balance_mode(self, address: str) -> str:
+        """The account mode, if a single balance is correct for it ("standard" or "unified")."""
+        mode = self.get_account_mode(address)
+        if mode not in ("standard", "unified"):
+            raise UnsupportedAccountModeException(mode)
+        return mode
+
+    def _spot_usdc_total(self, address: str) -> Decimal:
+        """USDC in the spot account. In unified mode this is the perp collateral, and it
+        already includes the unrealized PnL of every perp position."""
+        response = self._with_retry(self.info.spot_user_state, address)
+        for balance in response.get("balances", []):
+            if balance.get("coin") == "USDC":
+                return Decimal(str(balance.get("total", "0")))
+        return Decimal("0")
+
     def get_perp_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
-        """Get perpetual trading balance for an address.
-        
+        """Get the balance that perp positions trade against, including their unrealized PnL.
+
+        Standard accounts: the account value of the perp account (summed over the client's
+        perp dexes, each holds its own collateral). Unified accounts: the USDC in the spot
+        account, which is shared with spot and already includes the PnL; the perp account
+        figures are only the part of it backing positions.
+
         Args:
             address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
-            simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
-            
+            simple (bool): If True (default), returns just the balance. If False, returns detailed information.
+
         Returns:
-            Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance.
+            Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the balance.
                                           If simple=False, returns a dictionary containing:
-                                          - balance: Total balance in USD
+                                          - balance: The balance in USD
                                           - positions: List of open positions
                                           - margin_used: Current margin usage
                                           - state: Full user state data
+
+        Raises:
+            UnsupportedAccountModeException: For portfolio-margin accounts and unknown account modes.
+            AddressRequiredException: Without address on a client without an account
         """
-        if address is None and not self.is_authenticated():
-            raise ValueError("Address required when client is not authenticated")
-            
-        if address is None:
-            address = self.public_address
-            
-        # Get user state which includes all necessary information
-        user_state = self.get_user_state(address)
-        
+        address = self._address(address)
+
+        return self._perp_balance(address, self._balance_mode(address), simple)
+
+    def _perp_balance(self, address: str, mode: str, simple: bool,
+                      spot_usdc: Optional[Decimal] = None) -> Union[Decimal, Dict[str, Any]]:
+        """`spot_usdc`: the spot USDC already read, so that results agree with that read."""
+        user_state = None if simple and mode == "unified" else self.get_user_state(address)
+        if mode == "unified":
+            balance = self._spot_usdc_total(address) if spot_usdc is None else spot_usdc
+        else:
+            balance = user_state.margin_summary.account_value
+
         if simple:
-            return user_state.margin_summary.account_value
-            
+            return balance
+
         return {
-            'balance': user_state.margin_summary.account_value,
+            'balance': balance,
             'positions': [ap.position for ap in user_state.asset_positions],
             'margin_used': user_state.margin_summary.total_margin_used,
             'state': user_state
@@ -1352,12 +2466,11 @@ class HyperliquidClient:
                                      - total_balance: Total balance in USD
                                      - tokens: Dict of token balances (SpotTokenBalance objects)
                                      - raw_state: Original API response
-        """
-        if address is None and not self.is_authenticated():
-            raise ValueError("Address required when client is not authenticated")
 
-        if address is None:
-            address = self.public_address
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+        """
+        address = self._address(address)
 
         # Get spot user state
         response = self._with_retry(self.info.spot_user_state, address)
@@ -1371,38 +2484,39 @@ class HyperliquidClient:
         token_balances: Dict[str, SpotTokenBalance] = {}
         
         for balance in response.get('balances', []):
-            try:
-                token = balance.get('coin')
-                if not token:
-                    continue
-                    
-                # Get token amount
-                token_amount = Decimal(str(balance.get('total', '0')))
-                if token_amount == 0:
-                    continue
-                    
-                # Get token price (stablecoins default to $1 since they have no perp market)
-                token_price = Decimal(str(prices.get(token, '0')))
-                if token_price == 0 and token.upper() in ('USDC', 'USDT', 'USDC.E', 'USDBC'):
-                    token_price = Decimal('1')
-                
-                # Calculate USD value
-                usd_value = token_amount * token_price
-                total_balance += usd_value
-                
-                # Create SpotTokenBalance object
-                token_balances[token] = SpotTokenBalance(
-                    token=token,
-                    amount=token_amount,
-                    usd_value=usd_value,
-                    price=token_price,
-                    hold=Decimal(str(balance.get('hold', '0'))),
-                    entry_ntl=Decimal(str(balance.get('entryNtl', '0')))
-                )
-                
-            except Exception as e:
-                logger.warning(f"Error processing balance for token {token}: {str(e)}")
+            token = balance.get('coin')
+            if not token:
                 continue
+                
+            # Get token amount
+            token_amount = Decimal(str(balance.get('total', '0')))
+            if token_amount == 0:
+                continue
+                
+            # Price from the perp market; without one, from the token's USDC spot pair
+            # (spot mids are keyed by pair id, e.g. "@107"); stablecoins default to $1
+            token_price = Decimal(str(prices.get(token, '0')))
+            if token_price == 0:
+                spot_coin = self.info.name_to_coin.get(f"{token}/USDC")
+                if spot_coin:
+                    token_price = Decimal(str(prices.get(spot_coin, '0')))
+            if token_price == 0 and token.upper() in ('USDC', 'USDT', 'USDC.E', 'USDBC'):
+                token_price = Decimal('1')
+            
+            # Calculate USD value
+            usd_value = token_amount * token_price
+            total_balance += usd_value
+            
+            # Create SpotTokenBalance object
+            token_balances[token] = SpotTokenBalance(
+                token=token,
+                amount=token_amount,
+                usd_value=usd_value,
+                price=token_price,
+                hold=Decimal(str(balance.get('hold', '0'))),
+                entry_ntl=Decimal(str(balance.get('entryNtl', '0')))
+            )
+            
                 
         if simple:
             return total_balance
@@ -1419,7 +2533,8 @@ class HyperliquidClient:
         """Resolve a token name to its spot pair name recognized by the SDK.
 
         Args:
-            token: Token name (e.g., "PURR", "HYPE")
+            token: Token name (e.g., "PURR", "HYPE") for its USDC pair, or a full pair name
+                (e.g., "HYPE/USDT0")
 
         Returns:
             The pair name (e.g., "PURR/USDC") that exists in info.name_to_coin.
@@ -1430,7 +2545,9 @@ class HyperliquidClient:
         pair = f"{token}/USDC"
         if pair in self.info.name_to_coin:
             return pair
-        raise ValueError(
+        if "/" in token and token in self.info.name_to_coin:
+            return token  # a full pair name, e.g. "HYPE/USDT0"
+        raise UnknownSymbolException(
             f"No spot pair found for '{token}'. "
             f"Try the full pair name (e.g., 'PURR/USDC') or check available spot pairs."
         )
@@ -1449,7 +2566,7 @@ class HyperliquidClient:
     def _format_spot_size(self, pair_name: str, size: float) -> float:
         """Format a size for a spot order."""
         sz_decimals = self._get_spot_sz_decimals(pair_name)
-        return round(size, sz_decimals)
+        return _round_down(size, sz_decimals)
 
     def transfer_to_spot(self, amount: float) -> dict:
         """Transfer USDC from perp wallet to spot wallet.
@@ -1462,17 +2579,7 @@ class HyperliquidClient:
         Returns:
             dict: API response.
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        if amount <= 0:
-            raise ValueError("Amount must be positive")
-        result = self._with_retry(self.exchange.usd_class_transfer, amount, False)
-        if result.get("status") == "err":
-            msg = result.get("response", "unknown error")
-            if "Must deposit" in msg:
-                raise ValueError("Transfer failed: API wallets cannot transfer funds. Use the main wallet's private key.")
-            raise ValueError(f"Transfer failed: {msg}")
-        return result
+        return self._usd_class_transfer(amount, to_perp=False)
 
     def transfer_to_perp(self, amount: float) -> dict:
         """Transfer USDC from spot wallet to perp wallet.
@@ -1485,16 +2592,21 @@ class HyperliquidClient:
         Returns:
             dict: API response.
         """
+        return self._usd_class_transfer(amount, to_perp=True)
+
+    def _usd_class_transfer(self, amount: float, to_perp: bool) -> dict:
+        """Shared implementation of transfer_to_spot and transfer_to_perp."""
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
         if amount <= 0:
-            raise ValueError("Amount must be positive")
-        result = self._with_retry(self.exchange.usd_class_transfer, amount, True)
-        if result.get("status") == "err":
-            msg = result.get("response", "unknown error")
-            if "Must deposit" in msg:
-                raise ValueError("Transfer failed: API wallets cannot transfer funds. Use the main wallet's private key.")
-            raise ValueError(f"Transfer failed: {msg}")
+            raise InvalidArgumentException("Amount must be positive")
+        action = "transfer to perp" if to_perp else "transfer to spot"
+        result = self._signed(action, self.exchange.usd_class_transfer, amount, to_perp)
+        if isinstance(result, dict) and result.get("status") == "err" and "Must deposit" in str(result.get("response")):
+            # Hyperliquid's answer to a transfer signed by an API wallet
+            raise ActionRejectedException(action, f"{result['response']} (API wallets cannot "
+                                          "transfer funds; use the main wallet's private key)")
+        self._action_result(result, action)
         return result
 
     def get_spot_price(self, token: str) -> float:
@@ -1512,7 +2624,7 @@ class HyperliquidClient:
         # Spot mids are keyed by the internal coin name
         price_str = mids.get(coin)
         if price_str is None:
-            raise ValueError(f"No price found for {token} (pair: {pair_name}, coin: {coin})")
+            raise HyperliquidException(f"Hyperliquid has no price for {token} (pair {pair_name}, coin {coin})")
         return float(price_str)
 
     def create_spot_order(
@@ -1522,8 +2634,10 @@ class HyperliquidClient:
         is_buy: bool,
         limit_price: Optional[float] = None,
         post_only: bool = False,
-        time_in_force: Literal["Gtc", "Ioc", "Alo"] = "Gtc",
+        time_in_force: Optional[Literal["Gtc", "Ioc", "Alo"]] = None,
         slippage: Optional[float] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Create a spot order.
 
@@ -1533,14 +2647,28 @@ class HyperliquidClient:
             is_buy (bool): True for buy, False for sell.
             limit_price (Optional[float]): Price for limit orders. None for market.
             post_only (bool): Maker only (limit orders only).
-            time_in_force (str): "Gtc", "Ioc", or "Alo".
+            time_in_force (Optional[str]): "Gtc", "Ioc", or "Alo". Defaults to "Ioc" for a
+                market order (it never rests on the book), else "Gtc", as in create_order().
             slippage (Optional[float]): Slippage for market orders.
+            cloid (Optional[str]): Client order id, see create_order().
 
         Returns:
             Order: Order response.
+
+        Raises:
+            InvalidArgumentException: If size or limit_price is not a positive number, or
+                either is too small for the pair; checked before anything is sent.
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
+        order_cloid = _order_cloid(cloid)
+        if time_in_force is None:
+            time_in_force = "Ioc" if limit_price is None else "Gtc"
+        time_in_force = self._resolve_time_in_force(time_in_force, post_only)
+        if not _positive_number(size):
+            raise InvalidArgumentException(f"size must be a positive number, got {size!r}")
+        if limit_price is not None and not _positive_number(limit_price):
+            raise InvalidArgumentException(f"limit_price must be a positive number, got {limit_price!r}")
 
         pair_name = self._resolve_spot_pair(token)
 
@@ -1548,33 +2676,28 @@ class HyperliquidClient:
         if limit_price is None:
             current_price = self.get_spot_price(token)
             if current_price <= 0:
-                raise ValueError(f"Invalid current price for {token}: {current_price}")
-            effective_slippage = slippage if slippage is not None else self.default_slippage
-            if not 0 < effective_slippage <= 0.5:
-                raise ValueError("slippage must be between 0 (exclusive) and 0.5 (inclusive)")
-            limit_price = current_price * (1 + effective_slippage) if is_buy else current_price * (1 - effective_slippage)
+                raise HyperliquidException(f"Invalid current price for {token}: {current_price}")
+            limit_price = self._with_slippage(current_price, is_buy, slippage)
 
         # Format size and price for spot
         size = self._format_spot_size(pair_name, size)
         limit_price = self._format_spot_price(pair_name, limit_price)
+        if not _positive_number(limit_price):  # rounds to 0, or overflows to infinity
+            raise InvalidArgumentException(f"price rounds to {limit_price} at {token}'s price precision")
 
         sz_decimals = self._get_spot_sz_decimals(pair_name)
         min_size = 1.0 / (10 ** sz_decimals) if sz_decimals > 0 else 1
         if size < min_size:
-            raise ValueError(f"Minimum size for {token} is {min_size} (szDecimals={sz_decimals})")
+            raise InvalidArgumentException(f"Minimum size for {token} is {min_size} (szDecimals={sz_decimals})")
 
         order_type = {"limit": {"tif": time_in_force}}
-        if post_only:
-            if time_in_force == "Ioc":
-                raise ValueError("post_only cannot be used with IOC orders")
-            order_type["limit"]["postOnly"] = True
 
         logger.debug(f"Spot order: pair={pair_name}, size={size}, price={limit_price}, buy={is_buy}")
 
         try:
-            response = self._with_retry(
-                self.exchange.order,
-                name=pair_name,
+            response = self._place_order(
+                pair_name,
+                order_cloid,
                 is_buy=is_buy,
                 sz=size,
                 limit_px=limit_price,
@@ -1583,51 +2706,8 @@ class HyperliquidClient:
             )
 
             logger.debug(f"Spot order response: {response}")
-
-            if isinstance(response, dict):
-                if response.get("status") != "ok":
-                    raise ValueError(f"Order failed with status: {response.get('status')}")
-
-                if "response" in response and "data" in response["response"]:
-                    statuses = response["response"]["data"].get("statuses", [])
-                    if statuses and "error" in statuses[0]:
-                        raise ValueError(f"Order error: {statuses[0]['error']}")
-
-                    if statuses and "resting" in statuses[0]:
-                        order_data = {
-                            "order_id": str(statuses[0]["resting"]["oid"]),
-                            "symbol": token,
-                            "is_buy": is_buy,
-                            "size": str(size),
-                            "order_type": order_type,
-                            "reduce_only": False,
-                            "status": "open",
-                            "time_in_force": time_in_force,
-                            "created_at": int(time.time() * 1000),
-                            "limit_price": str(limit_price),
-                        }
-                        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-                    elif statuses and "filled" in statuses[0]:
-                        filled_sz = statuses[0]["filled"].get("totalSz", size)
-                        order_data = {
-                            "order_id": str(statuses[0]["filled"]["oid"]),
-                            "symbol": token,
-                            "is_buy": is_buy,
-                            "size": str(size),
-                            "filled_size": str(filled_sz),
-                            "average_fill_price": str(statuses[0]["filled"]["avgPx"]),
-                            "order_type": order_type,
-                            "reduce_only": False,
-                            "status": "filled",
-                            "time_in_force": time_in_force,
-                            "created_at": int(time.time() * 1000),
-                            "limit_price": str(limit_price),
-                        }
-                        return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-                else:
-                    raise ValueError(f"Unexpected response structure: {response}")
-
-            raise ValueError(f"Unexpected response format: {type(response)} - {response}")
+            return self._order_from_response(response, token, is_buy, size, limit_price, order_type, False,
+                                             f"{token} spot order", market="spot", cloid=order_cloid)
 
         except ValueError:
             raise
@@ -1642,6 +2722,8 @@ class HyperliquidClient:
         limit_price: Optional[float] = None,
         post_only: bool = False,
         slippage: Optional[float] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Buy a spot token.
 
@@ -1651,6 +2733,7 @@ class HyperliquidClient:
             limit_price (Optional[float]): Price for limit order. None for market order.
             post_only (bool): Maker only (limit orders only).
             slippage (Optional[float]): Slippage for market orders. Overrides default_slippage.
+            cloid (Optional[str]): Client order id, see create_order().
 
         Returns:
             Order: Order response.
@@ -1664,6 +2747,7 @@ class HyperliquidClient:
             post_only=post_only,
             time_in_force=time_in_force,
             slippage=slippage,
+            cloid=cloid,
         )
 
     def spot_sell(
@@ -1673,6 +2757,8 @@ class HyperliquidClient:
         limit_price: Optional[float] = None,
         post_only: bool = False,
         slippage: Optional[float] = None,
+        *,
+        cloid: Optional[str] = None,
     ) -> Order:
         """Sell a spot token.
 
@@ -1682,6 +2768,7 @@ class HyperliquidClient:
             limit_price (Optional[float]): Price for limit order. None for market order.
             post_only (bool): Maker only (limit orders only).
             slippage (Optional[float]): Slippage for market orders. Overrides default_slippage.
+            cloid (Optional[str]): Client order id, see create_order().
 
         Returns:
             Order: Order response.
@@ -1695,6 +2782,7 @@ class HyperliquidClient:
             post_only=post_only,
             time_in_force=time_in_force,
             slippage=slippage,
+            cloid=cloid,
         )
 
     def spot_cancel_order(self, order_id: Union[str, int], token: str) -> bool:
@@ -1705,19 +2793,17 @@ class HyperliquidClient:
             token (str): Token name (e.g., "PURR").
 
         Returns:
-            bool: True if cancelled, False if not found.
+            bool: True if the order was canceled, False if it is not open: never placed,
+                already canceled or filled.
+
+        Raises:
+            AuthenticationRequiredException: If the client has no account
+            OrderException: If the exchange answered, but did not cancel the order
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        pair_name = self._resolve_spot_pair(token)
-        try:
-            self._with_retry(self.exchange.cancel, pair_name, int(order_id))
-            return True
-        except Exception as e:
-            err = str(e).lower()
-            if "not found" in err or "already" in err or "no order" in err:
-                return False
-            raise
+            raise AuthenticationRequiredException()
+        oid = _order_id(order_id)
+        return self._cancel_one(self._resolve_spot_pair(token), oid)
 
     def spot_cancel_all_orders(self, token: Optional[str] = None) -> None:
         """Cancel all open spot orders.
@@ -1730,7 +2816,7 @@ class HyperliquidClient:
             RuntimeError: If any cancellation fails.
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
 
         # Build set of spot coin names
         spot_coins = {coin for coin, asset in self.info.coin_to_asset.items() if asset >= 10000}
@@ -1748,40 +2834,79 @@ class HyperliquidClient:
             return
 
         # Bulk cancel in a single API call
-        cancel_requests = [{"coin": order["coin"], "oid": order["oid"]} for order in spot_orders]
-        self._with_retry(self.exchange.bulk_cancel, cancel_requests)
+        self._cancel_all([{"coin": order["coin"], "oid": order["oid"]} for order in spot_orders])
 
-    def get_spot_open_orders(self, token: Optional[str] = None) -> List[Order]:
+    def _spot_coin_symbols(self) -> Dict[str, str]:
+        """Map each spot coin ("PURR/USDC", "@107") to the symbol this library reports for it.
+
+        Pairs quoted in USDC report the base token name ("PURR"); other pairs report
+        "BASE/QUOTE" ("HYPE/USDT0"). Tokens are looked up by their `index` field, which is
+        not their position in the list.
+        """
+        meta = self._with_retry(self.info.spot_meta)
+        token_names = {token["index"]: token["name"] for token in meta["tokens"]}
+        symbols: Dict[str, str] = {}
+        for pair in meta["universe"]:
+            base, quote = (token_names[index] for index in pair["tokens"])
+            symbols[pair["name"]] = _spot_symbol(base, quote)
+        return symbols
+
+    def get_spot_markets(self) -> List[SpotMarket]:
+        """Every spot pair with its current figures: mark, mid and previous-day price and the
+        day volume, in the quote token. One request.
+
+        The symbol is the one the spot methods take and report: the base token for a pair
+        quoted in USDC ("HYPE"), else "BASE/QUOTE" ("HYPE/USDT0").
+
+        Returns:
+            List[SpotMarket]: In Hyperliquid's order of the pairs.
+        """
+        meta, contexts = self._with_retry(self.info.spot_meta_and_asset_ctxs)
+        tokens = {token["index"]: token for token in meta["tokens"]}
+        # Matched by coin, never by position: Hyperliquid lists the contexts by pair index,
+        # pairs no longer listed included (1190 contexts for 351 pairs, 2026-11-14).
+        by_coin = {context["coin"]: context for context in contexts}
+        markets = []
+        for pair in meta["universe"]:
+            base, quote = (tokens[index] for index in pair["tokens"])
+            context = by_coin[pair["name"]]
+            markets.append(SpotMarket(
+                symbol=_spot_symbol(base["name"], quote["name"]),
+                coin=pair["name"],
+                base=base["name"],
+                quote=quote["name"],
+                size_decimals=base["szDecimals"],
+                mark_price=_decimal(context.get("markPx")),
+                mid_price=_decimal(context.get("midPx")),
+                previous_day_price=_decimal(context.get("prevDayPx")),
+                day_volume=_decimal(context.get("dayNtlVlm")),
+            ))
+        return markets
+
+    def get_spot_open_orders(self, token: Optional[str] = None, *, address: Optional[str] = None) -> List[Order]:
         """Get open spot orders.
 
         Args:
             token (Optional[str]): If provided, only returns orders for this token.
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
 
         Returns:
             List[Order]: List of open spot orders.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+        address = self._address(address)
 
-        # Build set of spot coin names and reverse mapping (coin -> token name)
-        spot_coin_to_token: Dict[str, str] = {}
-        meta = self.info.spot_meta()
-        for pair in meta["universe"]:
-            base_idx = pair["tokens"][0]
-            base_name = meta["tokens"][base_idx]["name"]
-            coin = self.info.name_to_coin.get(f"{base_name}/USDC")
-            if coin:
-                spot_coin_to_token[coin] = base_name
-
-        # Filter to specific token if requested
         if token:
-            pair_name = self._resolve_spot_pair(token)
-            target_coin = self.info.name_to_coin[pair_name]
-            spot_coin_to_token = {target_coin: token}
+            pair = self._resolve_spot_pair(token)  # e.g. "PURR/USDC" for "PURR" or "PURR/USDC"
+            base, quote = pair.split("/", 1)
+            # Reported under the same symbol as without a filter: "PURR", not the "PURR/USDC" asked for.
+            spot_coin_to_token = {self.info.name_to_coin[pair]: _spot_symbol(base, quote)}
+        else:
+            spot_coin_to_token = self._spot_coin_symbols()
 
-        response = self._with_retry(
-            self.info.frontend_open_orders, self.account.public_address
-        )
+        response = self._with_retry(self.info.frontend_open_orders, address)
 
         orders = []
         for order_data in response:
@@ -1789,152 +2914,158 @@ class HyperliquidClient:
             if coin not in spot_coin_to_token:
                 continue
 
-            token_name = spot_coin_to_token[coin]
-            try:
-                order_type = {}
-                if order_data.get("orderType") == "Limit":
-                    order_type["limit"] = {
-                        "tif": order_data.get("tif", "Gtc"),
-                    }
-
-                order = Order(
-                    order_id=str(order_data["oid"]),
-                    symbol=token_name,
-                    is_buy=order_data["side"] == "B",
-                    size=Decimal(str(order_data.get("sz", "0"))),
-                    order_type=from_dict(data_class=OrderType, data=order_type, config=DACITE_CONFIG),
-                    status="open",
-                    time_in_force=order_data.get("tif", "Gtc"),
-                    created_at=order_data.get("timestamp", 0),
-                    limit_price=Decimal(str(order_data.get("limitPx", "0"))),
-                    filled_size=Decimal(str(order_data.get("origSz", "0"))) - Decimal(str(order_data.get("sz", "0"))),
-                    type="limit",
-                )
-                orders.append(order)
-            except Exception as e:
-                logger.warning(f"Failed to parse spot order: {e}")
-                continue
+            order = self._parse_open_order(order_data, spot_coin_to_token[coin], market="spot")
+            orders.append(order)
 
         return orders
 
-    def get_spot_order_book(self, token: str) -> Dict[str, Any]:
+    def get_spot_order_book(self, token: str, *, decimal: bool = False) -> Dict[str, Any]:
         """Get the order book for a spot token.
 
         Args:
             token (str): Token name (e.g., "FRAC", "HYPE").
+            decimal (bool): Prices and sizes as Decimal instead of float (see get_order_book).
 
         Returns:
             Dict[str, Any]: Order book data (same format as get_order_book).
         """
         pair_name = self._resolve_spot_pair(token)
-        return self.get_order_book(pair_name)
+        return self.get_order_book(pair_name, decimal=decimal)
 
-    def get_spot_fills(self, token: Optional[str] = None) -> list:
-        """Get recent spot fills for the authenticated user.
+    def get_spot_fills(self, token: Optional[str] = None, *, address: Optional[str] = None) -> list:
+        """Get recent spot fills of a wallet, by default the client's account.
 
         Args:
             token (Optional[str]): If provided, only returns fills for this token.
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
 
         Returns:
             List[Fill]: List of spot fill objects.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+        address = self._address(address)
 
-        # Build reverse mapping: internal coin name -> token name
-        spot_coin_to_token: Dict[str, str] = {}
-        meta = self.info.spot_meta()
-        for pair in meta["universe"]:
-            base_idx = pair["tokens"][0]
-            base_name = meta["tokens"][base_idx]["name"]
-            coin = self.info.name_to_coin.get(f"{base_name}/USDC")
-            if coin:
-                spot_coin_to_token[coin] = base_name
-                # Also map the human-readable pair name
-                spot_coin_to_token[f"{base_name}/USDC"] = base_name
+        spot_coin_to_token = self._spot_coin_symbols()
+        if token and token.endswith("/USDC"):
+            token = token[: -len("/USDC")]  # USDC pairs are reported by their token name
 
-        raw = self._with_retry(self.info.user_fills, self.public_address)
+        raw = self._with_retry(self.info.user_fills, address)
         fills = []
         for f in raw:
-            coin = f.get("coin", "")
-            if coin not in spot_coin_to_token:
-                continue
             fill = self._parse_fill(f)
-            # Replace internal coin name with token name
-            fill.symbol = spot_coin_to_token[coin]
+            if fill.market != "spot":
+                continue
+            # Named as the other spot methods name it; a pair no longer listed keeps
+            # Hyperliquid's name (e.g. "@98") instead of being dropped.
+            fill.symbol = spot_coin_to_token.get(f["coin"], f["coin"])
             if token and fill.symbol != token:
                 continue
             fills.append(fill)
         return fills
 
-    def get_evm_balance(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
-        """Get EVM chain balance for an address.
+    def get_account_summary(self, address: Optional[str] = None) -> AccountSummary:
+        """An account's balances by its account mode: every collateral balance,
+        every perp dex with its positions, and the totals that hold for the mode.
 
-        Args:
-            address (Optional[str]): The address to get balance for. If None, uses authenticated user's address.
-            simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
+        - unified: the spot balances are the collateral of every dex; account_value is their
+          USD value (USDC already includes the PnL of open positions), available_to_trade is
+          USDC total minus hold. Per-dex account value and withdrawable are None: the dex
+          figures are only the part of the collateral backing its positions.
+        - standard: each dex has its own collateral; account_value adds every dex and the spot
+          balances, available_to_trade is None (see each dex's withdrawable).
+        - portfolio margin and unknown modes: balances and dexes only, every total None.
 
-        Returns:
-            Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance in USD.
-                                          If simple=False, returns a dictionary containing:
-                                          - balance: Total balance in USD
-                                          - state: Full EVM state data
+        Outcome balances (HIP-4) and tokens without a price are listed unpriced and left out
+        of the totals; sources["unpriced"] names them. Only this client's dexes are read
+        (perp_dexs; sources["dexes"]): positions and margin on
+        other HIP-3 dexes are not in the summary, although in unified accounts their PnL is in
+        the USDC. The figures come from separate requests (about 2 + 2 per dex), a moment apart.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
         """
-        if address is None and not self.is_authenticated():
-            raise ValueError("Address required when client is not authenticated")
-            
-        if address is None:
-            address = self.public_address
-            
-        # Get EVM state
-        response = self._with_retry(self.info.evm_state, address)
-        
-        # Calculate total balance
-        total_balance = Decimal(str(response.get('totalBalance', '0')))
-        
-        if simple:
-            return total_balance
-            
-        return {
-            'balance': total_balance,
-            'state': response
-        }
+        address = self._address(address)
+        mode = self.get_account_mode(address)
+        balances = [_collateral(balance) for balance in self.get_spot_balance(address, simple=False).tokens.values()]
+        own_collateral = mode == "standard"  # otherwise the spot account holds every dex's collateral
+        dexes = []
+        for dex in self.perp_dexs:
+            state = self._get_user_state_single(address, dex)
+            dexes.append(DexAccount(
+                dex=dex or None,
+                account_value=state.margin_summary.account_value if own_collateral else None,
+                withdrawable=state.withdrawable if own_collateral else None,
+                margin_used=state.margin_summary.total_margin_used,
+                cross_maintenance_margin_used=state.cross_maintenance_margin_used,
+                positions=[asset.position for asset in state.asset_positions],
+            ))
+        scope = {"dexes": ", ".join(dex or "default" for dex in self.perp_dexs) + " (other dexes are not read)"}
+        unpriced = [b.token for b in balances if b.usd_value is None]
+        if unpriced:
+            scope["unpriced"] = ", ".join(unpriced) + " (not in account_value)"
+        priced = sum((b.usd_value for b in balances if b.usd_value is not None), Decimal(0))
+        margin_used = sum((d.margin_used for d in dexes), Decimal(0))
+        if mode == "unified":
+            usdc = next((b for b in balances if b.token == "USDC"), None)
+            return AccountSummary(
+                mode=mode, account_value=priced, available_to_trade=usdc.available if usdc else Decimal(0),
+                margin_used=margin_used, balances=balances, dexes=dexes, sources={
+                    "account_value": "spot balances at USD prices; USDC includes the PnL of open positions",
+                    "available_to_trade": "USDC total minus hold",
+                    "margin_used": "totalMarginUsed of the dexes read",
+                    **scope,
+                })
+        if mode == "standard":
+            return AccountSummary(
+                mode=mode, account_value=sum((d.account_value or Decimal(0) for d in dexes), priced),
+                available_to_trade=None, margin_used=margin_used, balances=balances, dexes=dexes, sources={
+                    "account_value": "accountValue of every dex plus the spot balances at USD prices",
+                    "available_to_trade": "none for the account: each dex has its own collateral (see withdrawable)",
+                    "margin_used": "totalMarginUsed of the dexes read",
+                    **scope,
+                })
+        return AccountSummary(
+            mode=mode, account_value=None, available_to_trade=None, margin_used=None, balances=balances,
+            dexes=dexes, sources={"totals": f"not established for {mode} accounts; see balances and dexes", **scope})
 
     def get_all_balances(self, address: Optional[str] = None, simple: bool = True) -> Union[Decimal, Dict[str, Any]]:
-        """Get all balances (perp, spot, and EVM) for an address.
-        
+        """Get the total value of an account: perp plus spot balance for standard accounts; the
+        spot balance alone for unified accounts, whose perp collateral is the spot USDC.
+
         Args:
             address (Optional[str]): The address to get balances for. If None, uses authenticated user's address.
             simple (bool): If True (default), returns just the total balance. If False, returns detailed information.
-            
+
         Returns:
             Union[Decimal, Dict[str, Any]]: If simple=True (default), returns just the total balance in USD.
                                           If simple=False, returns a dictionary containing:
-                                          - total_balance: Sum of all balances in USD
-                                          - perp: Perpetual trading balance and details
-                                          - spot: Spot trading balance and details
-                                          - evm: EVM chain balance and details
+                                          - total_balance: Total account value in USD
+                                          - account_mode: "standard" or "unified"
+                                          - perp: get_perp_balance(simple=False); in unified mode its
+                                            balance is part of the spot balance, not added to it
+                                          - spot: get_spot_balance(simple=False)
+
+        Raises:
+            UnsupportedAccountModeException: For portfolio-margin accounts and unknown account modes.
+            AddressRequiredException: Without address on a client without an account
         """
-        if address is None and not self.is_authenticated():
-            raise ValueError("Address required when client is not authenticated")
-            
-        if address is None:
-            address = self.public_address
-            
-        # Get all balances
-        perp = self.get_perp_balance(address, simple=simple)
+        address = self._address(address)
+
+        mode = self._balance_mode(address)
         spot = self.get_spot_balance(address, simple=simple)
-        evm = self.get_evm_balance(address, simple=simple)
-        
-        # Calculate total balance
         if simple:
-            return perp + spot + evm
-            
+            return spot if mode == "unified" else self._perp_balance(address, mode, True) + spot
+
+        usdc = spot.tokens.get("USDC")
+        perp = self._perp_balance(address, mode, False, spot_usdc=usdc.amount if usdc else Decimal("0"))
+        perp_value = perp['balance'] if mode == "standard" else Decimal("0")
         return {
-            'total_balance': perp['balance'] + spot['balance'] + evm['balance'],
+            'total_balance': perp_value + spot.total_balance,
+            'account_mode': mode,
             'perp': perp,
             'spot': spot,
-            'evm': evm
         }
 
     def get_market_info(self, symbol: str = None) -> Union[Dict, List[Dict]]:
@@ -1962,9 +3093,42 @@ class HyperliquidClient:
         if symbol:
             market = next((m for m in markets if m['name'] == symbol), None)
             if not market:
-                raise ValueError(f"Symbol {symbol} not found")
+                raise self._unknown_symbol(symbol)
             return market
 
+        return markets
+
+    def get_markets(self) -> List[Market]:
+        """Every perp market of this client's dexes (perp_dexs, e.g. also xyz:), with
+        its current figures: mark, mid and oracle price, funding, open interest, volume, and
+        whether it is delisted or at its open interest cap. Two requests per dex.
+
+        Returns:
+            List[Market]: In Hyperliquid's order, delisted markets included.
+        """
+        markets: List[Market] = []
+        for dex in self.perp_dexs:
+            with_contexts = self._markets_with_contexts(self.info, dex)
+            capped = set(self._with_retry(self.info.post, "/info", {"type": "perpsAtOpenInterestCap", "dex": dex}))
+            for market, context in with_contexts:
+                markets.append(Market(
+                    symbol=market["name"],
+                    dex=dex or None,
+                    size_decimals=market["szDecimals"],
+                    max_leverage=market["maxLeverage"],
+                    margin_mode=_margin_mode(market),
+                    delisted=bool(market.get("isDelisted", False)),
+                    at_open_interest_cap=(market["name"] in capped
+                                          or (bool(dex) and market["name"].split(":", 1)[-1] in capped)),
+                    mark_price=_decimal(context.get("markPx")),
+                    mid_price=_decimal(context.get("midPx")),
+                    oracle_price=_decimal(context.get("oraclePx")),
+                    previous_day_price=_decimal(context.get("prevDayPx")),
+                    funding=_decimal(context.get("funding")),
+                    premium=_decimal(context.get("premium")),
+                    open_interest=_decimal(context.get("openInterest")),
+                    day_volume_usd=_decimal(context.get("dayNtlVlm")),
+                ))
         return markets
 
     def get_funding_rates(self, symbol: Optional[str] = None, threshold: Optional[float] = None) -> Union[float, List[Dict[str, Any]]]:
@@ -1995,53 +3159,43 @@ class HyperliquidClient:
             high_rates = client.get_funding_rates(threshold=0.0001)
             for rate in high_rates:
                 print(f"{rate['symbol']}: {rate['funding_rate']:.6f}")
+
+        Raises:
+            UnknownSymbolException: If symbol is not a market of this client.
+            HyperliquidException: If Hyperliquid has no predicted funding rate for symbol.
         """
-        try:
-            rates = self._with_retry(self.info.post, "/info", {"type": "predictedFundings"})
+        # predictedFundings: [[coin, [[venue, {"fundingRate": ..., ...}], ...]], ...]
+        rates = self._with_retry(self.info.post, "/info", {"type": "predictedFundings"})
+        market_names = {market['name'] for market in self.get_market_info()}
+        if symbol is not None and symbol not in market_names:
+            raise self._unknown_symbol(symbol)
 
-            # Get market info to map symbols
-            market_info = self.get_market_info()
-            market_names = {market['name'] for market in market_info}
+        funding_data = []
+        for coin, venues in rates:
+            if coin not in market_names:
+                continue
+            funding_rate = next((info["fundingRate"] for venue, info in venues if venue == "HlPerp"), None)
+            if funding_rate is not None:
+                funding_data.append({'symbol': coin, 'funding_rate': float(funding_rate)})
 
-            # Process funding rates
-            funding_data = []
+        # If specific symbol requested, return just that rate
+        if symbol is not None:
+            rate = next((data['funding_rate'] for data in funding_data if data['symbol'] == symbol), None)
+            if rate is None:
+                raise HyperliquidException(f"Hyperliquid has no predicted funding rate for {symbol}")
+            return rate
 
-            for rate in rates:
-                symbol_name = rate[0]
-                if symbol_name in market_names:
-                    funding_rate = None
-                    for item in rate[1]:
-                        if item[0] == 'HlPerp':
-                            funding_rate = item[1]['fundingRate']
-                            break
+        # Apply threshold filter if provided
+        if threshold is not None:
+            funding_data = [
+                data for data in funding_data
+                if abs(data['funding_rate']) >= abs(threshold)
+            ]
 
-                    if funding_rate is not None:
-                        funding_data.append({
-                            'symbol': symbol_name,
-                            'funding_rate': float(funding_rate)
-                        })
+        # Sort by funding rate: highest positive to lowest negative
+        funding_data.sort(key=lambda x: x['funding_rate'], reverse=True)
 
-            # If specific symbol requested, return just that rate
-            if symbol is not None:
-                for data in funding_data:
-                    if data['symbol'] == symbol:
-                        return data['funding_rate']
-                raise ValueError(f"Symbol {symbol} not found in funding rates")
-
-            # Apply threshold filter if provided
-            if threshold is not None:
-                funding_data = [
-                    data for data in funding_data
-                    if abs(data['funding_rate']) >= abs(threshold)
-                ]
-
-            # Sort by funding rate: highest positive to lowest negative
-            funding_data.sort(key=lambda x: x['funding_rate'], reverse=True)
-
-            return funding_data
-
-        except (KeyError, IndexError, ValueError) as e:
-            raise ValueError(f"Failed to parse funding rates response: {str(e)}")
+        return funding_data
 
     def cancel_all(self) -> None:
         """Cancel all open orders across all symbols.
@@ -2050,85 +3204,90 @@ class HyperliquidClient:
         """
         return self.cancel_all_orders()
 
-    def _fetch_market_specs(self) -> Dict[str, Dict]:
-        """Fetch current market specifications from the API using meta_and_asset_ctxs for richer data."""
+    def _markets_with_contexts(self, info: Info, dex: str) -> List[Tuple[Dict[str, Any], Dict[str, Any]]]:
+        """(market, context) for each market of `dex`, in Hyperliquid's order, from one
+        metaAndAssetCtxs request. Failures (after the retries) and answers that are not in the
+        documented format ([meta, one context per market]) are raised as they are."""
+        meta, contexts = self._with_retry(info.post, "/info", {"type": "metaAndAssetCtxs", "dex": dex})
+        return list(zip(meta["universe"], contexts, strict=True))
+
+    def _fetch_market_specs(self, info: Optional[Info] = None) -> Dict[str, Dict]:
+        """Fetch current market specifications from the API using meta_and_asset_ctxs for richer
+        data, through `info` (default: the client's)."""
+        info = self.info if info is None else info
         specs = {}
 
         for dex in self.perp_dexs:
-            try:
-                response = self.info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
-                meta = response[0]
-                ctxs = response[1] if len(response) > 1 else []
-            except Exception:
-                try:
-                    meta = self.info.meta(dex=dex)
-                    ctxs = []
-                except Exception:
-                    continue
-
-            universe = meta.get('universe', meta) if isinstance(meta, dict) else meta
-
-            for i, market in enumerate(universe):
-                spec = {
-                    "size_decimals": market.get('szDecimals', 3),
+            # Every dex or none: a skipped dex would leave its markets unknown, or formatted with
+            # wrong size decimals.
+            for market, ctx in self._markets_with_contexts(info, dex):
+                specs[market["name"]] = {
+                    "size_decimals": market["szDecimals"],
                     "price_decimals": market.get('px_dps', 1),
-                    "max_leverage": market.get('maxLeverage', 50),
+                    "max_leverage": market["maxLeverage"],
                     "only_isolated": market.get('onlyIsolated', False),
+                    "margin_mode": _margin_mode(market),
+                    # HIP-3 markets: fees in growth mode are a tenth; the deployer's share on top
+                    "growth_mode": market.get("growthMode") == "enabled",
+                    "deployer_fee_scale": market.get("deployerFeeScale"),
+                    "funding": ctx.get("funding"),
+                    "open_interest": ctx.get("openInterest"),
+                    "mark_price": ctx.get("markPx"),
                 }
-                if i < len(ctxs) and isinstance(ctxs[i], dict):
-                    spec["funding"] = ctxs[i].get("funding")
-                    spec["open_interest"] = ctxs[i].get("openInterest")
-                    spec["mark_price"] = ctxs[i].get("markPx")
-                specs[market['name']] = spec
 
         if not specs:
             raise RuntimeError("Failed to fetch market specs from any dex")
         return specs
 
     def refresh_market_specs(self) -> Dict[str, Dict]:
-        """Refresh market specifications from the API.
+        """Reload the market metadata, so markets listed since the client was created can be
+        traded: the SDK's symbol tables (a new Info, built as when the client is created) and
+        the market specs (size decimals, max leverage, margin mode).
+
+        Nothing reloads on its own; call this in a long-running program when markets were
+        listed. The client changes only once everything is loaded: a failure raises
+        (NetworkException, ...) and leaves the client as it was.
 
         Returns:
-            Dict[str, Dict]: Updated market specs.
+            Dict[str, Dict]: The new market specs.
         """
-        try:
-            self.market_specs = self._fetch_market_specs()
-            self._market_specs_fetched_at = time.time()
-            HyperliquidClient._cached_market_specs = self.market_specs
-            HyperliquidClient._cached_market_specs_at = self._market_specs_fetched_at
-        except Exception as e:
-            logger.warning(f"Failed to refresh market specs: {e}. Keeping existing specs.")
-        return self.market_specs
+        info = self._new_info()
+        meta, spot_meta = self._startup_metadata(info)
+        specs = self._fetch_market_specs(info)
+        # The previous Info is not closed: a request of another thread may still use it.
+        self.info, self._meta, self._spot_meta = info, meta, spot_meta
+        if hasattr(self, "exchange"):
+            self.exchange.info = info
+        self._store_market_specs(specs)
+        return specs
 
-    def _ensure_fresh_market_specs(self) -> None:
-        """Auto-refresh market specs if older than 1 hour."""
-        if time.time() - self._market_specs_fetched_at > self._CACHE_TTL:
-            try:
-                self.market_specs = self._fetch_market_specs()
-                self._market_specs_fetched_at = time.time()
-                HyperliquidClient._cached_market_specs = self.market_specs
+    def _store_market_specs(self, specs: Dict[str, Dict]) -> None:
+        """Use freshly fetched specs, and share them if the cache holds this client's network
+        and dex list."""
+        self.market_specs = specs
+        self._market_specs_fetched_at = time.time()
+        with HyperliquidClient._cache_lock:
+            if HyperliquidClient._cached_key == self._cache_key:
+                HyperliquidClient._cached_meta = self._meta
+                HyperliquidClient._cached_spot_meta = self._spot_meta
+                HyperliquidClient._cached_market_specs = specs
                 HyperliquidClient._cached_market_specs_at = self._market_specs_fetched_at
-                logger.debug("Auto-refreshed stale market specs")
-            except Exception as e:
-                logger.warning(f"Failed to auto-refresh market specs: {e}")
 
-    def get_stop_loss_price(self, symbol: str) -> Optional[Decimal]:
+    def get_stop_loss_price(self, symbol: str, *, address: Optional[str] = None) -> Optional[Decimal]:
         """Get the stop loss price for a specific symbol.
-        
+
         Args:
             symbol (str): Trading pair symbol (e.g., "BTC")
-            
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
             Optional[Decimal]: The stop loss price if a stop loss order exists, None otherwise
-            
+
         Raises:
-            RuntimeError: If client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-            
         # Get all open orders for the symbol
-        open_orders = self.get_open_orders(symbol)
+        open_orders = self.get_open_orders(symbol, address=address)
         
         # Filter for stop loss orders
         sl_orders = [order for order in open_orders if order.type == "stop_loss"]
@@ -2140,22 +3299,20 @@ class HyperliquidClient:
         # If there are multiple stop loss orders, this returns the first one
         return sl_orders[0].trigger_price
     
-    def get_take_profit_price(self, symbol: str) -> Optional[Decimal]:
+    def get_take_profit_price(self, symbol: str, *, address: Optional[str] = None) -> Optional[Decimal]:
         """Get the take profit price for a given symbol.
-        
+
         Args:
             symbol (str): The trading symbol to check
-            
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
             Optional[Decimal]: The trigger price of the first take profit order found, or None if no take profit order exists
-            
+
         Raises:
-            RuntimeError: If the client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to get take profit price")
-            
-        orders = self.get_open_orders(symbol)
+        orders = self.get_open_orders(symbol, address=address)
         tp_orders = [order for order in orders if order.type == "take_profit"]
         
         if not tp_orders:
@@ -2163,69 +3320,73 @@ class HyperliquidClient:
             
         return tp_orders[0].trigger_price
         
-    def has_position(self, symbol: str) -> bool:
-        """Check if the user has an open position for the given symbol.
-        
+    def has_position(self, symbol: str, *, address: Optional[str] = None) -> bool:
+        """Check if a wallet has an open position for the given symbol.
+
         Args:
             symbol (str): The trading symbol to check
-            
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
             bool: True if a position exists, False otherwise
-            
+
         Raises:
-            RuntimeError: If the client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to check positions")
-            
-        positions = self.get_positions()
+        positions = self.get_positions(address=address)
         return any(p.symbol == symbol and p.size != 0 for p in positions)
     
-    def get_position_size(self, symbol: str) -> Optional[Decimal]:
+    def get_position_size(self, symbol: str, *, address: Optional[str] = None) -> Optional[Decimal]:
         """Get the size of a position for a given symbol.
-        
+
         Args:
             symbol: The trading symbol (e.g., "BTC")
-            
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
             The position size as a Decimal, or None if no position exists
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
         """
-        positions = self.get_positions()
+        positions = self.get_positions(address=address)
         position = next((p for p in positions if p.symbol == symbol), None)
         if position is None:
             return None
         return position.size
         
-    def get_position_direction(self, symbol: str) -> Optional[str]:
+    def get_position_direction(self, symbol: str, *, address: Optional[str] = None) -> Optional[str]:
         """Get the direction of a position for a given symbol.
-        
+
         Args:
             symbol: The trading symbol (e.g., "BTC")
-            
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
             "long" if position size is positive, "short" if negative, None if no position exists
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
         """
-        position_size = self.get_position_size(symbol)
+        position_size = self.get_position_size(symbol, address=address)
         if position_size is None:
             return None
         return "long" if float(position_size) > 0 else "short"
         
-    def has_active_orders(self, symbol: Optional[str] = None) -> bool:
+    def has_active_orders(self, symbol: Optional[str] = None, *, address: Optional[str] = None) -> bool:
         """Check if there are any active orders for the given symbol.
-        
+
         Args:
             symbol (Optional[str]): The trading symbol to check
-            
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
         Returns:
             bool: True if there are active orders, False otherwise
-            
+
         Raises:
-            RuntimeError: If the client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to check active orders")
-            
-        orders = self.get_open_orders(symbol)
+        orders = self.get_open_orders(symbol, address=address)
         return len(orders) > 0
         
     def calculate_position_size(self, symbol: str, risk_amount: Decimal, stop_loss_price: Decimal) -> Decimal:
@@ -2244,7 +3405,7 @@ class HyperliquidClient:
             RuntimeError: If the client is not authenticated
         """
         if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to calculate position size")
+            raise AuthenticationRequiredException()
             
         # Get current price
         current_price = Decimal(str(self.get_price(symbol)))
@@ -2255,7 +3416,7 @@ class HyperliquidClient:
         elif current_price < stop_loss_price:  # Short position
             risk_per_unit = stop_loss_price - current_price
         else:
-            raise ValueError("Stop loss price cannot be equal to current price")
+            raise InvalidArgumentException("Stop loss price cannot be equal to current price")
             
         # Calculate position size
         position_size = risk_amount / risk_per_unit
@@ -2271,7 +3432,7 @@ class HyperliquidClient:
         
     def modify_order(
         self,
-        order_id: str,
+        order_id: Union[int, str],
         symbol: str,
         is_buy: bool,
         size: float,
@@ -2282,7 +3443,7 @@ class HyperliquidClient:
         """Modify an existing order.
         
         Args:
-            order_id (str): The ID of the order to modify
+            order_id (Union[int, str]): The ID of the order to modify
             symbol (str): Trading pair symbol (e.g., "BTC")
             is_buy (bool): True for buy orders, False for sell orders
             size (float): New order size
@@ -2291,209 +3452,140 @@ class HyperliquidClient:
             reduce_only (bool): Whether the order should only reduce position
             
         Returns:
-            Order: Updated order response
-            
+            Order: The order after the modify: open, or filled if the new price matched at once
+
         Raises:
             RuntimeError: If client is not authenticated
-            ValueError: If order modification fails
+            ValueError: If the exchange rejected the modify (its text is in the message)
+            ActionOutcomeUnknownException: If the modify was sent but its outcome is unknown;
+                check the order with get_order_status() before trying again
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
             
-        # Validate and format size and price
+        oid = _order_id(order_id)
         size, price = self._validate_and_format_order(symbol, size, price)
-        
-        try:
-            # Convert order_id to integer as required by the SDK
-            oid = int(order_id)
-            response = self._with_retry(
-                self.exchange.modify_order,
-                oid=oid,
-                name=symbol,
-                is_buy=is_buy,
-                sz=size,
-                limit_px=price,
-                order_type=order_type,
-                reduce_only=reduce_only,
-            )
-            
-            # Check for error response
-            if isinstance(response, dict):
-                if response.get("status") != "ok":
-                    raise ValueError(f"Failed to modify order: {response}")
-                
-                statuses = response.get("response", {}).get("data", {}).get("statuses", [{}])[0]
-                if "error" in statuses:
-                    raise ValueError(f"Order modification error: {statuses['error']}")
-                
-                # Format response data
-                if "resting" in statuses:
-                    # For limit orders
-                    order_data = {
-                        "order_id": str(statuses["resting"]["oid"]),
-                        "symbol": symbol,
-                        "is_buy": is_buy,
-                        "size": str(size),
-                        "order_type": order_type,
-                        "reduce_only": reduce_only,
-                        "status": "open",
-                        "time_in_force": order_type.get("limit", {}).get("tif", "Gtc") if "limit" in order_type else "Gtc",
-                        "created_at": int(time.time() * 1000),
-                        "limit_price": str(price)
-                    }
-                    
-                    # Add type field based on order_type
-                    if "trigger" in order_type:
-                        if order_type["trigger"].get("tpsl") == "tp":
-                            order_data["type"] = "take_profit"
-                            order_data["trigger_price"] = str(price)
-                        elif order_type["trigger"].get("tpsl") == "sl":
-                            order_data["type"] = "stop_loss"
-                            order_data["trigger_price"] = str(price)
-                    else:
-                        order_data["type"] = "limit"
-                    
-                    return from_dict(data_class=Order, data=order_data, config=DACITE_CONFIG)
-            
-            raise ValueError("Unexpected response format")
-            
-        except Exception as e:
-            raise ValueError(f"Failed to modify order: {str(e)}")
+        response = self._signed(
+            f"{symbol} order modify",
+            self.exchange.modify_order,
+            oid=oid,
+            name=symbol,
+            is_buy=is_buy,
+            sz=size,
+            limit_px=price,
+            order_type=order_type,
+            reduce_only=reduce_only,
+        )
+        # Read like the answer to an order: resting, filled (the new price matched at once) or error.
+        return self._order_from_response(response, symbol, is_buy, size, price, order_type, reduce_only,
+                                         f"{symbol} order modify")
 
     def update_stop_loss(self, symbol: str, new_price: float) -> Optional[Order]:
-        """Update the stop loss price for an existing position.
+        """Move the stop loss of an existing position to a new trigger price.
 
-        Tries to modify the existing stop loss order in place. If modification
-        fails (e.g. exchange rejects it), falls back to cancelling the old
-        order and creating a new one.
-
-        If no stop loss order exists yet, creates one automatically using the
-        current position size and direction.
+        Places the new stop loss first, sized to the live position, then cancels the old stop
+        loss orders, so the position is never left without one. If the new order is rejected
+        or its outcome is unknown, the old orders stay in place and the error is raised. If no
+        stop loss exists yet, one is created.
 
         Args:
             symbol (str): The trading symbol
             new_price (float): The new stop loss trigger price
 
         Returns:
-            Optional[Order]: The updated or newly created stop loss order
+            Optional[Order]: The new stop loss order
 
         Raises:
-            RuntimeError: If the client is not authenticated
+            AuthenticationRequiredException: If the client has no account
+            PositionNotFoundException: If there is no position in `symbol`
+            ProtectionReplacementIncompleteException: If the new order was placed but does not
+                cover the whole position (it executed at once, partly, or the position grew), or
+                that could not be checked, also when there was no old one; or an old one could
+                not be canceled
         """
         if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to update stop loss")
+            raise AuthenticationRequiredException()
+        return self._replace_protection(symbol, new_price, "stop_loss")
 
-        position_size = abs(float(self.get_position_size(symbol)))
-
-        open_orders = self.get_open_orders(symbol)
-        sl_orders = [order for order in open_orders if order.type == "stop_loss"]
-
-        if not sl_orders:
-            position_direction = self.get_position_direction(symbol)
-            is_buy = position_direction == "short"
-            return self.stop_loss(symbol, position_size, new_price, is_buy=is_buy)
-
-        sl_order = sl_orders[0]
-
-        order_type = {
-            "trigger": {
-                "triggerPx": new_price,
-                "isMarket": True,
-                "tpsl": "sl"
-            }
-        }
-
-        try:
-            return self.modify_order(
-                order_id=sl_order.order_id,
-                symbol=symbol,
-                is_buy=sl_order.is_buy,
-                size=float(sl_order.size),
-                price=new_price,
-                order_type=order_type,
-                reduce_only=True
-            )
-        except Exception as e:
-            logging.warning(f"Failed to modify stop loss order, falling back to cancel and create: {str(e)}")
-
-            for order in sl_orders:
-                try:
-                    self._with_retry(self.exchange.cancel, symbol, int(order.order_id))
-                    time.sleep(0.5)
-                except Exception as e:
-                    logging.warning(f"Failed to cancel stop loss order {order.order_id}: {str(e)}")
-
-            position_direction = self.get_position_direction(symbol)
-            is_buy = position_direction == "short"
-            return self.stop_loss(symbol, position_size, new_price, is_buy=is_buy)
-        
     def update_take_profit(self, symbol: str, new_price: float) -> Optional[Order]:
-        """Update the take profit price for an existing position.
+        """Move the take profit of an existing position to a new trigger price.
 
-        Tries to modify the existing take profit order in place. If modification
-        fails (e.g. exchange rejects it), falls back to cancelling the old
-        order and creating a new one.
-
-        If no take profit order exists yet, creates one automatically using the
-        current position size and direction.
+        Places the new take profit first, sized to the live position, then cancels the old
+        take profit orders. If the new order is rejected or its outcome is unknown, the old
+        orders stay in place and the error is raised. If no take profit exists yet, one is
+        created.
 
         Args:
             symbol (str): The trading symbol
             new_price (float): The new take profit trigger price
 
         Returns:
-            Optional[Order]: The updated or newly created take profit order
+            Optional[Order]: The new take profit order
 
         Raises:
-            RuntimeError: If the client is not authenticated
+            AuthenticationRequiredException: If the client has no account
+            PositionNotFoundException: If there is no position in `symbol`
+            ProtectionReplacementIncompleteException: If the new order was placed but does not
+                cover the whole position (it executed at once, partly, or the position grew), or
+                that could not be checked, also when there was no old one; or an old one could
+                not be canceled
         """
         if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to update take profit")
+            raise AuthenticationRequiredException()
+        return self._replace_protection(symbol, new_price, "take_profit")
 
-        position_size = abs(float(self.get_position_size(symbol)))
+    def _replace_protection(self, symbol: str, new_price: float, kind: str) -> Order:
+        """Shared implementation of update_stop_loss and update_take_profit.
 
-        open_orders = self.get_open_orders(symbol)
-        tp_orders = [order for order in open_orders if order.type == "take_profit"]
+        Modify is not used: it cannot change trigger orders under the exchange's
+        always-place rule, and a modify whose response is lost cannot be told apart from
+        one that failed.
+        """
+        # One replacement at a time per signing key: two concurrent ones would both cancel the
+        # same old order and leave two new ones.
+        with _signer_state(self.exchange_account.address).operation_lock:
+            position = next((p for p in self.get_positions() if p.symbol == symbol and p.size != 0), None)
+            if position is None:
+                raise PositionNotFoundException(f"No position found for {symbol}")
+            old_orders = [order for order in self.get_open_orders(symbol) if order.type == kind]
 
-        if not tp_orders:
-            position_direction = self.get_position_direction(symbol)
-            is_buy = position_direction == "short"
-            return self.take_profit(symbol, position_size, new_price, is_buy=is_buy)
+            place = self.stop_loss if kind == "stop_loss" else self.take_profit
+            new_order = place(symbol, abs(float(position.size)), new_price)
 
-        tp_order = tp_orders[0]
+            # The new order must protect the whole position now: it may have executed at once
+            # (partly), or the position may have grown meanwhile. Only then are the old orders
+            # removed; without old orders, a gap is reported all the same.
+            old_ids = [o.order_id for o in old_orders]
+            kept = "were kept: " if old_ids else ""
+            try:
+                position = next(
+                    (p for p in self.get_positions() if p.symbol == symbol and p.size != 0), None
+                )
+            except Exception as exc:
+                raise ProtectionReplacementIncompleteException(
+                    new_order, old_ids,
+                    f"{kept}the position could not be read to check the new order covers it",
+                ) from exc
+            if position is not None and not (
+                new_order.status == "open" and new_order.size >= abs(position.size)
+                and new_order.is_buy == position.is_short  # still the closing side: it may have flipped
+            ):
+                raise ProtectionReplacementIncompleteException(
+                    new_order, old_ids, f"{kept}the new order does not cover the whole position",
+                    position=position,
+                )
 
-        order_type = {
-            "trigger": {
-                "triggerPx": new_price,
-                "isMarket": True,
-                "tpsl": "tp"
-            }
-        }
-
-        try:
-            return self.modify_order(
-                order_id=tp_order.order_id,
-                symbol=symbol,
-                is_buy=tp_order.is_buy,
-                size=float(tp_order.size),
-                price=new_price,
-                order_type=order_type,
-                reduce_only=True
-            )
-        except Exception as e:
-            logging.warning(f"Failed to modify take profit order, falling back to cancel and create: {str(e)}")
-
-            for order in tp_orders:
+            not_canceled = []
+            for order in old_orders:
                 try:
-                    self._with_retry(self.exchange.cancel, symbol, int(order.order_id))
-                    time.sleep(0.5)
-                except Exception as e:
-                    logging.warning(f"Failed to cancel take profit order {order.order_id}: {str(e)}")
+                    self._cancel_one(symbol, order.order_id)
+                except Exception as exc:
+                    logger.warning(f"Failed to cancel old {kind} order {order.order_id} for {symbol}: {exc}")
+                    not_canceled.append(order.order_id)
+            if not_canceled:
+                raise ProtectionReplacementIncompleteException(new_order, not_canceled)
+            return new_order
 
-            position_direction = self.get_position_direction(symbol)
-            is_buy = position_direction == "short"
-            return self.take_profit(symbol, position_size, new_price, is_buy=is_buy)
-        
     def trailing_stop(self, symbol: str, trail_percent: float) -> Optional[Order]:
         """Set a stop loss at a percentage distance from the current price.
 
@@ -2516,7 +3608,7 @@ class HyperliquidClient:
             RuntimeError: If the client is not authenticated
         """
         if not self.is_authenticated():
-            raise RuntimeError("Client must be authenticated to set trailing stop")
+            raise AuthenticationRequiredException()
             
         # Get current price
         current_price = self.get_price(symbol)
@@ -2537,7 +3629,8 @@ class HyperliquidClient:
         # Update stop loss using the improved method
         return self.update_stop_loss(symbol, new_stop_price)
 
-    def get_open_order_by_id(self, symbol: str, order_id: Union[str, int]) -> Optional[Order]:
+    def get_open_order_by_id(self, symbol: str, order_id: Union[str, int], *,
+                             address: Optional[str] = None) -> Optional[Order]:
         """Find an open order by its ID.
 
         Only searches currently open orders. Returns None if the order is
@@ -2547,46 +3640,47 @@ class HyperliquidClient:
         Args:
             symbol (str): The trading symbol
             order_id (Union[str, int]): The order ID to find
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
 
         Returns:
             Optional[Order]: The open order if found, None otherwise
 
         Raises:
-            RuntimeError: If the client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("Client is not authenticated")
-
-        oid = str(order_id)
-        orders = self.get_open_orders(symbol)
+        oid = _order_id(order_id)
+        orders = self.get_open_orders(symbol, address=address)
         for order in orders:
             if order.order_id == oid:
                 return order
         return None
 
     def close_all_positions(self) -> Dict[str, Order]:
-        """Close all open positions.
-        
+        """Close all open positions, each with close().
+
+        Every position is tried, also after one fails to close.
+
         Returns:
-            Dict[str, Order]: A dictionary mapping symbols to close orders
-            
+            Dict[str, Order]: The closing order per symbol, when every position closed.
+
         Raises:
             RuntimeError: If the client is not authenticated
+            ClosePositionsIncompleteException: If a position was not (fully) closed; it carries
+                the orders that went through (``closed``) and the error per symbol (``failed``)
         """
         if not self.is_authenticated():
-            raise RuntimeError("Client is not authenticated")
-            
-        positions = self.get_positions()
-        results = {}
-        
-        for position in positions:
+            raise AuthenticationRequiredException()
+
+        closed: Dict[str, Order] = {}
+        failed: Dict[str, Exception] = {}
+        for position in self.get_positions():
             try:
-                close_order = self.close(position.symbol, position)
-                results[position.symbol] = close_order
-            except Exception as e:
-                logging.error(f"Failed to close position for {position.symbol}: {str(e)}")
-                
-        return results
+                closed[position.symbol] = self.close(position.symbol, position)
+            except Exception as error:  # reported below, after the other positions were tried
+                failed[position.symbol] = error
+        if failed:
+            raise ClosePositionsIncompleteException(closed, failed)
+        return closed
 
     def cancel_order(self, order_id: Union[str, int], symbol: str) -> bool:
         """Cancel a specific order by order ID and symbol.
@@ -2596,37 +3690,51 @@ class HyperliquidClient:
             symbol (str): The symbol the order is for
 
         Returns:
-            bool: True if order was successfully cancelled, False if order was
-                  not found or already processed.
+            bool: True if the order was canceled, False if it is not open: never placed,
+                already canceled or filled.
 
         Raises:
-            RuntimeError: If client is not authenticated
-            Exception: On network errors, auth failures, or other unexpected errors
+            AuthenticationRequiredException: If the client has no account
+            OrderException: If the exchange answered, but did not cancel the order
+            HyperliquidException: If the cancel could not be sent (NetworkException, ...)
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
 
-        oid = int(order_id)
-        try:
-            self._with_retry(self.exchange.cancel, symbol, oid)
+        canceled = self._cancel_one(symbol, _order_id(order_id))
+        if canceled:
             logger.info(f"Successfully cancelled order {order_id} for {symbol}")
-            return True
-        except Exception as e:
-            error_str = str(e).lower()
-            # Only return False for "order doesn't exist" type errors
-            if any(phrase in error_str for phrase in [
-                "not found", "unknown oid", "already", "no order"
-            ]):
-                logger.info(f"Order {order_id} for {symbol} not found or already processed")
-                return False
-            # Re-raise real errors (network, auth, etc.)
-            raise
+        else:
+            logger.info(f"Order {order_id} for {symbol} not found or already processed")
+        return canceled
 
-    def get_order_book(self, symbol: str) -> Dict[str, Any]:
+    def cancel_order_by_cloid(self, cloid: str, symbol: str) -> bool:
+        """Cancel an order by the client order id it was placed with (the SDK's cancel_by_cloid).
+
+        Args:
+            cloid (str): The order's client order id, "0x" and 32 hex digits (Order.cloid)
+            symbol (str): The symbol the order is for
+
+        Returns:
+            bool: True if the order was canceled, False if it is not open: never placed,
+                already canceled or filled.
+
+        Raises:
+            AuthenticationRequiredException: If the client has no account
+            InvalidArgumentException: If cloid is not 0x followed by 32 hex digits
+            OrderException: If the exchange answered, but did not cancel the order
+        """
+        if not self.is_authenticated():
+            raise AuthenticationRequiredException()
+        return self._cancel_one(symbol, _cloid(cloid))
+
+    def get_order_book(self, symbol: str, *, decimal: bool = False) -> Dict[str, Any]:
         """Get the current order book (L2 snapshot) for a symbol.
 
         Args:
             symbol (str): Trading pair symbol (e.g., "BTC")
+            decimal (bool): Prices, sizes, spread and mid as Decimal, exactly as Hyperliquid
+                sends them, instead of float (which can lose digits of large, fine sizes).
 
         Returns:
             Dict[str, Any]: Order book data with the following structure:
@@ -2642,26 +3750,19 @@ class HyperliquidClient:
                 }
 
         Raises:
-            ValueError: If order book response structure is invalid
+            UnknownSymbolException: If symbol is not a market of this client.
         """
+        self._require_symbol(symbol)
         l2_data = self._with_retry(self.info.l2_snapshot, symbol)
-
-        if not isinstance(l2_data, dict) or "levels" not in l2_data:
-            raise ValueError(f"Invalid order book response for {symbol}")
-
-        levels = l2_data.get("levels", [])
-        if len(levels) < 2:
-            raise ValueError(f"Insufficient order book levels for {symbol}")
-
-        bids_raw = levels[0]
-        asks_raw = levels[1]
+        bids_raw, asks_raw = l2_data["levels"]  # l2Book: levels = [bids, asks], each possibly empty
+        number: Callable[[str], Any] = (lambda text: Decimal(str(text))) if decimal else float
 
         bids = []
         for bid in bids_raw:
             if isinstance(bid, dict) and "px" in bid and "sz" in bid:
                 bids.append({
-                    "price": float(bid["px"]),
-                    "size": float(bid["sz"]),
+                    "price": number(bid["px"]),
+                    "size": number(bid["sz"]),
                     "num_orders": bid.get("n", 0),
                 })
 
@@ -2669,8 +3770,8 @@ class HyperliquidClient:
         for ask in asks_raw:
             if isinstance(ask, dict) and "px" in ask and "sz" in ask:
                 asks.append({
-                    "price": float(ask["px"]),
-                    "size": float(ask["sz"]),
+                    "price": number(ask["px"]),
+                    "size": number(ask["sz"]),
                     "num_orders": ask.get("n", 0),
                 })
 
@@ -2712,13 +3813,14 @@ class HyperliquidClient:
             float: Optimal limit price
             
         Raises:
-            ValueError: If parameters are invalid or order book data is unavailable
+            InvalidArgumentException: If side or urgency_factor is invalid
+            UnknownSymbolException: If symbol is not a market of this client
         """
         if side not in ["buy", "sell"]:
-            raise ValueError("side must be 'buy' or 'sell'")
+            raise InvalidArgumentException("side must be 'buy' or 'sell'")
 
         if not 0.0 <= urgency_factor <= 1.0:
-            raise ValueError("urgency_factor must be between 0.0 and 1.0")
+            raise InvalidArgumentException("urgency_factor must be between 0.0 and 1.0")
 
         if bbo_cache is not None and symbol in bbo_cache:
             cached = bbo_cache[symbol]
@@ -2780,16 +3882,26 @@ class HyperliquidClient:
 
         Raises:
             RuntimeError: If client is not authenticated
-            ValueError: If leverage is invalid
+            ValueError: If leverage is invalid, the market does not allow cross margin
+                (is_cross=True on an isolated-only market), or the exchange rejects the update
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
+        self._require_symbol(symbol)  # else the SDK fails with a bare KeyError while signing
         if leverage < 1:
-            raise ValueError("Leverage must be >= 1")
+            raise InvalidArgumentException("Leverage must be >= 1")
         max_lev = self.market_specs.get(symbol, {}).get("max_leverage")
         if max_lev and leverage > int(max_lev):
-            raise ValueError(f"Max leverage for {symbol} is {max_lev}")
-        return self._with_retry(self.exchange.update_leverage, leverage, symbol, is_cross)
+            raise InvalidArgumentException(f"Max leverage for {symbol} is {max_lev}")
+        margin_mode = self.market_specs.get(symbol, {}).get("margin_mode", "cross")
+        if is_cross and margin_mode != "cross":
+            raise InvalidArgumentException(
+                f"{symbol} does not allow cross margin (margin mode {margin_mode}); "
+                "use is_cross=False"
+            )
+        result = self._signed("leverage update", self.exchange.update_leverage, leverage, symbol, is_cross, idempotent=True)
+        self._action_result(result, f"{symbol} leverage update")
+        return result
 
     def add_isolated_margin(self, symbol: str, amount: float) -> dict:
         """Add margin to an isolated position.
@@ -2803,10 +3915,17 @@ class HyperliquidClient:
 
         Raises:
             RuntimeError: If client is not authenticated
+            ValueError: If amount is not greater than zero. The exchange treats a negative
+                amount as removing margin, so it is never sent by accident.
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        return self._with_retry(self.exchange.update_isolated_margin, amount, symbol)
+            raise AuthenticationRequiredException()
+        self._require_symbol(symbol)  # else the SDK fails with a bare KeyError while signing
+        if not _positive_number(amount):
+            raise InvalidArgumentException(f"amount must be greater than 0, got {amount!r}")
+        result = self._signed("isolated margin update", self.exchange.update_isolated_margin, amount, symbol)
+        self._action_result(result, f"{symbol} isolated margin update")
+        return result
 
     def _parse_fill(self, raw: dict) -> 'Fill':
         """Convert a raw fill dict from the API into a Fill model."""
@@ -2825,33 +3944,38 @@ class HyperliquidClient:
             fee=Decimal(str(raw["fee"])) if "fee" in raw else None,
             start_position=Decimal(str(raw["startPosition"])) if "startPosition" in raw else None,
             fee_token=raw.get("feeToken"),
+            trade_id=raw.get("tid"),
         )
 
-    def get_fills(self, symbol: Optional[str] = None) -> list:
-        """Get recent fills for the authenticated user.
+    def get_fills(self, symbol: Optional[str] = None, *, address: Optional[str] = None) -> list:
+        """Get recent fills of a wallet, by default the client's account.
 
         Args:
             symbol (Optional[str]): If provided, only returns fills for this symbol.
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
 
         Returns:
             List[Fill]: List of fill objects.
 
         Raises:
-            RuntimeError: If client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        raw = self._with_retry(self.info.user_fills, self.public_address)
+        address = self._address(address)
+        raw = self._with_retry(self.info.user_fills, address)
         fills = [self._parse_fill(f) for f in raw]
         if symbol:
             fills = [f for f in fills if f.symbol == symbol]
         return fills
+
+    _FILLS_PER_PAGE = 2000  # most fills one userFillsByTime response returns
 
     def get_fills_by_time(
         self,
         start_time: int,
         end_time: Optional[int] = None,
         symbol: Optional[str] = None,
+        *,
+        address: Optional[str] = None,
     ) -> list:
         """Get fills within a time range.
 
@@ -2859,39 +3983,225 @@ class HyperliquidClient:
             start_time (int): Start time in milliseconds since epoch.
             end_time (Optional[int]): End time in ms. Defaults to current time.
             symbol (Optional[str]): If provided, only returns fills for this symbol.
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
 
         Returns:
-            List[Fill]: List of fill objects.
+            List[Fill]: List of fill objects, oldest first. The exchange keeps only the 10000
+                most recent fills of an account.
 
         Raises:
-            RuntimeError: If client is not authenticated
+            AddressRequiredException: Without address on a client without an account
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        raw = self._with_retry(self.info.user_fills_by_time, self.public_address, start_time, end_time)
+        address = self._address(address)
+        end = end_time if end_time is not None else int(time.time() * 1000)  # fixed for all pages
+        raw, overflow = self._fill_pages(address, start_time, end)
+        if overflow:
+            logger.warning(f"More than {self._FILLS_PER_PAGE} fills in one millisecond; later fills in the range "
+                           "were not returned")
         fills = [self._parse_fill(f) for f in raw]
         if symbol:
             fills = [f for f in fills if f.symbol == symbol]
         return fills
 
-    def get_order_status(self, order_id: int) -> dict:
+    _FUNDING_PER_PAGE = 500  # userFunding returns at most 500 records, the oldest from startTime
+
+    def get_user_funding(
+        self,
+        start_time: int,
+        end_time: Optional[int] = None,
+        symbol: Optional[str] = None,
+        *,
+        address: Optional[str] = None,
+    ) -> List[FundingPayment]:
+        """The funding payments of a wallet in a time range, oldest first (Info userFunding),
+        every dex included (HIP-3 symbols prefixed, e.g. xyz:NVDA). Not to be confused with
+        get_funding_history, a market's funding rate history.
+
+        One response holds at most 500 payments: this pages through the range, one request per
+        500 payments. More than 500 at one timestamp cannot be paged and raise
+        HyperliquidException, never a partial list.
+
+        Args:
+            start_time (int): Start in milliseconds since the epoch (inclusive).
+            end_time (Optional[int]): End in ms (inclusive). Defaults to now.
+            symbol (Optional[str]): Only payments of this symbol.
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+            InvalidArgumentException: If the range ends before it starts
+            HyperliquidException: If more than 500 payments share one timestamp
+        """
+        address = self._address(address)
+        end = end_time if end_time is not None else int(time.time() * 1000)  # fixed for all pages
+        if end < start_time:
+            raise InvalidArgumentException("the range ends before it starts")
+        records: List[dict] = []
+        seen: set = set()
+        start = start_time
+        while True:
+            page = self._with_retry(self.info.user_funding_history, address, start, end)
+            new = []
+            for record in page:  # one payment per coin and time
+                key = (record["time"], record["delta"]["coin"])
+                if key not in seen:
+                    seen.add(key)
+                    new.append(record)
+            records.extend(new)
+            if len(page) < self._FUNDING_PER_PAGE:
+                break
+            if not new:
+                raise HyperliquidException(
+                    f"More than {self._FUNDING_PER_PAGE} funding payments at {page[-1]['time']} ms: the rest of "
+                    "the range cannot be read")
+            start = page[-1]["time"]  # inclusive: that time's payments come again and are skipped
+        payments = [FundingPayment(
+            time=r["time"], symbol=r["delta"]["coin"], market=coin_market(r["delta"]["coin"]),
+            size=Decimal(str(r["delta"]["szi"])), funding_rate=Decimal(str(r["delta"]["fundingRate"])),
+            usdc=Decimal(str(r["delta"]["usdc"]).strip()),
+        ) for r in records]
+        return [p for p in payments if symbol is None or p.symbol == symbol]
+
+    _RETAINED_FILLS = 10000  # Hyperliquid keeps only the most recent 10000 fills of an account
+
+    def _fill_pages(self, address: str, start: int, end: int) -> tuple:
+        """The raw fills from start to end (both inclusive), oldest first, each once; and
+        whether more than one response of fills shared a millisecond (the rest is unreachable).
+
+        One response holds at most 2000 fills, the oldest from its start. Paging goes on from
+        the last fill's time (inclusive, so that millisecond's fills come again and are skipped
+        by trade id, which Hyperliquid documents for every fill).
+        """
+        if end < start:
+            raise InvalidArgumentException("the range ends before it starts")
+        raw: List[dict] = []
+        seen: set = set()
+        while True:
+            page = self._with_retry(self.info.user_fills_by_time, address, start, end)
+            new = []
+            for fill in page:
+                if fill["tid"] not in seen:
+                    seen.add(fill["tid"])
+                    new.append(fill)
+            raw.extend(new)
+            if len(page) < self._FILLS_PER_PAGE:
+                return raw, False
+            if not new:
+                return raw, True
+            start = page[-1]["time"]
+
+    def _kept_before(self, address: str, start: int) -> bool:
+        """Whether a fill older than `start` is still kept. Asked after the range was read: if
+        one is kept now, every newer fill was kept when the range was read."""
+        return start > 0 and bool(self._with_retry(self.info.user_fills_by_time, address, 0, start - 1))
+
+    _ARRIVALS_UNTIL_MS = 30 * 86_400_000  # far past any clock difference to Hyperliquid's servers
+
+    def _fewer_kept_than_retained(self, address: str, in_range: set, end: int, now: int) -> bool:
+        """Whether fewer fills than Hyperliquid retains are kept from the range's start on: the
+        range's trade ids, those after it up to `now`, and every fill since `now` (a new fill
+        can push an old one out). Read without a bound from this computer's clock, which may be
+        behind the servers'; each trade id counted once. False when the count cannot be
+        completed."""
+        kept = set(in_range)
+        for start, stop in ((end + 1, now), (now + 1, now + self._ARRIVALS_UNTIL_MS)):
+            if stop < start:
+                continue
+            fills, overflow = self._fill_pages(address, start, stop)
+            if overflow:
+                return False
+            kept.update(fill["tid"] for fill in fills)
+        return len(kept) < self._RETAINED_FILLS
+
+    def get_fill_history(
+        self,
+        start_time: int,
+        end_time: Optional[int] = None,
+        symbol: Optional[str] = None,
+        *,
+        address: Optional[str] = None,
+    ) -> FillHistory:
+        """The fills of a time range, and whether Hyperliquid's limits cut it short.
+
+        Hyperliquid keeps only the 10000 most recent fills of an account. The range is known
+        to be complete if a fill older than start_time is still kept after it was read (then
+        every newer one was kept too), or if fewer than 10000 fills are kept from start_time
+        on, counting those that arrived during the call; else truncated_reason is
+        "retention_window". That costs one or two requests, and more pages only when the range
+        ends in the past.
+
+        This holds as long as Hyperliquid answers consistently (a fill, once returned, is also in
+        later answers) and its servers' clock is within 30 days of this computer's. A fill that
+        Hyperliquid records late, behind a range already read, cannot be ruled out by any
+        sequence of reads; truncated False means none of the limits above applies.
+
+        Args:
+            start_time (int): Start in milliseconds since the epoch (inclusive).
+            end_time (Optional[int]): End in ms (inclusive). Defaults to now.
+            symbol (Optional[str]): Only fills of this symbol.
+            address (Optional[str]): The wallet to read. Defaults to the client's account.
+
+        Returns:
+            FillHistory: The fills oldest first, truncated and truncated_reason.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+        """
+        address = self._address(address)
+        now = int(time.time() * 1000)
+        end = now if end_time is None else end_time
+        raw, overflow = self._fill_pages(address, start_time, end)
+        reason = None
+        if overflow:
+            reason = "same_millisecond_overflow"
+        elif not self._kept_before(address, start_time) and not self._fewer_kept_than_retained(
+                address, {fill["tid"] for fill in raw}, end, now):
+            reason = "retention_window"
+        fills = [self._parse_fill(f) for f in raw]
+        if symbol:
+            fills = [f for f in fills if f.symbol == symbol]
+        return FillHistory(fills=fills, truncated=reason is not None, truncated_reason=reason)
+
+    def get_order_status(self, order_id: Union[int, str], *, address: Optional[str] = None) -> dict:
         """Query the status of a specific order by order ID.
 
         Args:
-            order_id (int): The order ID to query.
+            order_id (Union[int, str]): The order ID to query.
+            address (Optional[str]): The wallet the order belongs to. Defaults to the client's account.
 
         Returns:
             dict: Order status from the API.
 
         Raises:
-            RuntimeError: If client is not authenticated
+            AddressRequiredException: Without address on a client without an account
+            InvalidArgumentException: If order_id is not a whole number
         """
-        if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
-        return self._with_retry(self.info.query_order_by_oid, self.public_address, order_id)
+        oid = _order_id(order_id)
+        address = self._address(address)
+        return self._with_retry(self.info.query_order_by_oid, address, oid)
 
-    def bulk_order(self, orders: List[dict]) -> list:
-        """Place multiple orders atomically.
+    def get_order_status_by_cloid(self, cloid: str, *, address: Optional[str] = None) -> dict:
+        """Query the status of an order by the client order id it was placed with (the SDK's
+        query_order_by_cloid). The answer has the format of get_order_status().
+
+        Args:
+            cloid (str): The order's client order id, "0x" and 32 hex digits (Order.cloid)
+            address (Optional[str]): The wallet the order belongs to. Defaults to the client's account.
+
+        Returns:
+            dict: Order status from the API; {"status": "unknownOid"} if the wallet has no
+                order with this client order id.
+
+        Raises:
+            AddressRequiredException: Without address on a client without an account
+            InvalidArgumentException: If cloid is not 0x followed by 32 hex digits
+        """
+        client_order_id = _cloid(cloid)
+        address = self._address(address)
+        return self._with_retry(self.info.query_order_by_cloid, address, client_order_id)
+
+    def bulk_order(self, orders: List[dict]) -> dict:
+        """Place several orders in one action (the SDK's bulk_orders).
 
         Args:
             orders: List of order dicts, each with keys:
@@ -2901,30 +4211,58 @@ class HyperliquidClient:
                 - limit_price (float): Limit price
                 - reduce_only (bool, optional): Defaults to False
                 - time_in_force (str, optional): "Gtc", "Ioc", or "Alo". Defaults to "Gtc"
+                - cloid (str, optional): Client order id, "0x" and 32 hex digits. With one, the
+                  order can be looked up (get_order_status_by_cloid) if the outcome is unknown.
 
         Returns:
-            list: API response with order statuses
+            dict: Hyperliquid's answer. Its statuses have one entry per order, in order:
+                {"resting": {"oid"}}, {"filled": {"oid", "totalSz", "avgPx"}}, or
+                {"error": text} for an order the exchange rejected; the others are placed.
 
         Raises:
-            RuntimeError: If client is not authenticated
-            ValueError: If any order is invalid
+            AuthenticationRequiredException: If the client has no account
+            InvalidArgumentException: If any order is invalid; checked before anything is sent
+            OrderRejectedException: If the exchange refused the whole action
+            ActionOutcomeUnknownException: If the action was sent but its outcome is unknown,
+                or the answer is not one documented status per order; look the orders up by
+                their cloids, or check the open orders and fills, before sending again
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
 
         order_requests = []
         for o in orders:
+            missing = [key for key in ("symbol", "is_buy", "size", "limit_price") if key not in o]
+            if missing:
+                raise InvalidArgumentException(f"bulk_order: an order lacks {', '.join(missing)}: {o}")
             size, price = self._validate_and_format_order(o["symbol"], o["size"], o["limit_price"])
-            order_requests.append({
+            for key in ("is_buy", "reduce_only"):
+                if not isinstance(o.get(key, False), bool):
+                    raise InvalidArgumentException(f"bulk_order: {key} must be True or False, got {o[key]!r}")
+            time_in_force = o.get("time_in_force", "Gtc")
+            if time_in_force not in _TIMES_IN_FORCE:
+                raise InvalidArgumentException(
+                    f"bulk_order: time_in_force must be Gtc, Ioc or Alo, got {time_in_force!r}")
+            request = {
                 "coin": o["symbol"],
                 "is_buy": o["is_buy"],
                 "sz": size,
                 "limit_px": price,
-                "order_type": {"limit": {"tif": o.get("time_in_force", "Gtc")}},
+                "order_type": {"limit": {"tif": time_in_force}},
                 "reduce_only": o.get("reduce_only", False),
-            })
+            }
+            if o.get("cloid") is not None:
+                request["cloid"] = _cloid(o["cloid"])
+            order_requests.append(request)
 
-        return self._with_retry(self.exchange.bulk_orders, order_requests)
+        response = self._signed("bulk order", self.exchange.bulk_orders, order_requests)
+        if isinstance(response, dict) and response.get("status") == "err":  # refused as a whole
+            raise OrderRejectedException("bulk order", str(response.get("response")))
+        statuses = self._statuses(response)
+        if (statuses is None or len(statuses) != len(order_requests)
+                or not all(self._is_documented_status(status) for status in statuses)):
+            raise ActionOutcomeUnknownException("bulk order", f"answered in no documented format: {response}")
+        return response
 
     def bulk_cancel(self, cancels: List[dict]) -> dict:
         """Cancel multiple orders atomically.
@@ -2938,13 +4276,22 @@ class HyperliquidClient:
             dict: API response
 
         Raises:
-            RuntimeError: If client is not authenticated
+            AuthenticationRequiredException: If the client has no account
+            InvalidArgumentException: If a cancel lacks its symbol or order id, or its symbol
+                is not a market of the client (UnknownSymbolException); checked before
+                anything is sent
         """
         if not self.is_authenticated():
-            raise RuntimeError("This method requires authentication")
+            raise AuthenticationRequiredException()
 
-        cancel_requests = [{"coin": c["symbol"], "oid": int(c["order_id"])} for c in cancels]
-        return self._with_retry(self.exchange.bulk_cancel, cancel_requests)
+        cancel_requests = []
+        for c in cancels:
+            missing = [key for key in ("symbol", "order_id") if key not in c]
+            if missing:
+                raise InvalidArgumentException(f"bulk_cancel: a cancel lacks {', '.join(missing)}: {c}")
+            self._require_symbol(c["symbol"])  # else the SDK fails with a bare KeyError while signing
+            cancel_requests.append({"coin": c["symbol"], "oid": _order_id(c["order_id"])})
+        return self._signed("cancel", self.exchange.bulk_cancel, cancel_requests, idempotent=True)
 
     def get_funding_history(
         self,
@@ -2962,6 +4309,7 @@ class HyperliquidClient:
         Returns:
             List[dict]: List of dicts with keys: time, funding_rate, premium
         """
+        self._require_symbol(symbol)
         raw = self._with_retry(self.info.funding_history, symbol, start_time, end_time)
         return [
             {
@@ -2982,16 +4330,9 @@ class HyperliquidClient:
             dict: Portfolio data from the API.
 
         Raises:
-            RuntimeError: If no address and not authenticated
-            ValueError: If the API call fails
+            AddressRequiredException: Without address on a client without an account
         """
-        if address is None:
-            if not self.is_authenticated():
-                raise RuntimeError("Address or authentication required")
-            address = self.public_address
+        address = self._address(address)
 
-        try:
-            return self._with_retry(self.info.post, "/info", {"type": "portfolio", "user": address})
-        except Exception as e:
-            raise ValueError(f"Failed to fetch portfolio: {str(e)}")
+        return self._with_retry(self.info.post, "/info", {"type": "portfolio", "user": address})
 

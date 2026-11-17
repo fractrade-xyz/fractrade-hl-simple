@@ -46,7 +46,7 @@ def main():
 
         # Query order status
         print(f"\n--- Order Status ---")
-        status = client.get_order_status(int(order.order_id))
+        status = client.get_order_status(order.order_id)
         print(f"Order {order.order_id}: {status['order']['status']}")
 
         # Set TP/SL
