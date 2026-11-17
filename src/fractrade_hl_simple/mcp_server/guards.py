@@ -22,6 +22,7 @@ from typing import Any, Optional, TypeGuard
 
 from ..models import PERP_MARKETS, coin_market
 from .config import AccountConfig
+from .convert import decimal as _decimal
 from .errors import ToolError
 
 
@@ -318,20 +319,6 @@ def _limit(value: Any, name: str) -> Any:
     if value is None:
         raise ValueError(f"{name} is not configured: the account cannot trade")
     return value
-
-
-def _decimal(value: Any) -> Decimal:
-    """`value` exactly as written (the shortest text of a float, not its binary expansion);
-    NaN for anything that is not a number, so that a rule fails on it."""
-    if isinstance(value, Decimal):
-        return value
-    if isinstance(value, bool):
-        return Decimal("NaN")
-    if isinstance(value, int):
-        return Decimal(int(value))
-    if isinstance(value, float):
-        return Decimal(repr(float(value)))  # float(): a subclass's repr may be no number (numpy)
-    return Decimal("NaN")
 
 
 def _finite(value: Any) -> TypeGuard[Decimal]:

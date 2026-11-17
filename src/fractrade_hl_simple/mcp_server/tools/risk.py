@@ -16,6 +16,7 @@ from ...exceptions import InvalidArgumentException, PositionNotFoundException
 from ...hyperliquid import MIN_ORDER_USD, split_size
 from .. import risk
 from ..accounts import AccountRegistry, Target
+from ..convert import decimal as _decimal
 from ..server import ToolSpec
 from .read import SYMBOL, _wallet_tool
 
@@ -38,7 +39,7 @@ def _get_position_risk(registry: AccountRegistry) -> ToolSpec:
             raise PositionNotFoundException(f"no {symbol} position")  # type: ignore[no-untyped-call]
         is_long = position.size > 0
         size = abs(position.size)
-        exits, skipped = _exits(client.get_open_orders(symbol, address=target.address), is_long)
+        exits, skipped = _exits(client.get_open_orders(symbol, address=target.address), is_long, size)
         result = risk.outcomes(
             is_long=is_long, entry=position.entry_price, size=size, exits=exits,
             fees=_fees(client, symbol, target), book=_book(client, symbol),
@@ -61,14 +62,18 @@ def _get_position_risk(registry: AccountRegistry) -> ToolSpec:
         read, required=["symbol"])
 
 
-def _exits(orders: list[Any], is_long: bool) -> tuple[list[risk.Exit], list[str]]:
+def _exits(orders: list[Any], is_long: bool, size: Decimal) -> tuple[list[risk.Exit], list[str]]:
     """The reduce-only orders that close the position: trigger orders (stop loss, take
-    profit) at their trigger price, a resting limit order as a take profit at its price."""
+    profit) at their trigger price, a resting limit order as a take profit at its price. A
+    TP/SL for the whole position (set so in the Hyperliquid app) closes all of `size` when it
+    triggers, whatever size it is listed with; one with a size of its own keeps that."""
     exits, skipped = [], []
     for order in orders:
         if not order.reduce_only or order.is_buy == is_long:
             continue
         left = order.size - order.filled_size
+        if order.is_position_tpsl and left == 0:
+            left = size
         trigger = order.order_type.trigger if order.order_type else None
         if order.type in ("stop_loss", "take_profit") and order.trigger_price is not None:
             market = bool(trigger and trigger.get("isMarket"))
@@ -250,7 +255,3 @@ def _account_value(client: Any, target: Target) -> Optional[Decimal]:
 
 def _daily_loss(target: Target) -> Optional[Decimal]:
     return None if target.account is None else target.account.max_daily_loss_pct
-
-
-def _decimal(value: Any) -> Decimal:
-    return Decimal(repr(float(value))) if isinstance(value, float) else Decimal(value)

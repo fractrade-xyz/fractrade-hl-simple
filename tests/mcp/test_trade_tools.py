@@ -1257,14 +1257,35 @@ class TestWhenTheSharedStateCannotBeWritten:
         session = Session()
         session.trader.exchange.order.return_value = {"status": "ok", "response": "?"}
         session.trader.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
-        self.full_disk(monkeypatch, session, "remember_cloid")
+        self.full_disk(monkeypatch, session, "remember_cloids")
         is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001, "cloid": CLOID})
         assert is_error and body["error"]["code"] == "OUTCOME_UNKNOWN" and body["error"]["details"]["cloid"] == CLOID
 
     def test_a_filled_order_is_reported_filled(self, monkeypatch):
         session = Session()
         session.trader.exchange.order.return_value = FILLED
-        self.full_disk(monkeypatch, session, "remember_cloid")
+        self.full_disk(monkeypatch, session, "remember_cloids")
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001})
+        assert not is_error and body["data"]["status"] == "filled"
+
+    def test_an_unexpected_error_is_logged_once(self, caplog):
+        # The tool's own log line built the whole error body, which logged the traceback too.
+        session = Session()
+        session.trader.exchange.order.side_effect = AttributeError("a bug")
+        with caplog.at_level(logging.INFO):
+            assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "INTERNAL"
+        assert [r.getMessage() for r in caplog.records].count("unexpected error in a tool call") == 1
+        assert any(r.getMessage().endswith(": INTERNAL") for r in caplog.records)
+
+    def test_any_failure_of_the_bookkeeping_after_an_order_leaves_its_result(self, monkeypatch):
+        # Not only a full disk: e.g. a damaged file's decoding error came back as INTERNAL,
+        # and the agent never saw the filled order.
+        session = Session()
+        session.trader.exchange.order.return_value = FILLED
+
+        def damaged(*args, **kwargs):
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+        monkeypatch.setattr(session.registry._state, "remember_cloids", damaged)
         is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001})
         assert not is_error and body["data"]["status"] == "filled"
 
@@ -1367,6 +1388,15 @@ max_leverage = 5
 
     def orders(self, session):
         return [c.kwargs for c in session.trader.exchange.order.call_args_list]
+
+    def test_the_cloids_of_the_entry_and_its_levels_are_saved_in_one_write(self, monkeypatch):
+        # Each one rewrote the whole 30-day file, holding the account's lock.
+        session = self.session()
+        state, saves = session.registry._state, []
+        save = state._save_cloids
+        monkeypatch.setattr(state, "_save_cloids", lambda key, used: saves.append(len(used)) or save(key, used))
+        assert not session.one("open_position", self.ARGS)[0]
+        assert saves == [4]  # the entry and its three levels
 
     def test_the_entry_as_checked_then_each_level_for_its_share_of_the_fill(self):
         session = self.session()

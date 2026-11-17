@@ -187,10 +187,25 @@ class TestOrdersAndCloids:
         orders = next((tmp_path / "state").glob("*.orders"))
         orders.write_text(orders.read_text() + "not a time\nnan\n-inf\ninf\n")
         assert one.risk_orders_last_hour(KEY) == 5
-        one.remember_cloid(KEY, "0x" + "c" * 32)
+        one.remember_cloids(KEY, ["0x" + "c" * 32])
         cloids = next((tmp_path / "state").glob("*.cloids"))
         cloids.write_text(cloids.read_text() + "garbage\n")
         assert one.reserve_cloid(KEY, "0x" + "c" * 32) is None
+
+
+    def test_a_byte_that_is_no_utf8_spoils_only_its_line(self, tmp_path):
+        # It raised UnicodeDecodeError: after an order, the agent got INTERNAL, not the order.
+        one = server(tmp_path / "state")
+        one.remember_cloids(KEY, ["0x" + "c" * 32])
+        cloids = next((tmp_path / "state").glob("*.cloids"))
+        cloids.write_bytes(cloids.read_bytes() + b"\xff\xfe damaged\n")
+        assert one.reserve_cloid(KEY, "0x" + "c" * 32) is None  # still used
+        one.remember_cloids(KEY, ["0x" + "d" * 32, "0x" + "e" * 32])
+        assert one.reserve_cloid(KEY, "0x" + "d" * 32) is None and one.reserve_cloid(KEY, "0x" + "e" * 32) is None
+        one.count_risk_order(KEY)
+        orders = next((tmp_path / "state").glob("*.orders"))
+        orders.write_bytes(orders.read_bytes() + b"\xff\xfe\n")
+        assert one.risk_orders_last_hour(KEY) == 2  # the damaged line counts as an order now
 
 
 class TestTheFolder:
@@ -198,7 +213,7 @@ class TestTheFolder:
         state = server(tmp_path / "state")
         state.halt(KEY)
         state.count_risk_order(KEY)
-        state.remember_cloid(KEY, "0x" + "c" * 32)
+        state.remember_cloids(KEY, ["0x" + "c" * 32])
         folder = tmp_path / "state"
         assert {oct(p.stat().st_mode & 0o777) for p in (folder, folder / "servers")} == {"0o700"}
         assert {oct(p.stat().st_mode & 0o777) for p in folder.rglob("*") if p.is_file()} == {"0o600"}

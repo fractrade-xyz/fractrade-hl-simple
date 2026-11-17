@@ -83,6 +83,16 @@ def test_an_invalid_config_fails_with_its_message(tmp_path, capsys):
     assert "max_leverage must be a whole number from 1 to 50" in capsys.readouterr().err
 
 
+def test_an_unknown_log_level_in_the_environment_fails_with_a_message(tmp_path, capsys, monkeypatch):
+    # argparse checks choices only on the command line: it crashed with a raw ValueError.
+    config = tmp_path / "mcp.toml"
+    config.write_text(CONFIG)
+    monkeypatch.setenv("FRACTRADE_MCP_LOG_LEVEL", "trace")
+    with pytest.raises(SystemExit) as exited:
+        main(["--config", str(config), "--check"])
+    assert exited.value.code == 2 and "FRACTRADE_MCP_LOG_LEVEL must be one of DEBUG" in capsys.readouterr().err
+
+
 def test_without_the_mcp_extra_the_server_says_how_to_install_it(tmp_path):
     config = tmp_path / "mcp.toml"
     config.write_text(CONFIG)

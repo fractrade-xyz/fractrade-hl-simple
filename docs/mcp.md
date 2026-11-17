@@ -552,8 +552,9 @@ the wallet parameters, `symbol` (required). Read only. No position: `POSITION_NO
 
 The protections are the position's reduce-only open orders on the closing side: stop losses
 and take profits at their trigger price, a resting limit order as a take profit at its
-price. In the order the price reaches them, each counts up to what is left of the position
-(Hyperliquid fills a reduce-only order no further).
+price. A TP/SL set for the entire position (in the Hyperliquid app) counts for the whole
+position, as it closes all of it when it triggers. In the order the price reaches them, each
+counts up to what is left of the position (Hyperliquid fills a reduce-only order no further).
 
 Returns `side`, `size`, `entry_price`, `mid_price`, `liquidation_price`, `unrealized_pnl`,
 `leverage`, `margin_mode`, and:

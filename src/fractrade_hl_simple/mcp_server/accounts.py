@@ -360,10 +360,10 @@ class AccountRegistry:
                             hint="look its order up with get_order_status_by_cloid; a new order needs a new cloid")
         return reserved
 
-    def remember_cloid(self, target: Target, cloid: str) -> None:
-        """Mark a cloid the library made (close, update_stop_loss, ...) as used: the agent may
-        see it in a result."""
-        self._shared().remember_cloid(target.key, cloid)
+    def remember_cloids(self, target: Target, cloids: list[str]) -> None:
+        """Mark the cloids the library made (close, update_stop_loss, ...) as used, in one
+        write: the agent may see them in a result."""
+        self._shared().remember_cloids(target.key, cloids)
 
     def release_cloid(self, target: Target, cloid: str) -> None:
         """Free a reserved cloid whose order the library reports as not sent: an argument it

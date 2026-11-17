@@ -7,9 +7,24 @@ strings.
 from __future__ import annotations
 
 from datetime import datetime, timezone
+from decimal import Decimal
 from typing import Any, Optional
 
 from ..models import Order, Position
+
+
+def decimal(value: Any) -> Decimal:
+    """`value` exactly as written (a float's shortest text, not its binary expansion); NaN for
+    anything that is not a number, bool included, so that a check fails on it."""
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, bool):
+        return Decimal("NaN")
+    if isinstance(value, int):
+        return Decimal(int(value))
+    if isinstance(value, float):
+        return Decimal(repr(float(value)))  # float(): a subclass's repr may be no number (numpy)
+    return Decimal("NaN")
 
 
 def iso(ms: Optional[int]) -> Optional[str]:

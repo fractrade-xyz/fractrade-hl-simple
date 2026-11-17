@@ -319,6 +319,23 @@ class TestGetPositionRisk:
             ("2.37", "market (taker)"), ("2.28", "limit (maker)")]
         assert any("433.9 has no stop" in w for w in data["warnings"])
 
+    def test_a_stop_for_the_whole_position_counts_for_all_of_it(self):
+        # Set "for the entire position" in the Hyperliquid app, it is listed with size 0 and
+        # closes the whole position when it triggers. It was counted as size 0: no protection.
+        whole = icp_order(1, "stop_loss", "2.62", "0")
+        whole.is_position_tpsl = True
+        is_error, body = run("get_position_risk", {"symbol": "ICP"}, answers(get_open_orders=[whole]))
+        data = body["data"]
+        assert not is_error and data["unprotected_size"] == "0"
+        assert [(level["price"], level["size"]) for level in data["stop_losses"]] == [("2.62", "1301.6")]
+
+    def test_a_position_tpsl_with_a_size_of_its_own_keeps_it(self):
+        # A custom size stays fixed (Hyperliquid's TP/SL docs): only that much is protected.
+        sized = icp_order(1, "stop_loss", "2.62", "500")
+        sized.is_position_tpsl = True
+        is_error, body = run("get_position_risk", {"symbol": "ICP"}, answers(get_open_orders=[sized]))
+        assert not is_error and body["data"]["unprotected_size"] == "801.6"
+
     def test_no_position(self):
         is_error, body = run("get_position_risk", {"symbol": "ICP"}, answers(get_positions=[]))
         assert is_error and body["error"]["code"] == "POSITION_NOT_FOUND"

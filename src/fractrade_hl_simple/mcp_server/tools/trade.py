@@ -93,7 +93,8 @@ def _trade_tool(registry: AccountRegistry, name: str, description: str, properti
                 registry.check_signer(target, fresh=not reduces_risk(arguments))
                 data, outcome = act(registry.trade_client(target), target, arguments)
         except Exception as error:  # the symbol as %r: one line, whatever the agent sent
-            logger.info("%s %r (account %s): %s", name, symbol, target.name, error_body(error)["error"]["code"])
+            code = error.code if isinstance(error, HyperliquidException) else "INTERNAL"  # its traceback: once, by the server
+            logger.info("%s %r (account %s): %s", name, symbol, target.name, code)
             raise
         logger.info("%s %r (account %s): %s", name, symbol, target.name, outcome)
         return {"account": target.name, "address": target.address, "base_url": target.base_url, "data": data}
@@ -160,11 +161,13 @@ def _before_sending(write: Callable[[], Any]) -> Any:
 
 def _after_sending(write: Callable[[], Any]) -> None:
     """Shared-state bookkeeping after an order was sent (or provably not): never in place of
-    the order's outcome, which the agent must see as it is. A failure is logged."""
+    the order's outcome, which the agent must see as it is. Any failure is logged."""
     try:
         write()
     except OSError as error:
         logger.error("the shared state could not be written after an order: %s", error.strerror or error)
+    except Exception:
+        logger.exception("the shared state could not be written after an order")
 
 
 def _remembering(registry: AccountRegistry, target: Target, call: Callable[[], Any]) -> Any:
@@ -180,29 +183,30 @@ def _remembering(registry: AccountRegistry, target: Target, call: Callable[[], A
     return result
 
 
-def _remember(registry: AccountRegistry, target: Target, value: Any, seen: frozenset[int] = frozenset()) -> None:
-    """Mark every cloid in `value` as used: of each order (an order, a mapping of them), and of
-    an exception's documented attributes, its own `cloid` included (OrderOutcomeUnknownException:
+def _remember(registry: AccountRegistry, target: Target, value: Any) -> None:
+    """Mark every cloid in `value` as used, in one write."""
+    cloids = _cloids_in(value)
+    if cloids:
+        registry.remember_cloids(target, cloids)
+
+
+def _cloids_in(value: Any, seen: frozenset[int] = frozenset()) -> list[str]:
+    """Every cloid in `value`: of each order (an order, a mapping of them), and of an
+    exception's documented attributes, its own `cloid` included (OrderOutcomeUnknownException:
     the order may still arrive). Each object is visited once on a path, so a cycle ends."""
     if id(value) in seen:
-        return
+        return []
     seen = seen | {id(value)}
     if isinstance(value, Order):
-        if value.cloid:
-            registry.remember_cloid(target, value.cloid)
-    elif isinstance(value, Mapping):
-        if isinstance(value.get("cloid"), str):  # e.g. a level of PROTECTION_NOT_PLACED that may still arrive
-            registry.remember_cloid(target, value["cloid"])
-        for item in value.values():
-            _remember(registry, target, item, seen)
-    elif isinstance(value, (list, tuple)):
-        for item in value:
-            _remember(registry, target, item, seen)
-    elif isinstance(value, HyperliquidException):
-        details = library_details(value)
-        if isinstance(details.get("cloid"), str):
-            registry.remember_cloid(target, details["cloid"])
-        _remember(registry, target, details, seen)
+        return [value.cloid] if value.cloid else []
+    if isinstance(value, Mapping):  # its own cloid: e.g. a level of PROTECTION_NOT_PLACED that may still arrive
+        own = [value["cloid"]] if isinstance(value.get("cloid"), str) else []
+        return own + [cloid for item in value.values() for cloid in _cloids_in(item, seen)]
+    if isinstance(value, (list, tuple)):
+        return [cloid for item in value for cloid in _cloids_in(item, seen)]
+    if isinstance(value, HyperliquidException):
+        return _cloids_in(library_details(value), seen)
+    return []
 
 
 # ── buy, sell ─────────────────────────────────────────────────────────
@@ -263,7 +267,7 @@ def _open_position(registry: AccountRegistry) -> ToolSpec:
     def act(client: Any, target: Target, arguments: dict[str, Any]) -> tuple[Any, str]:
         symbol, is_long = arguments["symbol"], arguments["side"] == "long"
         stops, profits = arguments["stop_losses"], arguments.get("take_profits", [])
-        if sum((Decimal(repr(float(level["fraction"]))) for level in stops), Decimal(0)) != 1:
+        if sum((convert.decimal(level["fraction"]) for level in stops), Decimal(0)) != 1:
             raise ToolError("INVALID_ARGUMENT", "stop_losses: the fractions must add up to 1, so the whole position "
                                                 "is protected", hint="for a position without a full stop, use buy or sell")
         slippage = arguments.get("slippage")
@@ -272,7 +276,7 @@ def _open_position(registry: AccountRegistry) -> ToolSpec:
         risk = _risk_state(registry, client, target, symbol, is_long)
         if _config(target).max_risk_pct is not None:  # what the trade loses if every stop fills
             risk = replace(risk, loss_at_stops=_before_sending_read("the loss at the stop losses", lambda: _loss_at_stops(
-                client, target, symbol, is_long, Decimal(repr(float(size))), stops)))
+                client, target, symbol, is_long, convert.decimal(size), stops)))
         guards.check_order(_config(target), symbol, size, price, is_buy=is_long, reduce_only=False, market=True,
                            slippage_value=slippage, risk=risk).enforce()
         opening = client.open_long_position if is_long else client.open_short_position
@@ -619,7 +623,7 @@ def _risk_state(registry: AccountRegistry, client: Any, target: Target, symbol: 
     if "leverage" in wanted:
         reads.append(("the market's leverage", lambda: {"leverage": client.get_leverage(symbol)}))
     if not is_buy:
-        reads.append(("the market's mid price", lambda: {"mid": _price(client.get_price(symbol))}))
+        reads.append(("the market's mid price", lambda: {"mid": convert.decimal(client.get_price(symbol))}))
     if "account" in wanted:
         reads.append(("the account's value and margin", lambda: _margins(client.get_account_summary())))
     if "day" in wanted:
@@ -667,13 +671,6 @@ def _before_sending_read(what: str, read: Callable[[], Any]) -> Any:
         return read()
     except Exception as error:  # nothing is sent yet, whatever failed
         raise _read_failed(what, error) from error
-
-
-def _price(value: Any) -> Decimal:
-    """A price from the library (a float) as the Decimal of its shortest text; NaN if none."""
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return Decimal("NaN")
-    return Decimal(repr(float(value)))
 
 
 def _margins(summary: Any) -> dict[str, Any]:

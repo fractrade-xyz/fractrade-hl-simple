@@ -177,7 +177,10 @@ def _check_signers(config: Config, trading_keys: dict[str, str]) -> int:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    args = _parser().parse_args(argv)
+    parser = _parser()
+    args = parser.parse_args(argv)
+    if args.log_level not in LOG_LEVELS:  # argparse checks choices on the command line only, not a default
+        parser.error(f"FRACTRADE_MCP_LOG_LEVEL must be one of {', '.join(LOG_LEVELS)}, got {args.log_level!r}")
     _setup_logging(args.log_level)
     if args.init:  # before the config is read: there may be none yet
         return _setup(args)

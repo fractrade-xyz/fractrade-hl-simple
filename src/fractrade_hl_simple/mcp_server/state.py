@@ -33,7 +33,7 @@ import sys
 import threading
 import time
 import weakref
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -183,11 +183,14 @@ class SharedState:
             self._save_cloids(key, used)
             return cloid
 
-    def remember_cloid(self, key: Key, cloid: str) -> None:
+    def remember_cloids(self, key: Key, cloids: Iterable[str]) -> None:
+        """Mark `cloids` as used, in one write."""
         with self.account_lock(key):
             used = self._cloids(key)
-            if cloid.lower() not in used:
-                used[cloid.lower()] = time.time()
+            new = {cloid.lower() for cloid in cloids} - used.keys()
+            if new:
+                now = time.time()
+                used.update(dict.fromkeys(sorted(new), now))
                 self._save_cloids(key, used)
 
     def release_cloid(self, key: Key, cloid: str) -> None:
@@ -272,8 +275,10 @@ def _name(key: Key) -> str:
 
 
 def _lines(path: Path) -> list[str]:
+    """The lines of `path`; none if it does not exist. A byte that is no UTF-8 (only damage or
+    an edit by hand makes one) spoils only its line, which each reader treats as damaged."""
     try:
-        return path.read_text(encoding="utf-8").splitlines()
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
     except FileNotFoundError:
         return []
 
