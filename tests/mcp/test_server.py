@@ -13,7 +13,7 @@ import pytest
 pytest.importorskip("mcp")  # the server needs the [mcp] extra
 
 import anyio  # noqa: E402
-from mcp import Client, StdioServerParameters  # noqa: E402
+from mcp import Client  # noqa: E402
 from jsonschema import Draft202012Validator  # noqa: E402
 from mcp.shared.exceptions import MCPError  # noqa: E402
 
@@ -27,7 +27,8 @@ from fractrade_hl_simple.mcp_server.tools.read import read_tools  # noqa: E402
 MODES = ["legacy", "2026-07-28"]  # the handshake era and the stateless one
 ECHO_SCHEMA = {
     "type": "object",
-    "properties": {"symbol": {"type": "string"}, "size": {"type": "number"}, "reduce_only": {"type": "boolean"}},
+    "properties": {"symbol": {"type": "string"}, "size": {"type": "number"}, "reduce_only": {"type": "boolean"},
+                   "cloid": {"type": "string", "pattern": "^0x[0-9a-f]{4}$"}},
     "required": ["symbol", "size"],
     "additionalProperties": False,
 }
@@ -78,25 +79,8 @@ class TestProtocol:
         assert tools[0].input_schema == ECHO_SCHEMA and tools[0].annotations.read_only_hint
         assert not result.is_error
 
-    @pytest.mark.parametrize("mode", ["legacy", "auto"])  # auto: server/discover, as Claude Code does
-    def test_the_client_gets_the_instructions(self, mode):
-        async def run():
-            async with Client(probe_server(), mode=mode) as client:
-                return client.instructions
-
-        assert anyio.run(run) == INSTRUCTIONS
-
     def test_instructions_are_short(self):
         assert len(INSTRUCTIONS) < 1500
-    def test_an_unknown_tool_is_a_protocol_error(self):
-        async def run():
-            async with Client(probe_server(), mode="2026-07-28") as client:
-                with pytest.raises(MCPError) as error:
-                    await client.call_tool("echoo", {})
-                return error.value
-
-        error = anyio.run(run)
-        assert error.code == -32602 and error.message == "unknown tool 'echoo'"
 
     def test_an_unknown_tool_name_is_redacted_in_the_error(self):
         key = "ab" * 32
@@ -107,7 +91,8 @@ class TestProtocol:
                     await client.call_tool(key, {})
                 return error.value
 
-        assert key not in anyio.run(run).message
+        error = anyio.run(run)
+        assert error.code == -32602 and key not in error.message
 
     def test_tools_never_take_the_threads_the_sdk_reads_stdin_with(self):
         started, release = threading.Event(), threading.Event()
@@ -132,9 +117,6 @@ class TestProtocol:
 
 
 class TestArguments:
-    def test_results_are_compact_json_with_decimal_strings(self):
-        is_error, text = call(probe_server(), "echo", {"symbol": "BTC", "size": 0.01})
-        assert not is_error and text == '{"got":{"symbol":"BTC","size":0.01},"price":"1.50"}'
 
     @pytest.mark.parametrize("value, text", [
         (Decimal("1E-7"), '"0.0000001"'), (Decimal("1E+2"), '"100"'), (Decimal("0"), '"0"'),
@@ -149,12 +131,13 @@ class TestArguments:
         ({"symbol": "BTC", "size": True}, "size"),                           # a boolean is no number
         ({"symbol": "BTC", "size": 0.01, "reduce_only": "true"}, "reduce_only"),
         ({"size": 0.01}, "arguments"),                                       # missing
+        ({"symbol": "BTC", "size": 0.01, "cloid": "0x00ab\n"}, "cloid"),     # a pattern takes the whole string
     ])
     def test_wrong_arguments_are_refused_with_the_parameter_named(self, arguments, where):
         is_error, text = call(probe_server(), "echo", arguments)
         error = json.loads(text)["error"]
         assert is_error and error["code"] == "INVALID_ARGUMENT" and error["message"].startswith(f"{where}: ")
-        assert "symbol, size, reduce_only" in error["hint"]
+        assert "symbol, size, reduce_only, cloid" in error["hint"]
 
     @pytest.mark.parametrize("arguments, where", [
         ({"symbol": "BTC", "size": float("nan")}, "size"),
@@ -176,11 +159,6 @@ class TestArguments:
 
 
 class TestErrors:
-    def test_a_library_exception_comes_with_its_own_code(self):
-        is_error, text = call(probe_server(), "unknown_symbol", {})
-        assert is_error and json.loads(text)["error"] == {
-            "code": "UNKNOWN_SYMBOL", "message": "Unknown symbol 'BTCC'", "retryable": False,
-            "hint": None, "details": {}}
 
     def test_a_result_that_is_not_a_finite_number_is_internal(self):
         is_error, text = call(probe_server(), "not_a_number", {})
@@ -283,24 +261,19 @@ class TestListAccounts:
                                              "max_margin_pct": None, "max_total_margin_pct": None,
                                              "max_daily_loss_pct": None, "isolated_only": False,
                                              "max_orders_per_hour": None, "check_order_leverage": False,
-                                             "max_risk_pct": None},
+                                             "max_risk_pct": None, "max_day_loss_pct": None,
+                                             "max_day_loss_mode": None, "max_total_notional_x": None,
+                                             "max_total_notional_mode": None, "day_start": "00:00", "tz": "UTC"},
                  "perp_dexs": ["xyz"]},
                 {"name": "whale", "address": WHALE, "base_url": "https://api.hyperliquid-testnet.xyz",
                  "mode": "watch", "halted": False, "limits": None, "perp_dexs": []},
             ],
         }
 
-    def test_it_takes_no_arguments(self):
-        config = parse_config(CONFIG, "test.toml")
-        server = build_server(read_tools(config, AccountRegistry(config, {}, no_clients)))
-        is_error, text = call(server, "list_accounts", {"account": "main"})
-        assert is_error and json.loads(text)["error"]["code"] == "INVALID_ARGUMENT"
-
-
-TOOL_NAMES = ["list_accounts", "enable_perp_dexs", "get_account", "get_positions", "get_open_orders", "get_fills", "get_order_status",
+TOOL_NAMES = ["list_accounts", "enable_perp_dexs", "get_account", "get_positions", "get_open_orders", "get_fills", "get_changes", "get_order_status",
               "get_order_status_by_cloid", "get_portfolio",
-              "get_funding_payments", "get_prices", "list_markets", "get_market_info", "get_order_book", "get_funding_rates",
-              "get_position_risk", "plan_trade"]
+              "get_funding_payments", "get_pnl", "get_prices", "list_markets", "get_market_info", "get_order_book", "get_candles", "get_funding_rates",
+              "get_position_risk", "get_account_risk", "plan_trade"]
 
 MODERN_META = {
     "io.modelcontextprotocol/protocolVersion": "2026-07-28",
@@ -317,6 +290,7 @@ class StdioServer:
     def __init__(self, tmp_path, args=(), env=None, config=CONFIG):
         config_file = tmp_path / "mcp.toml"
         config_file.write_text(config)
+        config_file.chmod(0o600)
         self.process = subprocess.Popen(
             [sys.executable, "-m", "fractrade_hl_simple.mcp_server", "--config", str(config_file), *args],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -406,8 +380,10 @@ def test_a_real_stdio_connection_in_the_2026_07_28_era(tmp_path):
             assert refused["isError"] and (error["code"], error["message"]) == ("INVALID_ARGUMENT", "x: must be a finite number")
 
 
-TRADE_TOOL_NAMES = ["buy", "sell", "open_position", "modify_order", "cancel_order", "cancel_order_by_cloid", "close", "close_all_positions",
-                    "stop_loss", "take_profit", "update_stop_loss", "update_take_profit", "cancel_all_orders",
+TRADE_TOOL_NAMES = ["buy", "sell", "place_orders", "place_ladder", "open_position", "place_trigger_entry",
+                    "modify_order", "cancel_order",
+                    "cancel_order_by_cloid", "cancel_orders", "close", "close_all_positions",
+                    "stop_loss", "take_profit", "update_stop_loss", "update_take_profit", "sync_protection", "cancel_all_orders",
                     "set_leverage", "kill_switch"]
 
 

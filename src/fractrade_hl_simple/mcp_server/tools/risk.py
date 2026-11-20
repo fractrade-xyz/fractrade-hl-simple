@@ -9,14 +9,18 @@ book, fee rates, account value, leverage).
 
 from __future__ import annotations
 
+import time
 from decimal import Decimal
 from typing import Any, Optional
+from zoneinfo import ZoneInfoNotFoundError
 
 from ...exceptions import InvalidArgumentException, PositionNotFoundException
-from ...hyperliquid import MIN_ORDER_USD, split_size
-from .. import risk
+from ..._inputs import MIN_ORDER_USD
+from ..._protection import split_size
+from .. import guards, risk
 from ..accounts import AccountRegistry, Target
-from ..convert import decimal as _decimal
+from ..convert import decimal as _decimal, iso
+from ..errors import ToolError
 from ..server import ToolSpec
 from .read import SYMBOL, _wallet_tool
 
@@ -24,7 +28,7 @@ PRICE = {"type": "number", "exclusiveMinimum": 0}
 
 
 def risk_tools(registry: AccountRegistry) -> list[ToolSpec]:
-    return [_get_position_risk(registry), _plan_trade(registry)]
+    return [_get_position_risk(registry), _get_account_risk(registry), _plan_trade(registry)]
 
 
 # ── get_position_risk ─────────────────────────────────────────────────
@@ -36,7 +40,7 @@ def _get_position_risk(registry: AccountRegistry) -> ToolSpec:
         position = next((p for p in client.get_positions(address=target.address)
                          if p.symbol == symbol and p.size != 0), None)
         if position is None:
-            raise PositionNotFoundException(f"no {symbol} position")  # type: ignore[no-untyped-call]
+            raise PositionNotFoundException(f"no {symbol} position")
         is_long = position.size > 0
         size = abs(position.size)
         exits, skipped = _exits(client.get_open_orders(symbol, address=target.address), is_long, size)
@@ -60,6 +64,265 @@ def _get_position_risk(registry: AccountRegistry) -> ToolSpec:
         "slippage. Read only. No position: POSITION_NOT_FOUND.",
         {"symbol": {**SYMBOL, "description": "The position's market, exactly as Hyperliquid names it."}},
         read, required=["symbol"])
+
+
+# ── get_account_risk ──────────────────────────────────────────────────
+
+LOW_FREE_MARGIN_PCT = Decimal(10)  # warn below this % of the account value
+HOUR_MS = 3_600_000
+BETA_HOURS = 720  # 30 days of hourly candles
+
+
+def _get_account_risk(registry: AccountRegistry) -> ToolSpec:
+    def read(client: Any, target: Target, arguments: dict[str, Any]) -> dict[str, Any]:
+        positions = [p for p in client.get_positions(address=target.address) if p.size != 0]
+        orders = client.get_open_orders(address=target.address)
+        summary = client.get_account_summary(target.address)
+        account_value = summary.account_value if isinstance(summary.account_value, Decimal) else None
+        account = target.account
+        btc = _hourly(client, "BTC") if arguments.get("with_beta") and positions else None
+        rows: list[dict[str, Any]] = []
+        warnings: list[str] = []
+        stops_net = profits_net = long_notional = short_notional = Decimal(0)
+        to_stops = Decimal(0)  # the PnL from now until every stop has filled
+        weighted: Optional[Decimal] = Decimal(0) if btc is not None else None
+        for position in positions:
+            symbol, is_long, size = position.symbol, position.size > 0, abs(position.size)
+            exits, skipped = _exits([o for o in orders if o.symbol == symbol], is_long, size)
+            book = _book(client, symbol)
+            result = risk.outcomes(
+                is_long=is_long, entry=position.entry_price, size=size, exits=exits,
+                fees=_fees(client, symbol, target), book=book, account_value=account_value,
+                liquidation_price=position.liquidation_price)
+            # Hyperliquid's own valuation at the mark price, which needs no order book.
+            notional = abs(position.position_value)
+            mark = notional / size
+            if is_long:
+                long_notional += notional
+            else:
+                short_notional += notional
+            liquidation = position.liquidation_price
+            distance = None if liquidation is None or not mark else risk.percent(abs(mark - liquidation) / mark)
+            stops, profits = result["if_all_stops"], result["if_all_take_profits"]
+            row_warnings = [*result["warnings"], *skipped, *_breaks(account, position, stops, account_value)]
+            beta = None
+            if btc is not None:
+                beta = _beta(btc if symbol == "BTC" else _hourly(client, symbol), btc)
+                if beta is None:
+                    row_warnings.append("BTC beta not established (fewer than 24 hourly returns in common)")
+                    weighted = None
+                elif weighted is not None:
+                    weighted += (notional if is_long else -notional) * beta
+            if stops:
+                stops_net += stops["net_pnl"]
+                to_stops += stops["net_pnl"] - position.unrealized_pnl * stops["size"] / size
+            profits_net += profits["net_pnl"] if profits else Decimal(0)
+            rows.append({
+                "symbol": symbol, "side": result["side"], "size": size, "entry_price": position.entry_price,
+                "mark_price": risk.usd(mark) if mark >= 1 else mark, "mid_price": book.mid,
+                "notional": risk.usd(notional), "unrealized_pnl": position.unrealized_pnl,
+                "leverage": position.leverage.value, "margin_mode": position.leverage.type,
+                "margin_used": position.margin_used, "liquidation_price": liquidation,
+                "liquidation_distance_percent": distance, "if_all_stops": stops, "if_all_take_profits": profits,
+                "risk_reward": result["risk_reward"], "unprotected_size": result["unprotected_size"],
+                **({"beta_btc": beta} if btc is not None else {}), "warnings": row_warnings})
+            warnings.extend(f"{symbol}: {w}" for w in row_warnings)
+        margin, margin_warnings = _margin(summary, account_value)
+        warnings.extend(margin_warnings)
+        portfolio = client.get_portfolio(target.address)
+        change, capital = guards.portfolio_day_change(portfolio)
+        loss = None if change is None else max(Decimal(0), -change)
+        warnings.extend(_account_breaks(account, account_value, summary.margin_used, change, capital, to_stops))
+        today = _today(portfolio, account, arguments)
+        warnings.extend(_limit_breaks(account, portfolio, summary, orders, account_value, client))
+        return {"data": {
+            "positions": rows,
+            "totals": {
+                # As per position: the stops' percent_of_account is the loss (positive), the take profits' the gain.
+                "if_all_stops": {"net_pnl": risk.usd(stops_net), "percent_of_account": _of(-stops_net, account_value)},
+                "if_all_take_profits": {"net_pnl": risk.usd(profits_net),
+                                        "percent_of_account": _of(profits_net, account_value)},
+                "unprotected_positions": sum(1 for row in rows if row["unprotected_size"] > 0),
+                "long_notional": risk.usd(long_notional), "short_notional": risk.usd(short_notional),
+                "net_notional": risk.usd(long_notional - short_notional),
+                **({"btc_beta_weighted_notional": None if weighted is None else risk.usd(weighted)}
+                   if btc is not None else {})},
+            "margin": margin,
+            "daily_loss": {"loss_24h": None if loss is None else risk.usd(loss),
+                           "percent_of_account": None if loss is None or not capital else risk.percent(loss / capital),
+                           "max_daily_loss_pct": None if account is None else account.max_daily_loss_pct},
+            "day_loss": today,
+            "warnings": warnings,
+            "notes": "PnL after fees and estimated slippage, per position as get_position_risk. Notional at the "
+                     "mark price, in each market's collateral counted as USD. Positions of every dex this server "
+                     "reads.",
+        }}
+
+    return _wallet_tool(
+        registry, "get_account_risk",
+        "Risk of all open perp positions of an account together, also those opened outside this server (e.g. "
+        "in the Hyperliquid app): per position its outcomes at its stop losses and take profits after fees and "
+        "slippage (as get_position_risk), unprotected size, margin, liquidation price and distance from the "
+        "mark; in total the loss if every stop fills and the gain if every take profit does (USD and % of the "
+        "account), long, short and net notional, margin used and free, the last 24 hours' loss against "
+        "max_daily_loss_pct, today's loss (day_loss: since Hyperliquid's last record before the trading day's start, "
+        "against the account value then), and warnings: no stop, a stop beyond liquidation, free margin below 10 %, "
+        "and any position that breaks the account's guardrails (symbols, max_leverage, max_risk_pct, "
+        "max_total_margin_pct, max_daily_loss_pct, also if every stop fills, max_day_loss_pct and "
+        "max_total_notional_x in warn or block mode, by the config's day start). with_beta: also each "
+        "position's BTC beta from 30 days of hourly candles and the BTC-beta-weighted net notional (one more "
+        "request per position other than BTC, and one for BTC). Positions of every dex this server reads. Read only.",
+        {"with_beta": {"type": "boolean", "default": False,
+                       "description": "Also the BTC beta of each position (30 days of hourly candles)."},
+         "day_start": {"type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
+                       "description": "For day_loss only: when the trading day starts, HH:MM (default: the "
+                                      "account's day_start, else 00:00). The limits always use the config."},
+         "tz": {"type": "string", "minLength": 1,
+                "description": "For day_loss only: the IANA time zone of day_start, e.g. Europe/Athens (default: "
+                               "the account's tz, else UTC)."}},
+        read)
+
+
+def _margin(summary: Any, account_value: Optional[Decimal]) -> tuple[dict[str, Any], list[str]]:
+    """Margin used and free, by the account mode: a unified account's USDC available to trade;
+    a standard account's withdrawable per dex (its spot balance backs no perp position)."""
+    margin_used = summary.margin_used if isinstance(summary.margin_used, Decimal) else None
+    warnings: list[str] = []
+    dexes: Optional[list[dict[str, Any]]] = None
+    free: Optional[Decimal]
+    base: Optional[Decimal]
+    if isinstance(summary.available_to_trade, Decimal):
+        free, base = summary.available_to_trade, account_value
+    elif summary.mode == "standard":
+        dexes = [{"dex": d.dex or "default", "account_value": d.account_value, "margin_used": d.margin_used,
+                  "withdrawable": d.withdrawable} for d in summary.dexes]
+        known = [d for d in summary.dexes if d.withdrawable is not None and d.account_value is not None]
+        free = sum((d.withdrawable for d in known), Decimal(0)) if known else None
+        base = sum((d.account_value for d in known), Decimal(0)) if known else None
+        for d in known:
+            if d.margin_used > 0 and d.account_value and d.withdrawable * 100 / d.account_value < LOW_FREE_MARGIN_PCT:
+                warnings.append(f"free margin on the {d.dex or 'default'} dex is "
+                                f"{risk.percent(d.withdrawable / d.account_value)} % of its value, below "
+                                f"{LOW_FREE_MARGIN_PCT} %")
+    else:  # portfolio margin, unknown: no single free figure
+        free = base = None
+    if dexes is None and free is not None and base and free * 100 / base < LOW_FREE_MARGIN_PCT:
+        warnings.append(f"free margin is {risk.percent(free / base)} % of the account value, below "
+                        f"{LOW_FREE_MARGIN_PCT} %")
+    margin: dict[str, Any] = {"account_value": account_value, "margin_used": margin_used, "free_margin": free,
+              "free_margin_percent": None if free is None or not base else risk.percent(free / base)}
+    if dexes is not None:
+        margin["dexes"] = dexes
+    return margin, warnings
+
+
+def _of(amount: Decimal, account_value: Optional[Decimal]) -> Optional[Decimal]:
+    return None if account_value is None or account_value <= 0 else risk.percent(amount / account_value)
+
+
+def _breaks(account: Any, position: Any, stops: Optional[dict[str, Any]], account_value: Optional[Decimal]) -> list[str]:
+    """The account's guardrails that the position breaks, however it was opened."""
+    if account is None:
+        return []
+    found = []
+    if account.symbols is not None and position.symbol not in account.symbols:
+        found.append("not in the account's symbols")
+    if account.max_leverage is not None and position.leverage.value > account.max_leverage:
+        found.append(f"leverage {position.leverage.value} is above max_leverage {account.max_leverage}")
+    if account.max_risk_pct is not None and stops is not None and account_value and account_value > 0:
+        loss_pct = -stops["net_pnl"] * 100 / account_value  # from the cents, not the rounded percentage
+        if loss_pct > account.max_risk_pct:
+            found.append(f"the loss at its stops ({stops['percent_of_account']} % of the account) is beyond "
+                         f"max_risk_pct ({account.max_risk_pct} %)")
+    return found
+
+
+def _account_breaks(account: Any, account_value: Optional[Decimal], margin_used: Any, change: Optional[Decimal],
+                    capital: Optional[Decimal], to_stops: Decimal) -> list[str]:
+    """The account-wide guardrails broken: margin in use, the last 24 hours' loss, and that loss
+    if every stop filled now (the PnL from now to the stops, gains of the day included)."""
+    if account is None:
+        return []
+    found = []
+    if account.max_total_margin_pct is not None and account_value and isinstance(margin_used, Decimal):
+        used = margin_used * 100 / account_value
+        if used > account.max_total_margin_pct:
+            found.append(f"margin in use {risk.percent(used / 100)} % is above max_total_margin_pct "
+                         f"({account.max_total_margin_pct} %)")
+    if account.max_daily_loss_pct is not None and change is not None and capital and capital > 0:
+        loss_pct = max(Decimal(0), -change) * 100 / capital
+        projected = max(Decimal(0), -(change + to_stops)) * 100 / capital
+        if loss_pct >= account.max_daily_loss_pct:
+            found.append(f"the last 24 hours' loss {risk.percent(loss_pct / 100)} % reached max_daily_loss_pct "
+                         f"({account.max_daily_loss_pct} %): no new risk")
+        elif projected >= account.max_daily_loss_pct:
+            found.append(f"if every stop filled now, the last 24 hours' loss would be "
+                         f"{risk.percent(projected / 100)} %, reaching max_daily_loss_pct ({account.max_daily_loss_pct} %)")
+    return found
+
+
+def _today(portfolio: Any, account: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+    """day_loss: the loss since Hyperliquid's last portfolio record at or before the trading
+    day's start, by the call's day_start and tz, else the account's, else 00:00 UTC."""
+    day_start = arguments.get("day_start") or (account.day_start if account is not None else "00:00")
+    tz = arguments.get("tz") or (account.tz if account is not None else "UTC")
+    try:
+        state = guards.today(portfolio, day_start, tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        raise ToolError("INVALID_ARGUMENT", f"tz: {tz!r} is no IANA time zone", hint="e.g. Europe/Athens or UTC") from None
+    loss, capital = state["today_loss"], state["today_capital"]
+    return {"start": iso(state["today_start"]), "since": iso(state["today_since"]),
+            "loss": None if loss is None else risk.usd(loss),
+            "percent_of_account": None if loss is None or not capital or capital <= 0 else risk.percent(loss / capital),
+            "max_day_loss_pct": None if account is None else account.max_day_loss_pct}
+
+
+def _limit_breaks(account: Any, portfolio: Any, summary: Any, orders: list[Any],
+                  account_value: Optional[Decimal], client: Any) -> list[str]:
+    """max_day_loss_pct (by the config's day start) and max_total_notional_x broken now, in
+    warn or block mode: trades made in the Hyperliquid app are not checked when made. The
+    positions are the summary's, read after the open orders: an order that fills in between
+    counts twice, never not at all."""
+    if account is None:
+        return []
+    found = []
+    if account.max_day_loss_pct is not None and account.max_day_loss_mode != "off":
+        state = guards.RiskState(**guards.today(portfolio, account.day_start, account.tz))
+        check = guards.today_loss(state, account.max_day_loss_pct, account.max_day_loss_mode)
+        if not check.passed:
+            found.append(f"{check.detail} (max_day_loss_pct, {account.max_day_loss_mode})")
+    if account.max_total_notional_x is not None and account.max_total_notional_mode != "off":
+        # A pending sell is valued at the mid when that is higher, as the trading guard values it.
+        mids = {symbol: _decimal(price) for symbol, price in client.get_price().items()} \
+            if any(not o.is_buy and not o.reduce_only for o in orders) else {}
+        state = guards.RiskState(open_notional=guards.open_notional(summary, orders, mids), account_value=account_value)
+        check = guards.total_notional(state, Decimal(0), account.max_total_notional_x, account.max_total_notional_mode,
+                                      what=None)
+        if not check.passed:
+            found.append(f"{check.detail} (max_total_notional_x, {account.max_total_notional_mode})")
+    return found
+
+
+def _hourly(client: Any, symbol: str) -> list[Any]:
+    """The closed hourly candles of the last 30 days."""
+    now = time.time() * 1000
+    return [c for c in client.get_candles(symbol, "1h", lookback=BETA_HOURS) if c.close_time <= now]
+
+
+def _beta(asset: list[Any], btc: list[Any]) -> Optional[Decimal]:
+    """The asset's beta to BTC from hourly returns in the same hours; None below a day of them."""
+    a = {c.open_time: c.close for c in asset}
+    b = {c.open_time: c.close for c in btc}
+    hours = sorted(set(a) & set(b))
+    pairs = [(float(a[t1] / a[t0] - 1), float(b[t1] / b[t0] - 1))
+             for t0, t1 in zip(hours, hours[1:]) if t1 - t0 == HOUR_MS and a[t0] and b[t0]]
+    if len(pairs) < 24:
+        return None
+    mean_a = sum(x for x, _ in pairs) / len(pairs)
+    mean_b = sum(y for _, y in pairs) / len(pairs)
+    covariance = sum((x - mean_a) * (y - mean_b) for x, y in pairs)
+    variance = sum((y - mean_b) ** 2 for _, y in pairs)
+    return None if variance == 0 else Decimal(str(round(covariance / variance, 2)))
 
 
 def _exits(orders: list[Any], is_long: bool, size: Decimal) -> tuple[list[risk.Exit], list[str]]:
@@ -101,7 +364,9 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
         # The prices as they are sent: rounded as Hyperliquid requires (two can become one).
         stops = sent_levels(client, symbol, is_long, raw_stops)
         profits = sent_levels(client, symbol, is_long, arguments.get("take_profits", []))
-        limit = _decimal(arguments["entry_price"]) if "entry_price" in arguments else None
+        # A limit as it will be signed (rounded as Hyperliquid requires), as open_position checks it.
+        limit = _decimal(client.prepare_order(symbol, 1, is_long, arguments["entry_price"])[1]) \
+            if "entry_price" in arguments else None
         given = [key for key in ("size", "risk_usd", "risk_pct") if key in arguments]
         if len(given) != 1:
             raise InvalidArgumentException("pass exactly one of size, risk_usd and risk_pct")
@@ -160,7 +425,7 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
                 continue
             exits.append(risk.Exit(kind, price, part, market=True))
             if part * price < MIN_ORDER_USD:
-                warnings.append(f"the {label} at {price} is worth {risk._usd(part * price)} USD, below Hyperliquid's "
+                warnings.append(f"the {label} at {price} is worth {risk.usd(part * price)} USD, below Hyperliquid's "
                                 f"minimum order of {MIN_ORDER_USD} USD (open_position refuses it)")
         result = risk.outcomes(is_long=is_long, entry=entry, size=size, exits=exits, fees=fees, book=book,
                                account_value=account_value, entry_fee=entry_fee, max_daily_loss_pct=_daily_loss(target))
@@ -173,12 +438,13 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
         if limited:
             result["warnings"].append("the visible order book limited the size: a larger one could not be estimated")
         if notional < MIN_ORDER_USD:
-            result["warnings"].append(f"the entry is worth {risk._usd(notional)} USD, below Hyperliquid's minimum "
+            result["warnings"].append(f"the entry is worth {risk.usd(notional)} USD, below Hyperliquid's minimum "
                                       f"order of {MIN_ORDER_USD} USD")
         allowed = None if target.account is None else target.account.max_risk_pct
         if allowed is not None and account_value is not None and account_value > 0:
-            # Exactly as open_position checks it (unrounded), for the plan's size and stops.
-            loss = risk.planned_loss(size, is_long=is_long, limit=None, resting=False, stops=stops, fees=fees,
+            # As open_position checks it, for the plan's size and stops: a market entry, or with a
+            # limit from the limit at the taker fee (a Gtc limit can fill at once).
+            loss = risk.planned_loss(size, is_long=is_long, limit=limit, resting=False, stops=stops, fees=fees,
                                      book=book, size_decimals=decimals)
             if loss is None or loss > account_value * allowed / 100:
                 result["warnings"].append(f"the loss at the stop losses is above the account's max_risk_pct ({allowed} "
@@ -186,9 +452,9 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
         return {"data": {
             "symbol": symbol,
             "entry": "limit (maker)" if resting else "limit (taker)" if limit is not None else "market (taker)",
-            "risk_budget": None if risk_budget is None else risk._usd(risk_budget),
-            "notional": risk._usd(notional),
-            "margin": risk._usd(notional / leverage.value), "leverage": leverage.value, "margin_mode": leverage.type,
+            "risk_budget": None if risk_budget is None else risk.usd(risk_budget),
+            "notional": risk.usd(notional),
+            "margin": risk.usd(notional / leverage.value), "leverage": leverage.value, "margin_mode": leverage.type,
             **result}}
 
     return _wallet_tool(

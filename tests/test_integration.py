@@ -1,6 +1,8 @@
 import pytest
 from decimal import Decimal
-from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
+import secrets
+from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount, _maker
+from fractrade_hl_simple.exceptions import OrderOutcomeUnknownException, ProtectionOrderException
 import time
 
 
@@ -669,6 +671,63 @@ def test_convenience_functions(client):
         except Exception as e:
             print(f"Cleanup error: {e}")
 
+def test_trigger_entry_rests_until_its_trigger(client):
+    """A stop entry far above the price rests as a trigger order of its own, not reduce-only,
+    and is canceled by its client order id (also after an unknown outcome): nothing else of
+    the account is touched."""
+    symbol = "ETH"
+    price = client.get_price(symbol)
+    trigger = price * 1.2
+    size = round(12 / trigger, 4)  # about 12 USD at the trigger
+    cloid = "0x" + secrets.token_hex(16)
+    try:
+        order = client.trigger_order(symbol, True, size, trigger_price=trigger, cloid=cloid)
+        assert order.status == "open" and order.reduce_only is False
+        listed = client.get_open_order_by_id(symbol, order.order_id)
+        assert listed is not None and listed.is_buy and not listed.reduce_only
+        assert listed.order_type.trigger["isMarket"] is True and listed.trigger_price == Decimal(str(order.trigger_price))
+    finally:
+        client.cancel_order_by_cloid(cloid, symbol)
+    assert not [o for o in client.get_open_orders(symbol) if o.cloid == cloid]
+
+
+def test_resting_entry_with_its_stop_and_take_profit_attached(client):
+    """A limit buy far below the price, with a stop loss and take profit attached (normalTpsl, as
+    the SDK's example sends them): they are listed under the entry, and canceling the entry by
+    its id cancels them with it. Nothing else of the account is touched."""
+    symbol = "ETH"
+    price = client.get_price(symbol)
+    stop, take = price * 0.75, price * 0.85
+    size = round(12 / stop, 4)  # about 12 USD at the stop, the lowest of the three
+    entry_id, cloid, child_ids = None, None, []
+    try:
+        try:
+            orders = client.open_long_position(symbol, size, stop_loss_price=stop, take_profit_price=take,
+                                               limit_price=price * 0.8)
+        except ProtectionOrderException as error:  # the entry was placed: it is canceled below
+            entry_id = error.orders["entry"].order_id
+            raise
+        except OrderOutcomeUnknownException as error:
+            cloid = error.cloid
+            raise
+        entry = orders["entry"]
+        entry_id = entry.order_id
+        assert list(orders) == ["entry"] and entry.status == "open"
+        listed = client.get_open_order_by_id(symbol, entry_id)
+        children = sorted(listed.children or [], key=lambda child: child["orderType"])
+        assert [(c["orderType"], c["side"], c["reduceOnly"], Decimal(c["sz"])) for c in children] == [
+            ("Stop Market", "A", True, entry.size), ("Take Profit Market", "A", True, entry.size)]
+        child_ids = [c["oid"] for c in children]
+    finally:
+        if entry_id is not None:
+            client.cancel_order(entry_id, symbol)
+        elif cloid is not None:
+            client.cancel_order_by_cloid(cloid, symbol)
+    time.sleep(2)
+    still_open = {o.order_id for o in client.get_open_orders(symbol)}
+    assert entry_id not in still_open and not still_open & set(child_ids)
+
+
 def test_limit_orders(client):
     """Test creating, modifying, and canceling limit orders."""
     symbol = "BTC"
@@ -900,7 +959,7 @@ def test_funding_rates(client):
     print("Very large threshold correctly returns empty list")
     
     # Print summary
-    print(f"\n=== Funding Rates Test Summary ===")
+    print("\n=== Funding Rates Test Summary ===")
     print(f"Total funding rates available: {len(all_rates)}")
     print(f"Rates above {low_threshold} (0.001%): {len(low_threshold_rates)}")
     print(f"Rates above {high_threshold} (0.01%): {len(high_threshold_rates)}")
@@ -992,7 +1051,7 @@ class TestMakerOrderIntegration:
     @pytest.mark.parametrize("symbol,size", MAKER_TEST_ASSETS)
     def test_auto_timing_detected(self, client, symbol, size):
         """Auto-detect produces reasonable timeout/reprice for each tier."""
-        timeout, reprice = client._auto_reprice_interval(symbol)
+        timeout, reprice = _maker.auto_timing(client, symbol)
         book = client.get_order_book(symbol)
         spread_bps = (book["spread"] / book["mid_price"]) * 10000 if book["mid_price"] else 0
 

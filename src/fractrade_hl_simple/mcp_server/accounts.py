@@ -17,9 +17,9 @@ from typing import Any, Optional
 
 from eth_account import Account
 
-from ..exceptions import InvalidArgumentException, UnknownSymbolException
+from ..exceptions import HyperliquidException, InvalidArgumentException, UnknownSymbolException
 from ..models import HyperliquidAccount, coin_market
-from .config import ADDRESS, BASE_URLS, AccountConfig, Config
+from .config import ADDRESS, TOOL_BASE_URLS, AccountConfig, Config
 from .errors import ToolError
 from .state import SharedState
 
@@ -140,9 +140,9 @@ class AccountRegistry:
         # account locks below must never wait for the network.
         self._create_lock = threading.Lock()
         self._state_lock = threading.Lock()
-        # Per server, on purpose: a cache (every order that adds risk looks up again), and
-        # the dexes enable_perp_dexs adds for this session.
-        self._signer_confirmed: set[str] = set()  # account names whose key was checked
+        # Per server, on purpose: the last signer check (used only when a lookup for a call
+        # that reduces risk fails), and the dexes enable_perp_dexs adds for this session.
+        self._signer_confirmed: set[str] = set()  # account names whose key was confirmed
         self._session_dexes: dict[str, tuple[str, ...]] = {}  # by base_url: enable_perp_dexs
 
     @property
@@ -165,9 +165,9 @@ class AccountRegistry:
                 raise ToolError("INVALID_ARGUMENT", "pass account or address, not both")
             if not ADDRESS.fullmatch(address):
                 raise ToolError("INVALID_ARGUMENT", "address must be 0x followed by 40 hex characters")
-            base_url = BASE_URLS[0] if base_url is None else base_url
-            if base_url not in BASE_URLS:
-                raise ToolError("INVALID_ARGUMENT", f"base_url must be one of {', '.join(BASE_URLS)}")
+            base_url = TOOL_BASE_URLS[0] if base_url is None else base_url
+            if base_url not in TOOL_BASE_URLS:
+                raise ToolError("INVALID_ARGUMENT", f"base_url must be one of {', '.join(TOOL_BASE_URLS)}")
             return Target(None, address, base_url)
         if base_url is not None:
             raise ToolError("INVALID_ARGUMENT", "base_url is used only with address",
@@ -321,22 +321,26 @@ class AccountRegistry:
 
     # ── signer check ────────────────────────────────────────────────
 
-    def check_signer(self, target: Target, fresh: bool = False) -> None:
+    def check_signer(self, target: Target, reduces_risk: bool = False) -> None:
         """Raise SIGNER_NOT_AUTHORIZED unless the key of `target`'s account is an API wallet
-        that trades its address. Call it holding the account's lock, before a
-        signed action. A confirmed result is kept: while it is, a call that reduces risk does
-        not wait for (or fail on) a lookup; the first call and a call after a refusal do look
-        up. `fresh` looks up again anyway, for every action that adds risk: an approval
-        removed meanwhile is found before the next such order. A refusal is not kept, and
-        drops a kept confirmation, so an API wallet approved meanwhile works at the next call. A failed lookup raises the library's
-        exception and changes nothing."""
+        that trades its address. Call it holding the account's lock, at the start of every
+        trade call: it looks the key up each time, so an approval removed, or moved to another
+        account, is found before the next call. A lookup that fails with a retryable error
+        (Hyperliquid's info down, rate limited) raises it, except for a call that
+        `reduces_risk` after a confirmed lookup: that one uses the confirmed result, so a
+        close still works then. A refusal drops the confirmed result."""
         config = target.account
         if config is None or config.name not in self._keys:
             raise ToolError("TRADING_DISABLED", f"{target.name or target.address} is not enabled for trading")
-        with self._state_lock:
-            if config.name in self._signer_confirmed and not fresh:
+        signer = signer_address(self._keys[config.name])
+        try:
+            problem = signer_problem(config, signer, lambda: self.read_client(target))
+        except HyperliquidException as error:
+            with self._state_lock:
+                confirmed = config.name in self._signer_confirmed
+            if reduces_risk and confirmed and error.retryable:
                 return
-        problem = signer_problem(config, signer_address(self._keys[config.name]), lambda: self.read_client(target))
+            raise
         with self._state_lock:
             if problem is None:
                 self._signer_confirmed.add(config.name)
@@ -360,6 +364,21 @@ class AccountRegistry:
                             hint="look its order up with get_order_status_by_cloid; a new order needs a new cloid")
         return reserved
 
+    def reserve_cloids(self, target: Target, cloids: list[Optional[str]]) -> list[str]:
+        """reserve_cloid for the orders of a batch, all or none, in one write: each given cloid,
+        a new one for each None. One used before, or given twice in the batch, refuses them
+        all (INVALID_ARGUMENT)."""
+        reserved = self._shared().reserve_cloids(target.key, cloids)
+        if reserved is None:
+            raise ToolError("INVALID_ARGUMENT", "a cloid of the batch was used before for this account, or is given "
+                                                "twice", hint="each order needs its own new cloid; look a used one up "
+                                                              "with get_order_status_by_cloid")
+        return reserved
+
+    def release_cloids(self, target: Target, cloids: list[str]) -> None:
+        """release_cloid for every order of a batch that provably was not sent, in one write."""
+        self._shared().release_cloids(target.key, cloids)
+
     def remember_cloids(self, target: Target, cloids: list[str]) -> None:
         """Mark the cloids the library made (close, update_stop_loss, ...) as used, in one
         write: the agent may see them in a result."""
@@ -372,14 +391,14 @@ class AccountRegistry:
 
     # ── orders that add risk (max_orders_per_hour) ──────────────────
 
-    def count_risk_order(self, target: Target) -> float:
-        """Count an order that adds risk for every server, just before it is sent; returns its
-        time, for release_risk_order."""
-        return self._shared().count_risk_order(target.key)
+    def count_risk_order(self, target: Target, count: int = 1) -> float:
+        """Count `count` orders that add risk (a batch's, in one write) for every server, just
+        before they are sent; returns their time, for release_risk_order."""
+        return self._shared().count_risk_order(target.key, count)
 
-    def release_risk_order(self, target: Target, at: float) -> None:
-        """Uncount an order that provably was not sent."""
-        self._shared().release_risk_order(target.key, at)
+    def release_risk_order(self, target: Target, at: float, count: int = 1) -> None:
+        """Uncount orders that provably were not sent."""
+        self._shared().release_risk_order(target.key, at, count)
 
     def risk_orders_last_hour(self, target: Target) -> int:
         """The orders that added risk on `target`'s exchange account in the last hour, from

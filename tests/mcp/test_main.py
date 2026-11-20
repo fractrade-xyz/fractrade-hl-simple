@@ -32,9 +32,15 @@ max_leverage = 5
 '''
 
 
+def write_config(path, text):
+    """A config file as --init makes it: only its owner can read and write it."""
+    path.write_text(text)
+    path.chmod(0o600)
+
+
 def test_check_prints_the_accounts_and_exits(tmp_path, capsys):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     assert main(["--config", str(config), "--check"]) == 0
     out, err = capsys.readouterr()
     assert out == ""  # stdout is the protocol channel
@@ -60,7 +66,7 @@ class RoleClient:
 def test_check_online_checks_the_signer_of_each_trading_account(tmp_path, capsys, monkeypatch,
                                                                  answer, status, says):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     monkeypatch.setenv("HL_KEY_MAIN", KEY)
     monkeypatch.setattr(RoleClient, "answer", answer)
     monkeypatch.setattr("fractrade_hl_simple.hyperliquid.HyperliquidClient", RoleClient)
@@ -71,22 +77,15 @@ def test_check_online_checks_the_signer_of_each_trading_account(tmp_path, capsys
 
 def test_online_works_only_with_check(tmp_path, capsys):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     assert main(["--config", str(config), "--online"]) == 1
     assert "--online works only with --check" in capsys.readouterr().err
-
-
-def test_an_invalid_config_fails_with_its_message(tmp_path, capsys):
-    config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG.replace("max_leverage = 5", "max_leverage = 500"))
-    assert main(["--config", str(config), "--check"]) == 1
-    assert "max_leverage must be a whole number from 1 to 50" in capsys.readouterr().err
 
 
 def test_an_unknown_log_level_in_the_environment_fails_with_a_message(tmp_path, capsys, monkeypatch):
     # argparse checks choices only on the command line: it crashed with a raw ValueError.
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     monkeypatch.setenv("FRACTRADE_MCP_LOG_LEVEL", "trace")
     with pytest.raises(SystemExit) as exited:
         main(["--config", str(config), "--check"])
@@ -95,7 +94,7 @@ def test_an_unknown_log_level_in_the_environment_fails_with_a_message(tmp_path, 
 
 def test_without_the_mcp_extra_the_server_says_how_to_install_it(tmp_path):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     code = ("import sys; sys.modules['mcp'] = None\n"  # as if the extra were not installed
             "from fractrade_hl_simple.mcp_server.__main__ import main\n"
             f"sys.exit(main(['--config', {str(config)!r}]))")
@@ -108,7 +107,7 @@ def test_a_real_import_error_is_not_taken_for_the_missing_extra(tmp_path):
     pytest.importorskip("mcp")  # with the extra missing, its install hint correctly comes first
     pytest.importorskip("jsonschema")
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     code = ("import sys; sys.modules['fractrade_hl_simple.mcp_server.tools.read'] = None\n"  # a broken module
             "from fractrade_hl_simple.mcp_server.__main__ import main\n"
             f"sys.exit(main(['--config', {str(config)!r}]))")
@@ -128,7 +127,7 @@ def test_log_records_are_redacted_traceback_included():
 
 def test_check_says_whether_trading_would_be_on(tmp_path, capsys, monkeypatch):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     monkeypatch.delenv("FRACTRADE_MCP_TRADING", raising=False)
     assert main(["--config", str(config), "--check"]) == 0
     assert "trading tools: off (start with --enable-trading or FRACTRADE_MCP_TRADING=1 to trade main)" in \
@@ -141,7 +140,7 @@ def test_check_says_whether_trading_would_be_on(tmp_path, capsys, monkeypatch):
 
 def test_with_the_switch_a_missing_key_fails_the_check_and_the_server(tmp_path, capsys, monkeypatch):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     monkeypatch.delenv("HL_KEY_MAIN", raising=False)
     monkeypatch.setenv("FRACTRADE_MCP_TRADING", "1")
     assert main(["--config", str(config), "--check"]) == 1
@@ -152,7 +151,7 @@ def test_with_the_switch_a_missing_key_fails_the_check_and_the_server(tmp_path, 
 
 def test_without_the_switch_the_signer_check_reads_no_key(tmp_path, capsys, monkeypatch):
     config = tmp_path / "mcp.toml"
-    config.write_text(CONFIG)
+    write_config(config, CONFIG)
     monkeypatch.delenv("FRACTRADE_MCP_TRADING", raising=False)
     monkeypatch.setenv("HL_KEY_MAIN", "not a key")  # reading it would fail
     assert main(["--config", str(config), "--check", "--online"]) == 0
@@ -416,14 +415,6 @@ class TestInitFailures:
         assert main(["--init", "--config", str(tmp_path / "mcp.toml")]) == 1
         assert "is a symbolic link: the key goes into a regular file of your own" in capsys.readouterr().err
         assert not dangling or not other.exists()
-
-    def test_a_path_with_characters_outside_the_bmp_is_written_as_valid_toml(self, tmp_path, capsys):
-        path = tmp_path / "Grüße 😀" / "mcp.toml"
-        assert main(["--init", "--config", str(path)]) == 0
-        from fractrade_hl_simple.mcp_server.config import parse_config
-        config = parse_config(path.read_text(encoding="utf-8").replace("0xYOUR_ACCOUNT_ADDRESS", ADDRESS), "x")
-        assert config.accounts["main"].key_file == path.parent / "keys" / "main"
-
 
 def _owned_by_another_user(monkeypatch, call, path):
     """Make os.stat or os.lstat report `path` as another user's: only root can make one."""

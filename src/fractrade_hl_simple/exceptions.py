@@ -54,7 +54,7 @@ class UnauthorizedException(HyperliquidException):
     """Exception raised for 401 Unauthorized status code."""
     code = "UNAUTHORIZED"
 
-    def __init__(self, message="UNAUTHORIZED"):
+    def __init__(self, message: str = "UNAUTHORIZED") -> None:
         super().__init__(message)
 
 class RateLimitException(HyperliquidException):
@@ -62,7 +62,7 @@ class RateLimitException(HyperliquidException):
     code = "RATE_LIMITED"
     retryable = True
 
-    def __init__(self, message="RATE_LIMIT_EXCEEDED"):
+    def __init__(self, message: str = "RATE_LIMIT_EXCEEDED") -> None:
         super().__init__(message)
 
 class ServerErrorException(HyperliquidException, ServerError):
@@ -150,11 +150,13 @@ class InsufficientMarginException(OrderRejectedException):
     """The exchange refused the order for lack of margin ("Insufficient margin to place
     order.", PerpMargin in the API docs)."""
     code = "INSUFFICIENT_MARGIN"
+    def __init__(self, action: str = "order", reason: str = "Insufficient margin to place order."):
+        super().__init__(action, reason)
 
 class OrderNotFoundException(OrderException):
     """Raised when an order is not found."""
     code = "ORDER_NOT_FOUND"
-    def __init__(self, message="Order not found"):
+    def __init__(self, message: str = "Order not found") -> None:
         super().__init__(message)
 
 class ActionOutcomeUnknownException(HyperliquidException):
@@ -193,8 +195,8 @@ class OrderOutcomeUnknownException(ActionOutcomeUnknownException, OrderException
 class ProtectionOrderException(OrderException):
     """The entry order was placed, but a stop loss or take profit was not.
 
-    Raised when placing it failed, or when the entry is a resting limit order that has not
-    filled yet (there is no position to protect).
+    Raised when placing it failed, Hyperliquid refused to attach it to a resting limit
+    entry, or it executed at once because the price had already crossed it.
 
     Attributes:
         leg: The order that was not placed: "stop_loss", "take_profit", or with several,
@@ -242,24 +244,64 @@ class ProtectionReplacementIncompleteException(OrderException):
         subject = f"old orders {', '.join(map(str, self.old_order_ids))} " if self.old_order_ids else ""
         super().__init__(f"New order {new_order.order_id} was placed, but {subject}{reason}")
 
-class OrdersNotCanceledException(OrderException):
-    """Canceling several orders (``cancel_all_orders``, ``spot_cancel_all_orders``): the
-    exchange did not cancel some of them. The others were canceled, or were already gone.
+class ProtectionSyncIncompleteException(OrderException):
+    """``resize_protection``: orders were sent, but the position is not protected as asked.
+
+    Every order placed is reduce-only, so together they cannot close more than the position;
+    an old one still open can trigger at its old price. The attributes say what happened, so
+    nothing needs to be guessed; a level with ``outcome_unknown`` may still arrive: look it up
+    by its cloid before placing it again.
 
     Attributes:
-        failed: One entry per order still open: {"symbol", "order_id", "reason"}, the reason
-            being Hyperliquid's text.
+        placed: The orders confirmed placed.
+        kept: The orders that already matched a level and were left as they were.
+        canceled: Ids of the old orders cancelled (or found no longer open).
+        not_canceled: Ids of the old orders that could not be cancelled: may still be open.
+        retained: Ids of the old orders deliberately left open, as the step that would have
+            cancelled them was not reached (a new order failed, or the check before it).
+        missing: The levels not placed, or not open with their size afterwards: dicts of leg,
+            kind ("stop_loss" or "take_profit"), price, size, and outcome_unknown with its
+            cloid when the order may still have arrived.
+        position: The position read afterwards, when it is what did not match; else None.
+    """
+    code = "PROTECTION_SYNC_INCOMPLETE"
+
+    def __init__(self, reason: str, *, placed=(), kept=(), canceled=(), not_canceled=(), retained=(), missing=(),
+                 position=None):
+        self.placed = list(placed)
+        self.kept = list(kept)
+        self.canceled = list(canceled)
+        self.not_canceled = list(not_canceled)
+        self.retained = list(retained)
+        self.missing = list(missing)
+        self.position = position
+        super().__init__(f"Protection not resized as asked: {reason}")
+
+class OrdersNotCanceledException(OrderException):
+    """Canceling several orders (``bulk_cancel``, ``cancel_all_orders``,
+    ``spot_cancel_all_orders``): the exchange did not cancel some of them. The others were
+    canceled, or were already gone.
+
+    Attributes:
+        failed: One entry per order the exchange did not cancel, or whose cancel its answer
+            did not confirm (it may still be open): {"symbol", "order_id", "reason"}, the
+            reason being Hyperliquid's text or saying it was not confirmed.
+        canceled: The order ids this call canceled.
+        not_open: The order ids that were no longer open: filled, canceled before, or never
+            placed (also one a lost first attempt of this call canceled).
     """
     code = "ORDERS_NOT_CANCELED"
-    def __init__(self, failed: list):
+    def __init__(self, failed: list, canceled: Optional[list] = None, not_open: Optional[list] = None):
         self.failed = [dict(entry) for entry in failed]
+        self.canceled = list(canceled or [])
+        self.not_open = list(not_open or [])
         super().__init__("Orders not canceled: " + "; ".join(
             f"{entry['symbol']} {entry['order_id']}: {entry['reason']}" for entry in self.failed))
 
 class PositionNotFoundException(HyperliquidException):
     """Raised when a position is not found."""
     code = "POSITION_NOT_FOUND"
-    def __init__(self, message="Position not found"):
+    def __init__(self, message: str = "Position not found") -> None:
         super().__init__(message)
 
 class PositionNotClosedException(OrderException):

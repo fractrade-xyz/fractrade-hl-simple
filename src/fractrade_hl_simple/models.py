@@ -1,19 +1,19 @@
-from typing import List, TypedDict, Optional, Dict, Union, Literal, Any
-from dataclasses import MISSING, dataclass, fields
+from typing import List, Optional, Dict, Union, Literal, Any
+from dataclasses import MISSING, dataclass, field, fields
 import os
-from dotenv import load_dotenv
+from dotenv import find_dotenv, load_dotenv
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
 from dacite import Config as DaciteConfig
 import eth_account
-import logging
 import re
 
 def load_env_file() -> None:
-    """Load a .env file into os.environ (variables already set win). Called when credentials
-    or the network are read from the environment, never at import: importing the library
-    must not change the environment."""
-    load_dotenv()
+    """Load a .env file into os.environ (variables already set win): the first one found in
+    the working directory or a folder above it. Called when credentials or the network are
+    read from the environment, never at import: importing the library must not change the
+    environment."""
+    load_dotenv(find_dotenv(usecwd=True))
 
 @dataclass(slots=True, kw_only=True)
 class HyperliquidAccount:
@@ -46,7 +46,7 @@ class HyperliquidAccount:
                 account = eth_account.Account.from_key(private_key)
                 public_address = account.address
             except Exception as e:
-                raise ValueError(f"Invalid private key: {str(e)}")
+                raise ValueError(f"Invalid private key: {e}") from e
 
         return cls(
             private_key=private_key,
@@ -325,6 +325,21 @@ class Fill:
         )
 
 @dataclass(slots=True, kw_only=True)
+class Candle:
+    """One candle of a market (Info candleSnapshot). Prices in the market's quote currency."""
+    symbol: str
+    interval: str              # e.g. "15m", "1h", "1d"
+    open_time: int             # ms since the epoch: the candle's first millisecond
+    close_time: int            # ms since the epoch: its last millisecond (in the future while it forms)
+    open: Decimal
+    high: Decimal
+    low: Decimal
+    close: Decimal
+    volume: Decimal            # in the base asset
+    trades: int                # number of trades
+
+
+@dataclass(slots=True, kw_only=True)
 class FundingPayment:
     """One funding payment of an account (Info userFunding): positive usdc was received,
     negative was paid."""
@@ -350,6 +365,74 @@ class FillHistory:
 
 
 @dataclass(slots=True, kw_only=True)
+class ProtectionSync:
+    """The outcome of resize_protection(): the position's stop losses and take profits as asked."""
+    symbol: str
+    position_size: Decimal       # signed: negative is short
+    placed: List["Order"]        # new orders, open
+    kept: List["Order"]          # orders that already matched a level
+    canceled: List[int]          # ids of the old orders cancelled (or found no longer open)
+    untouched: List["Order"]     # native position TP/SL and orders with TP/SL children: not changed by it
+
+
+@dataclass(slots=True, kw_only=True)
+class Trade:
+    """One trade of a perp market, from flat to a position and back to flat (get_pnl). Its
+    figures are in its currency, its dex's collateral (the token its fees are paid in); a fee
+    paid in another token is in fees_other, never in fees."""
+    symbol: str
+    side: str                          # "long" or "short"
+    currency: str                      # its dex's collateral: "USDC", or e.g. "USDH" on some HIP-3 dexes; "unknown"
+    status: str                        # "closed", or "open" at the end of the range
+    opened_at: int                     # ms: its first fill, or the range's start if it was open before it
+    closed_at: Optional[int]           # ms: the fill that made it flat; None while open (without fills
+                                       # in the range: the latest it can have closed, the next trade's opening)
+    opened_before_start: bool          # open when the range started: entry_price covers only fills in the range
+    entry_price: Optional[Decimal]     # average price of the fills that opened or added; None if none in the range
+    exit_price: Optional[Decimal]      # average price of the fills that reduced or closed it; None if none
+    max_size: Decimal                  # the largest position during it, in base units
+    realized_pnl: Decimal              # Hyperliquid's closed PnL of its fills, before fees
+    fees: Decimal                      # paid in USDC
+    fees_other: Dict[str, Decimal]     # paid in other tokens, by token
+    funding: Decimal                   # positive: received
+    net_pnl: Decimal                   # realized_pnl - fees + funding
+    unrealized_pnl: Optional[Decimal]  # an open trade's, now (only when the range ends now)
+    fills: int
+
+
+@dataclass(slots=True, kw_only=True)
+class SpotPnL:
+    """A spot market's figures in a range (get_pnl with spot=True): Hyperliquid's closed PnL of
+    its fills, in the quote token, and the fees by the token they were paid in (a buy pays in
+    the base token)."""
+    symbol: str                        # as the spot methods name it: PURR, HYPE/USDT0
+    realized_pnl: Decimal
+    fees: Dict[str, Decimal]
+    fills: int
+
+
+@dataclass(slots=True, kw_only=True)
+class PnLReport:
+    """An account's trades of a time range and their totals (get_pnl). The totals are of the
+    USDC trades; trades in another currency are added up apart, in other_currencies; fees in a
+    token other than their trade's are in fees_other. truncated, truncated_reason: as
+    FillHistory."""
+    start_time: int
+    end_time: int
+    trades: List[Trade]
+    realized_pnl: Decimal
+    fees: Decimal
+    fees_other: Dict[str, Decimal]
+    funding: Decimal
+    net_pnl: Decimal                   # realized_pnl - fees + funding
+    unrealized_pnl: Optional[Decimal]  # of the open trades, when the range ends now
+    truncated: bool
+    truncated_reason: Optional[str] = None
+    other_currencies: Dict[str, Dict[str, Optional[Decimal]]] = field(default_factory=dict)  # by currency: the same totals
+    spot: Optional[List[SpotPnL]] = None  # with spot=True
+
+
+@dataclass(slots=True, kw_only=True)
 class OrderType:
     """Order type specification. Only one of limit, market, or trigger is set."""
     limit: Optional[Dict[str, Union[Decimal, bool, str]]] = None      # e.g. {"tif": "Gtc"}
@@ -368,8 +451,18 @@ class Order:
     reduce_only: bool = False
     status: str
     time_in_force: str = "GTC"
-    created_at: int
+    # When the exchange placed it (block time, ms); None for the result of placing or modifying
+    # an order: Hyperliquid's answer does not say.
+    created_at: Optional[int]
+    status_time: Optional[int] = None  # get_historical_orders: when the order got its status (ms)
     filled_size: Decimal = Decimal(0)
+    # False when filled_size may not be fills: a reduce-only order read from the exchange (open
+    # orders, order status) that rested and has less open than placed, or a reduce-only
+    # maker_order() result with maker fills (read the same way). Hyperliquid also shrinks a
+    # resting reduce-only order to the position, and its answer gives only the size placed
+    # (origSz) and the size still open (sz), so filled_size (their difference) is fills, a
+    # shrink, or both; the order's fills tell which.
+    filled_size_known: bool = True
     average_fill_price: Optional[Decimal] = None
     limit_price: Optional[Decimal] = None
     trigger_price: Optional[Decimal] = None
@@ -467,7 +560,7 @@ MODEL_TO_API_FIELDS = {v: k for k, v in API_TO_MODEL_FIELDS.items()}
 
 def convert_api_response(response: dict) -> dict:
     """Convert API response keys to model field names."""
-    converted = {}
+    converted: Dict[str, Any] = {}
     for api_key, value in response.items():
         model_key = API_TO_MODEL_FIELDS.get(api_key, api_key)
         if isinstance(value, dict):

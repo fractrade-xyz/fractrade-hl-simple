@@ -2,6 +2,7 @@
 signer, through the server and the real library client with the SDK mocked."""
 
 import json
+from contextlib import nullcontext
 from decimal import Decimal
 import logging
 import threading
@@ -15,11 +16,12 @@ pytest.importorskip("mcp")  # the server needs the [mcp] extra
 
 import anyio  # noqa: E402
 import requests  # noqa: E402
-from hyperliquid.utils import constants  # noqa: E402
 from mcp import Client  # noqa: E402
 
-from fractrade_hl_simple.exceptions import NetworkException  # noqa: E402
+from fractrade_hl_simple import _answers  # noqa: E402
+from fractrade_hl_simple.exceptions import InvalidArgumentException, NetworkException  # noqa: E402
 from fractrade_hl_simple.hyperliquid import HyperliquidClient  # noqa: E402
+from fractrade_hl_simple.mcp_server import guards  # noqa: E402
 from fractrade_hl_simple.mcp_server.accounts import AccountRegistry  # noqa: E402
 from fractrade_hl_simple.mcp_server.config import parse_config  # noqa: E402
 from fractrade_hl_simple.mcp_server.server import build_server  # noqa: E402
@@ -163,17 +165,41 @@ class TestOrders:
         assert (order["order_id"], order["status"], order["filled_size"], order["average_fill_price"]) == (
             3, "filled", "0.001", "85010.0")
         assert len(order["cloid"]) == 34 and body["account"] == "main"
+        # A market order: its limit price is its worst price, so no other cap.
+        assert (order["order_type"], order["is_market"], order["slippage_cap_pct"]) == ("Market", True, None)
 
     def test_a_limit_order_with_post_only_rests_as_maker_under_the_cloid_given(self, session):
         session.trader.exchange.order.return_value = RESTING
         is_error, body = session.one("sell", {"symbol": "BTC", "size": 0.001, "limit_price": 90000.55,
                                               "post_only": True, "cloid": CLOID})
         assert not is_error and (body["data"]["status"], body["data"]["cloid"]) == ("open", CLOID)
+        assert (body["data"]["order_type"], body["data"]["is_market"]) == ("Limit", False)
         assert (sent(session.trader)["limit_px"], sent(session.trader)["order_type"]) == (
             90001.0, {"limit": {"tif": "Alo"}})
         assert session.trader.exchange.order.call_args.kwargs["cloid"].to_raw() == CLOID
         # A sell is valued at the mid if that is higher (it can fill there): one price read.
         session.trader.info.all_mids.assert_called_once_with(dex="")
+
+    def test_a_placed_order_reads_as_the_same_order_read_back_but_for_its_time(self, session):
+        # Seen live: the placement result had the local time the answer arrived, no trigger
+        # condition, no is_position_tpsl and a filled size without the size's decimals, while
+        # get_open_orders showed the exchange's values. The answer has no time: null.
+        session.trader.exchange.order.return_value = RESTING
+        is_error, body = session.one("buy", {"symbol": "ETH", "size": 0.0088, "limit_price": 1250,
+                                             "post_only": True, "cloid": CLOID})
+        assert not is_error
+        placed = body["data"]
+        session.registry.read_client(session.target).info.frontend_open_orders.return_value = [{
+            "coin": "ETH", "side": "B", "limitPx": "1250.0", "sz": "0.0088", "oid": 4,
+            "timestamp": 1_795_023_213_902, "origSz": "0.0088", "triggerCondition": "N/A", "isTrigger": False,
+            "triggerPx": "0.0", "children": [], "isPositionTpsl": False, "reduceOnly": False,
+            "orderType": "Limit", "tif": "Alo", "cloid": CLOID}]
+        is_error, body = session.one("get_open_orders", {"account": "main"})
+        assert not is_error
+        read = body["data"][0]
+        assert (placed.pop("status"), placed.pop("average_fill_price")) == ("open", None)
+        assert (placed.pop("created_at"), read.pop("created_at")) == (None, "2026-11-18T17:33:33.902Z")
+        assert placed == read
 
     def test_post_only_without_a_limit_price_is_refused_and_keeps_the_cloid_free(self, session):
         assert session.code("buy", {"symbol": "BTC", "size": 0.001, "post_only": True, "cloid": CLOID}) == \
@@ -193,6 +219,238 @@ class TestOrders:
         session.trader.info.all_mids.side_effect = [{"BTC": "85000.0"}, {"BTC": "99000.0"}]
         assert not session.one("buy", {"symbol": "BTC", "size": 0.001})[0]
         assert session.trader.info.all_mids.call_count == 1 and sent(session.trader)["limit_px"] == 85850.0
+
+
+class TestNotional:
+    @pytest.mark.parametrize("tool, arguments, signed", [
+        # 99.9996 USD at the limit 99999.6, signed at 100000 (5 significant figures): 0.00099, not 0.001.
+        ("buy", {"symbol": "BTC", "notional_usd": 99.9996, "limit_price": 99999.6}, (0.00099, 100000.0)),
+        # A market order: 100 USD at the mid 3000, rounded down to the lot of 0.0001, sent at the mid minus 1 %.
+        ("sell", {"symbol": "ETH", "notional_usd": 100}, (0.0333, 2970.0)),
+    ], ids=["limit", "market"])
+    def test_a_size_in_usd_is_divided_by_the_price_as_signed_and_rounded_down(self, session, tool, arguments, signed):
+        assert not session.one(tool, arguments)[0]
+        assert (sent(session.trader)["sz"], sent(session.trader)["limit_px"]) == signed
+
+    def test_the_limits_check_the_size_computed(self):
+        # max_order_usd 99.9999. 100 USD at the limit 85000 is 0.00117 BTC, worth 99.45: within it. A
+        # market buy of 99.9999 USD is valued at its worst price, the mid plus 1 %: 100.44, above it.
+        session = Session(parse_config(CONFIG_CAP, "test.toml"))
+        session.trader.exchange.order.return_value = FILLED
+        assert not session.one("buy", {"symbol": "BTC", "notional_usd": 100, "limit_price": 85000})[0]
+        assert sent(session.trader)["sz"] == 0.00117
+        session.trader.exchange.order.reset_mock()
+        assert session.code("buy", {"symbol": "BTC", "notional_usd": 99.9999}) == "GUARD_BLOCKED"
+        session.trader.exchange.order.assert_not_called()
+
+
+def bulk(*statuses):
+    return {"status": "ok", "response": {"type": "order", "data": {"statuses": list(statuses)}}}
+
+
+POST_ONLY_CROSSED = {"error": "Post only order would have immediately matched, bbo was 3000.1@3000.2"}
+TWO = [{"symbol": "BTC", "is_buy": True, "size": 0.0011345, "limit_price": 79999.99},
+       {"symbol": "ETH", "is_buy": False, "size": 0.01, "limit_price": 3100, "post_only": True, "cloid": CLOID}]
+
+
+def signed_batch(session):
+    """The orders of the last bulk action as the SDK was asked to sign them, cloids as text."""
+    return [{**o, "cloid": o["cloid"].to_raw()} for o in session.trader.exchange.bulk_orders.call_args[0][0]]
+
+
+class TestPlaceOrders:
+    def test_the_orders_are_signed_as_prepared_in_one_action_and_each_has_its_outcome(self, session):
+        session.trader.exchange.bulk_orders.return_value = bulk({"resting": {"oid": 11}}, POST_ONLY_CROSSED)
+        is_error, body = session.one("place_orders", {"orders": TWO})
+        assert not is_error, body
+        sent = signed_batch(session)
+        made = sent[0]["cloid"]
+        assert sent == [
+            {"coin": "BTC", "is_buy": True, "sz": 0.00113, "limit_px": 80000.0, "order_type": {"limit": {"tif": "Gtc"}},
+             "reduce_only": False, "cloid": made},
+            {"coin": "ETH", "is_buy": False, "sz": 0.01, "limit_px": 3100.0, "order_type": {"limit": {"tif": "Alo"}},
+             "reduce_only": False, "cloid": CLOID}]
+        session.trader.exchange.order.assert_not_called()
+        placed, rejected = body["data"]["orders"]
+        assert (placed["status"], placed["order_id"], placed["cloid"], placed["size"], placed["order_type"]) == (
+            "open", 11, made, "0.00113", "Limit")
+        assert rejected == {"status": "rejected", "symbol": "ETH", "side": "sell", "size": "0.01", "limit_price": "3100.0",
+                            "reduce_only": False, "time_in_force": "Alo", "cloid": CLOID, "code": "ORDER_REJECTED",
+                            "reason": POST_ONLY_CROSSED["error"]}
+        assert (body["data"]["open"], body["data"]["filled"], body["data"]["rejected"]) == (1, 0, 1)
+        # Both cloids are used: a rejected order's too, as for one order.
+        for cloid in (made, CLOID):
+            assert session.code("buy", {"symbol": "BTC", "size": 0.001, "cloid": cloid}) == "INVALID_ARGUMENT"
+
+    @pytest.mark.parametrize("used_before", [False, True], ids=["given-twice", "used-before"])
+    def test_a_cloid_given_twice_or_used_before_refuses_the_whole_batch(self, session, used_before):
+        orders = TWO if used_before else [TWO[1], {**TWO[1], "cloid": CLOID.upper().replace("0X", "0x")}]
+        if used_before:
+            assert not session.one("buy", {"symbol": "BTC", "size": 0.001, "cloid": CLOID})[0]
+        assert session.code("place_orders", {"orders": orders}) == "INVALID_ARGUMENT"
+        session.trader.exchange.bulk_orders.assert_not_called()
+
+    def test_an_unknown_outcome_names_every_cloid_and_they_stay_used(self, session):
+        session.trader.exchange.bulk_orders.side_effect = requests.ReadTimeout("read timed out")
+        is_error, body = session.one("place_orders", {"orders": TWO})
+        error = body["error"]
+        assert is_error and (error["code"], error["retryable"]) == ("OUTCOME_UNKNOWN", False)
+        cloids = error["details"]["cloids"]
+        assert len(cloids) == 2 and cloids[1] == CLOID and "get_order_status_by_cloid" in error["hint"]
+        assert session.trader.exchange.bulk_orders.call_count == 1  # never sent twice
+        assert session.code("buy", {"symbol": "BTC", "size": 0.001, "cloid": cloids[0]}) == "INVALID_ARGUMENT"
+
+    def test_a_rejection_reason_is_scrubbed_and_cut_like_an_error(self, session):
+        key_like = "ab" * 32
+        session.trader.exchange.bulk_orders.return_value = bulk({"resting": {"oid": 1}},
+                                                                {"error": f"bad {key_like} " + "x" * 600})
+        rejected = session.one("place_orders", {"orders": TWO})[1]["data"]["orders"][1]
+        assert key_like not in rejected["reason"] and "<redacted>" in rejected["reason"]
+        assert len(rejected["reason"]) == 500
+
+
+class TestBatchGuards:
+    def session(self, extra):
+        session = Session(config(extra=extra))
+        session.trader.exchange.bulk_orders.side_effect = lambda orders: bulk(*[{"resting": {"oid": i}}
+                                                                                for i, _ in enumerate(orders)])
+        session.trader.get_account_summary = lambda: SimpleNamespace(account_value=Decimal(1000), margin_used=Decimal(90))
+        return session
+
+    @pytest.mark.parametrize("extra, order, fits, over", [
+        # 10 % of 1000 with 90 in use: at 5x each $40 order is $8 of margin, so one fits and two don't.
+        ("max_total_margin_pct = 10", {"symbol": "BTC", "is_buy": True, "size": 0.0008, "limit_price": 50000}, 1, 2),
+        ("max_orders_per_hour = 3", {"symbol": "BTC", "is_buy": True, "size": 0.001, "limit_price": 50000}, 3, 4),
+    ], ids=["total-margin", "order-rate"])
+    def test_the_account_limits_see_the_batch_together(self, extra, order, fits, over):
+        session = self.session(extra)
+        assert session.code("place_orders", {"orders": [order] * over}) == "GUARD_BLOCKED"
+        session.trader.exchange.bulk_orders.assert_not_called()
+        assert not session.one("place_orders", {"orders": [order] * fits})[0]
+
+    def test_a_reduce_only_batch_is_never_held_back_by_the_account_limits_or_their_reads(self):
+        # Over the total margin, every guardrail read failing, and halted: closing still works.
+        session = self.session("max_total_margin_pct = 1\nmax_daily_loss_pct = 1")
+        session.trader.get_account_summary = MagicMock(side_effect=requests.ConnectionError("down"))
+        session.registry.halt(session.target)
+        closing = [{"symbol": "BTC", "is_buy": False, "size": 0.5, "limit_price": 90000, "reduce_only": True},
+                   {"symbol": "ETH", "is_buy": True, "size": 1, "limit_price": 2900, "reduce_only": True}]
+        is_error, body = session.one("place_orders", {"orders": closing})
+        assert not is_error, body
+        session.trader.get_account_summary.assert_not_called()
+        # One order that adds risk makes it a batch that adds risk: refused while halted.
+        assert session.code("place_orders", {"orders": [closing[0], TWO[0]]}) == "KILL_SWITCH_ENGAGED"
+
+    ORDERS = [{"symbol": "BTC", "is_buy": True, "size": 0.001, "limit_price": 50000, "cloid": CLOID},
+              {"symbol": "ETH", "is_buy": True, "size": 0.01, "limit_price": 2900, "cloid": "0x" + "d" * 32}]
+
+    @pytest.mark.parametrize("outcome, code, used", [
+        ("connect-timeout", "TIMEOUT", False),
+        ("refused-by-the-library", "INVALID_ARGUMENT", False),
+        ("count-not-written", "GUARD_BLOCKED", False),
+        ("over-a-limit", "GUARD_BLOCKED", False),
+        ("read-timeout", "OUTCOME_UNKNOWN", True),
+        ("rejected-as-a-whole", "ORDER_REJECTED", True),
+    ])
+    def test_cloids_and_counts_are_freed_only_when_the_batch_provably_was_not_processed(self, outcome, code, used):
+        session = self.session("max_orders_per_hour = 2")
+        bulk_orders = session.trader.exchange.bulk_orders
+        bulk_orders.side_effect = {"connect-timeout": requests.ConnectTimeout("connect timed out"),
+                                   "read-timeout": requests.ReadTimeout("read timed out")}.get(outcome)
+        bulk_orders.return_value = bulk({"error": "Order price too far from reference price."})
+        orders = list(self.ORDERS)
+        if outcome == "over-a-limit":
+            orders[1] = {**orders[1], "size": 1}  # 2900 USD, above max_order_usd 100
+        library = patch.object(HyperliquidClient, "bulk_order", side_effect=InvalidArgumentException("bad order"))
+        count = patch.object(AccountRegistry, "count_risk_order", side_effect=OSError(28, "No space left on device"))
+        with library if outcome == "refused-by-the-library" else nullcontext(), \
+                count if outcome == "count-not-written" else nullcontext():
+            assert session.code("place_orders", {"orders": orders}) == code
+        cloids = [order["cloid"] for order in self.ORDERS]
+        if used:  # it may be on the book: both orders are counted, each cloid stays used
+            assert session.registry.risk_orders_last_hour(session.target) == 2
+            for cloid in cloids:  # reduce-only: not held back by the order rate
+                assert session.code("sell", {"symbol": "BTC", "size": 0.001, "limit_price": 90000, "reduce_only": True,
+                                             "cloid": cloid}) == "INVALID_ARGUMENT"
+        else:  # both cloids and both counts free again: the same orders go through
+            bulk_orders.side_effect = None
+            bulk_orders.return_value = bulk({"resting": {"oid": 1}}, {"resting": {"oid": 2}})
+            is_error, body = session.one("place_orders", {"orders": self.ORDERS})
+            assert not is_error, body
+
+
+class TestPlaceLadder:
+    def test_steps_evenly_spaced_both_ends_included_each_sized_in_usd(self, session):
+        session.trader.exchange.bulk_orders.side_effect = lambda orders: bulk(*[{"resting": {"oid": i}}
+                                                                                for i, _ in enumerate(orders)])
+        is_error, body = session.one("place_ladder", {"symbol": "ETH", "is_buy": True, "from_price": 3000,
+                                                      "to_price": 2900, "steps": 3, "notional_usd": 30})
+        assert not is_error, body
+        sent = signed_batch(session)
+        # 30 USD at 3000, 2950, 2900, rounded down to the lot of 0.0001.
+        assert [(o["limit_px"], o["sz"]) for o in sent] == [(3000.0, 0.01), (2950.0, 0.0101), (2900.0, 0.0103)]
+        assert len({o["cloid"] for o in sent}) == 3
+        data = body["data"]
+        assert (data["submitted_size"], data["submitted_value"], data["filled_size"], data["open"]) == (
+            "0.0304", "89.665", "0", 3)
+
+    def test_a_size_in_base_units_is_each_steps(self, session):
+        session.trader.exchange.bulk_orders.return_value = bulk({"resting": {"oid": 1}}, {"resting": {"oid": 2}})
+        assert not session.one("place_ladder", {"symbol": "ETH", "is_buy": True, "from_price": 2900,
+                                                "to_price": 3000, "steps": 2, "size": 0.01, "post_only": True})[0]
+        assert [(o["sz"], o["order_type"]) for o in signed_batch(session)] == [(0.01, {"limit": {"tif": "Alo"}})] * 2
+
+
+def open_order(oid, side, price, **raw):
+    return {"coin": "ETH", "side": side, "limitPx": str(price), "sz": "0.01", "oid": oid, "timestamp": 1700000000000,
+            "origSz": "0.01", "orderType": "Limit", "tif": "Gtc", "reduceOnly": False, **raw}
+
+
+def cancel_answer_of(*statuses):
+    return {"status": "ok", "response": {"type": "cancel", "data": {"statuses": list(statuses)}}}
+
+
+GONE = {"error": "Order was never placed, already canceled, or filled. asset=1"}
+
+
+class TestCancelOrders:
+    def test_by_order_id_in_one_action_also_while_halted(self, session):
+        session.registry.halt(session.target)
+        session.trader.exchange.bulk_cancel.return_value = cancel_answer_of("success", GONE)
+        is_error, body = session.one("cancel_orders", {"orders": [{"order_id": 9, "symbol": "BTC"},
+                                                                  {"order_id": 10, "symbol": "ETH"}]})
+        assert not is_error and body["data"] == {"canceled": [9], "not_open": [10], "skipped": []}
+        session.trader.exchange.bulk_cancel.assert_called_once_with([{"coin": "BTC", "oid": 9},
+                                                                     {"coin": "ETH", "oid": 10}])
+
+    def test_the_limit_orders_of_a_symbol_by_side_and_price_never_its_protection(self, session):
+        session.trader.info.frontend_open_orders.return_value = [
+            open_order(1, "B", 2900), open_order(2, "B", 2950), open_order(3, "B", 3010),   # 3: above the range
+            open_order(4, "A", 2950),                                                     # a sell
+            open_order(5, "A", 2950, isTrigger=True, triggerPx="2950", orderType="Stop Market", reduceOnly=True),
+            open_order(6, "B", 2920, children=[{"oid": 61}]),  # its stop loss would be canceled with it
+            {**open_order(7, "B", 2930), "coin": "BTC"},
+        ]
+        session.trader.exchange.bulk_cancel.return_value = cancel_answer_of("success", "success")
+        is_error, body = session.one("cancel_orders", {"symbol": "ETH", "is_buy": True, "min_price": 2900,
+                                                       "max_price": 3000})
+        assert not is_error and body["data"] == {"canceled": [1, 2], "not_open": [], "skipped": [6]}
+        session.trader.exchange.bulk_cancel.assert_called_once_with([{"coin": "ETH", "oid": 1}, {"coin": "ETH", "oid": 2}])
+
+    def test_orders_the_exchange_did_not_cancel_are_named(self, session):
+        session.trader.exchange.bulk_cancel.return_value = cancel_answer_of("success", {"error": "Cancel failed"})
+        is_error, body = session.one("cancel_orders", {"orders": [{"order_id": 9, "symbol": "BTC"},
+                                                                  {"order_id": 10, "symbol": "BTC"}]})
+        assert is_error and body["error"]["code"] == "ORDERS_NOT_CANCELED"
+        assert body["error"]["details"]["failed"] == [{"symbol": "BTC", "order_id": 10, "reason": "Cancel failed"}]
+
+    @pytest.mark.parametrize("arguments, code", [
+        ({"symbol": "BTCC"}, "UNKNOWN_SYMBOL"),  # a typo would match nothing, as if canceled
+        ({}, "INVALID_ARGUMENT"),
+    ])
+    def test_refused_before_anything_is_sent(self, session, arguments, code):
+        assert session.code("cancel_orders", arguments) == code
+        session.trader.exchange.bulk_cancel.assert_not_called()
 
 
 class TestGuards:
@@ -297,6 +555,7 @@ class TestModifyAndCancel:
         is_error, body = session.one("modify_order", {"order_id": 4, "symbol": "BTC", "is_buy": True, "size": 0.001,
                                                       "price": 80000, "order_type": {"limit": {"tif": "Gtc"}}})
         assert not is_error and body["data"]["order_id"] == 99
+        assert (body["data"]["order_type"], body["data"]["is_market"]) == ("Limit", False)
 
     @pytest.mark.parametrize("tool, arguments", [
         ("cancel_order", {"order_id": 4}), ("cancel_order_by_cloid", {"cloid": CLOID})])
@@ -318,6 +577,28 @@ class TestModifyAndCancel:
         assert not is_error and body["data"]["status"] == "open"
         assert (kwargs["oid"], kwargs["sz"], kwargs["limit_px"], kwargs["order_type"]) == (
             4, 0.001, 80001.0, {"limit": {"tif": "Alo"}})
+        # The modified order has a cloid (it used to come back null), and as a limit no position TP/SL.
+        assert body["data"]["cloid"] == kwargs["cloid"].to_raw() and body["data"]["is_position_tpsl"] is False
+
+    def test_a_modify_whose_answer_was_lost_names_its_new_cloid(self, session):
+        session.trader.exchange.modify_order.side_effect = requests.ConnectionError("Connection aborted")
+        is_error, body = session.one("modify_order", {"order_id": 4, "symbol": "BTC", "is_buy": True, "size": 0.001,
+                                                      "price": 80000, "order_type": {"limit": {"tif": "Gtc"}},
+                                                      "cloid": CLOID})
+        assert is_error and body["error"]["code"] == "OUTCOME_UNKNOWN" and body["error"]["details"]["cloid"] == CLOID
+        session.trader.exchange.order.return_value = FILLED
+        assert session.code("buy", {"symbol": "BTC", "size": 0.001, "cloid": CLOID}) == "INVALID_ARGUMENT"  # still used
+
+    def test_modifying_a_trigger_order_is_refused_before_sending(self, session):
+        # Seen live: sent, then refused by Hyperliquid ("Attempted to modify to invalid new order").
+        session.trader.info.frontend_open_orders.return_value = [{
+            "coin": "BTC", "side": "A", "limitPx": "72000.0", "sz": "0.001", "oid": 4, "timestamp": 1_700_000_000_000,
+            "origSz": "0.001", "triggerPx": "80000.0", "isTrigger": True, "orderType": "Stop Market",
+            "reduceOnly": True, "tif": None, "cloid": None}]
+        is_error, body = session.one("modify_order", {"order_id": 4, "symbol": "BTC", "is_buy": False, "size": 0.001,
+                                                      "price": 79000, "order_type": {"limit": {"tif": "Gtc"}}})
+        assert is_error and body["error"]["code"] == "INVALID_ARGUMENT" and "update_stop_loss" in body["error"]["hint"]
+        session.trader.exchange.modify_order.assert_not_called()
 
     def test_a_trigger_order_type_is_not_accepted(self, session):
         # Hyperliquid does not modify trigger orders; update_stop_loss moves a stop.
@@ -397,18 +678,19 @@ class TestAccountState:
         assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "SIGNER_NOT_AUTHORIZED"
         session.trader.exchange.order.assert_not_called()
 
-    def test_the_key_is_looked_up_again_before_an_order_that_adds_risk_but_not_before_a_close(self, session):
+    def test_the_key_is_looked_up_before_every_order_and_a_close_works_while_the_lookup_fails(self, session):
         reader = session.registry.read_client(session.target)
         agent = {"role": "agent", "data": {"user": session.target.address}}
-        reader.info.user_role.side_effect = [agent, agent, {"role": "missing"}]
+        down = requests.ConnectionError("connection reset")
+        reader.info.user_role.side_effect = [agent, down, down, {"role": "missing"}]
         session.trader.info.user_state.return_value = state(("BTC", "0.002"))
         session.trader.exchange.order.return_value = filled(5, "0.002")
-        assert not session.one("buy", {"symbol": "BTC", "size": 0.001})[0]      # lookup 1
-        assert not session.one("close", {"symbol": "BTC"})[0]                    # the kept result
-        assert not session.one("buy", {"symbol": "BTC", "size": 0.001})[0]      # lookup 2
+        assert not session.one("buy", {"symbol": "BTC", "size": 0.001})[0]          # confirmed
+        assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "NETWORK_ERROR"
+        assert not session.one("close", {"symbol": "BTC"})[0]                        # the confirmed result
         sent_before = session.trader.exchange.order.call_count
-        assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "SIGNER_NOT_AUTHORIZED"  # lookup 3
-        assert session.trader.exchange.order.call_count == sent_before and reader.info.user_role.call_count == 3
+        assert session.code("close", {"symbol": "BTC"}) == "SIGNER_NOT_AUTHORIZED"   # the approval was removed
+        assert session.trader.exchange.order.call_count == sent_before and reader.info.user_role.call_count == 4
 
     def test_a_watch_account_cannot_trade(self, session):
         assert session.code("buy", {"account": "whale", "symbol": "BTC", "size": 0.001}) == "TRADING_DISABLED"
@@ -418,9 +700,10 @@ class TestAccountState:
         trade = [spec.name for spec in trade_tools(session.registry)]
         hints = {name: (tools[name].annotations.read_only_hint, tools[name].annotations.destructive_hint,
                         tools[name].annotations.idempotent_hint) for name in trade}
-        idempotent = {"cancel_order", "cancel_order_by_cloid", "cancel_all_orders", "set_leverage", "kill_switch"}
-        # set_leverage and kill_switch change nothing that cannot be changed back: no extra friction in an emergency.
-        not_destructive = {"set_leverage", "kill_switch"}
+        idempotent = {"cancel_order", "cancel_order_by_cloid", "cancel_orders", "cancel_all_orders", "set_leverage",
+                      "kill_switch"}
+        # set_leverage changes nothing that cannot be changed back; the kill switch cancels entry orders.
+        not_destructive = {"set_leverage"}
         assert hints == {name: (False, name not in not_destructive, name in idempotent) for name in trade}
 
 
@@ -505,6 +788,9 @@ class TestProtection:
         signed = session.trader.exchange.order.call_args.kwargs
         assert not is_error and (body["data"]["type"], body["data"]["status"], body["data"]["cloid"]) == (
             "stop_loss", "open", CLOID)
+        # Placed as a market trigger: Hyperliquid's 10 % tolerance, whatever its limit price shows.
+        assert (body["data"]["order_type"], body["data"]["is_market"], body["data"]["slippage_cap_pct"]) == (
+            "Stop Market", True, 10.0)
         assert (signed["is_buy"], signed["reduce_only"], signed["order_type"]) == (
             True, True, {"trigger": {"triggerPx": 90001.0, "isMarket": True, "tpsl": "sl"}})
 
@@ -523,12 +809,29 @@ class TestProtection:
         session.trader.exchange.order.return_value = resting(7)
         assert not session.one("stop_loss", {"symbol": "BTC", "size": 0.002, "trigger_price": 80000})[0]
 
+    def test_moving_one_of_several_take_profits_says_they_became_one(self, session):
+        # Seen live: two take profits (62,300 / 62,800) were replaced by one, silently.
+        session.trader.info.user_state.return_value = state(("BTC", "0.002"))
+        tp = {"coin": "BTC", "side": "A", "limitPx": "90000.0", "sz": "0.001", "oid": 6, "timestamp": 1_700_000_000_000,
+              "origSz": "0.001", "triggerPx": "90000.0", "isTrigger": True, "orderType": "Take Profit Market",
+              "reduceOnly": True, "tif": None, "cloid": None}
+        both = [tp, {**tp, "oid": 7, "triggerPx": "92000.0"}]
+        new = {**tp, "oid": 9, "sz": "0.002", "origSz": "0.002", "triggerPx": "91000.0"}
+        session.trader.info.frontend_open_orders.side_effect = [both, both, [*both, new]]
+        session.trader.exchange.order.return_value = resting(9)
+        session.trader.exchange.cancel.return_value = cancel_answer("success")
+        is_error, body = session.one("update_take_profit", {"symbol": "BTC", "new_price": 91000})
+        assert not is_error and body["data"]["warnings"] == [
+            "2 take profits were open before this call: update_take_profit replaces them with this one for the whole "
+            "position; to keep several levels, use sync_protection"]
+
     def test_moving_a_stop_loss_places_the_new_one_then_cancels_the_old(self, session):
         session.trader.info.user_state.return_value = state(("BTC", "0.002"))
-        session.trader.info.frontend_open_orders.return_value = [{
-            "coin": "BTC", "side": "A", "limitPx": "80000.0", "sz": "0.002", "oid": 6, "timestamp": 1_700_000_000_000,
-            "origSz": "0.002", "triggerPx": "80000.0", "isTrigger": True, "orderType": "Stop Market",
-            "reduceOnly": True, "tif": None, "cloid": None}]
+        old = {"coin": "BTC", "side": "A", "limitPx": "80000.0", "sz": "0.002", "oid": 6, "timestamp": 1_700_000_000_000,
+               "origSz": "0.002", "triggerPx": "80000.0", "isTrigger": True, "orderType": "Stop Market",
+               "reduceOnly": True, "tif": None, "cloid": None}
+        # Read by the tool (how many it replaces), by the library, and again after placing: the new stop is open.
+        session.trader.info.frontend_open_orders.side_effect = [[old], [old], [old, {**old, "oid": 9, "triggerPx": "81000.0"}]]
         session.trader.exchange.order.return_value = resting(9)
         session.trader.exchange.cancel.return_value = cancel_answer("success")
         is_error, body = session.one("update_stop_loss", {"symbol": "BTC", "new_price": 81000})
@@ -536,6 +839,43 @@ class TestProtection:
         assert session.trader.exchange.cancel.call_args.args == ("BTC", 6)
         assert session.code("buy", {"symbol": "BTC", "size": 0.001, "cloid": body["data"]["cloid"]}) == \
             "INVALID_ARGUMENT"
+
+    STOP_6 = {"coin": "BTC", "side": "A", "limitPx": "80000.0", "sz": "0.001", "oid": 6, "timestamp": 1_700_000_000_000,
+              "origSz": "0.001", "triggerPx": "80000.0", "isTrigger": True, "orderType": "Stop Market",
+              "reduceOnly": True, "tif": None, "cloid": None}
+
+    def test_sync_protection_resizes_the_stop_to_the_position_also_while_halted(self, session):
+        session.registry.halt(session.target)
+        session.trader.info.user_state.return_value = state(("BTC", "0.002"))
+        session.trader.info.frontend_open_orders.side_effect = [
+            [self.STOP_6]] + [[{**self.STOP_6, "oid": 9, "sz": "0.002", "origSz": "0.002"}]] * 2
+        session.trader.exchange.order.return_value = resting(9)
+        session.trader.exchange.cancel.return_value = cancel_answer("success")
+        is_error, body = session.one("sync_protection", {"symbol": "BTC", "stop_losses": [{"price": 80000, "fraction": 1}]})
+        data = body["data"]
+        assert not is_error and ([o["order_id"] for o in data["placed"]], data["canceled"], data["position_size"]) == (
+            [9], [6], "0.002")
+        assert sent(session.trader)["sz"] == 0.002
+        # Its cloid is remembered as used (a reduce-only order runs while halted).
+        assert session.code("sell", {"symbol": "BTC", "size": 0.001, "reduce_only": True,
+                                     "cloid": data["placed"][0]["cloid"]}) == "INVALID_ARGUMENT"
+
+    def test_every_cloid_of_a_sync_not_done_as_asked_is_remembered(self, session):
+        # One stop placed, the next one's answer lost: both may be on the book.
+        session.trader.info.user_state.return_value = state(("BTC", "0.002"))
+        session.trader.info.frontend_open_orders.return_value = []
+        session.trader.exchange.order.side_effect = [resting(9), requests.ConnectionError("Connection aborted")]
+        session.trader.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"):
+            is_error, body = session.one("sync_protection", {"symbol": "BTC", "stop_losses": [
+                {"price": 80000, "fraction": 0.5}, {"price": 79000, "fraction": 0.5}]})
+        assert is_error and body["error"]["code"] == "PROTECTION_SYNC_INCOMPLETE"
+        details = body["error"]["details"]
+        cloids = [details["placed"][0]["cloid"], details["missing"][0]["cloid"]]
+        assert details["missing"][0]["outcome_unknown"] and None not in cloids
+        session.trader.exchange.order.side_effect = None
+        for cloid in cloids:
+            assert session.code("buy", {"symbol": "BTC", "size": 0.001, "cloid": cloid}) == "INVALID_ARGUMENT"
 
     def test_a_replacement_that_does_not_cover_the_position_keeps_the_old_one_and_says_so(self, session):
         # Read for the size, for the new order's side, and again to check: it grew meanwhile.
@@ -591,10 +931,11 @@ class TestLibraryCloids:
 class TestReplacementOrder:
     def setup(self, session):
         session.trader.info.user_state.return_value = state(("BTC", "0.002"))
-        session.trader.info.frontend_open_orders.return_value = [{
-            "coin": "BTC", "side": "A", "limitPx": "80000.0", "sz": "0.002", "oid": 6, "timestamp": 1_700_000_000_000,
-            "origSz": "0.002", "triggerPx": "80000.0", "isTrigger": True, "orderType": "Stop Market",
-            "reduceOnly": True, "tif": None, "cloid": None}]
+        old = {"coin": "BTC", "side": "A", "limitPx": "80000.0", "sz": "0.002", "oid": 6, "timestamp": 1_700_000_000_000,
+               "origSz": "0.002", "triggerPx": "80000.0", "isTrigger": True, "orderType": "Stop Market",
+               "reduceOnly": True, "tif": None, "cloid": None}
+        # Read by the tool (how many it replaces), by the library, and again after placing: the new stop is open.
+        session.trader.info.frontend_open_orders.side_effect = [[old], [old], [old, {**old, "oid": 9, "triggerPx": "81000.0"}]]
         session.trader.exchange.order.return_value = resting(9)
 
     def test_the_new_stop_is_placed_before_the_old_one_is_canceled(self, session):
@@ -693,21 +1034,34 @@ class TestKillSwitch:
     def reader(self, session):
         return session.registry.read_client(session.target)
 
-    def test_it_halts_and_reports_what_is_still_live(self, session):
+    def test_it_halts_cancels_the_entries_and_reports_what_is_still_live(self, session):
+        short = state(("BTC", "-0.002"))
+        stop = {"coin": "BTC", "side": "B", "limitPx": "90000.0", "sz": "0.002", "oid": 6, "timestamp": 1_700_000_000_000,
+                "origSz": "0.002", "triggerPx": "90000.0", "isTrigger": True, "orderType": "Stop Market",
+                "reduceOnly": True, "tif": None, "cloid": None}
+        spot = {"coin": "@107", "side": "B", "limitPx": "1.0", "sz": "1", "oid": 7, "timestamp": 1_700_000_000_000,
+                "origSz": "1", "orderType": "Limit", "reduceOnly": False, "tif": "Gtc", "cloid": None}
+        # Of the short's orders: a buy limit without reduce_only still closes it (kept); a sell
+        # stop below adds to it, and an ETH buy opens a position (both canceled).
+        closing = dict(stop, oid=8, orderType="Limit", isTrigger=False, triggerPx="0.0", reduceOnly=False, tif="Gtc")
+        adding = dict(stop, oid=9, side="A", triggerPx="80000.0", limitPx="72000.0", reduceOnly=False)
+        opening = dict(closing, oid=10, coin="ETH", side="B", limitPx="3000.0")
+        session.trader.info.user_state.return_value = short
+        session.trader.info.frontend_open_orders.return_value = [stop, spot, closing, adding, opening]
+        session.trader.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
+            "statuses": ["success", {"error": "Order was never placed, already canceled, or filled. asset=1"}]}}}
         reader = self.reader(session)
-        reader.info.user_state.return_value = state(("BTC", "-0.002"))
-        reader.info.frontend_open_orders.return_value = [
-            {"coin": "BTC", "side": "B", "limitPx": "90000.0", "sz": "0.002", "oid": 6, "timestamp": 1_700_000_000_000,
-             "origSz": "0.002", "triggerPx": "90000.0", "isTrigger": True, "orderType": "Stop Market",
-             "reduceOnly": True, "tif": None, "cloid": None},
-            {"coin": "@107", "side": "B", "limitPx": "1.0", "sz": "1", "oid": 7, "timestamp": 1_700_000_000_000,
-             "origSz": "1", "orderType": "Limit", "reduceOnly": False, "tif": "Gtc", "cloid": None}]
+        reader.info.user_state.return_value = short
+        reader.info.frontend_open_orders.return_value = [stop, spot, closing]
         is_error, body = session.one("kill_switch", {})
         assert not is_error and body["halted"] == ["main"]
+        [cancels] = session.trader.exchange.bulk_cancel.call_args.args
+        assert cancels == [{"coin": "BTC", "oid": 9}, {"coin": "ETH", "oid": 10}]
         account = body["accounts"][0]
+        assert account["entries"] == {"canceled": [9], "not_open": [10], "not_canceled": [], "error": None}
         assert (account["halted"], account["positions"], account["open_orders"], account["error"]) == (
-            True, [{"symbol": "BTC", "dex": None, "side": "short", "size": "0.002"}],
-            {"count": 1, "stop_losses": 1, "take_profits": 0}, None)  # the spot order is not counted
+            True, [{"symbol": "BTC", "dex": None, "side": "short", "size": "0.002", "unprotected_size": "0"}],
+            {"count": 2, "stop_losses": 1, "take_profits": 0}, None)  # the spot order is not counted
         assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "KILL_SWITCH_ENGAGED"
         session.trader.info.user_state.return_value = state(("BTC", "-0.002"))
         session.trader.exchange.order.return_value = filled(5, "0.002")
@@ -750,23 +1104,54 @@ max_leverage = 5
         assert not is_error and body["halted"] == ["main", "copy"]
         assert all(session.registry.is_halted(t) for t in session.registry.trading_targets())
 
-    def test_it_does_not_wait_for_a_trade_call_that_is_running(self, session):
+    def test_each_cancels_outcome_is_reported(self, session):
+        # In one answer: canceled, already gone, in no documented format, refused.
+        entries = [{"coin": "BTC", "side": "B", "limitPx": "80000.0", "sz": "0.001", "oid": oid,
+                    "timestamp": 1_700_000_000_000, "origSz": "0.001", "orderType": "Limit", "reduceOnly": False,
+                    "tif": "Gtc", "cloid": None} for oid in (11, 12, 13, 14)]
+        session.trader.info.user_state.return_value = state()
+        session.trader.info.frontend_open_orders.return_value = entries
+        session.trader.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
+            "statuses": ["success", {"error": "Order was never placed, already canceled, or filled. asset=0"},
+                         {"status": "success"}, {"error": "Too many cancels"}]}}}
+        entries_report = session.one("kill_switch", {})[1]["accounts"][0]["entries"]
+        assert (entries_report["canceled"], entries_report["not_open"]) == ([11], [12])
+        assert [(row["order_id"], "not confirmed" in row["reason"]) for row in entries_report["not_canceled"]] == [
+            (13, True), (14, False)]
+
+    def test_it_halts_at_once_and_cancels_the_order_of_a_trade_call_still_running(self, session):
         tools = {spec.name: spec for spec in trade_tools(session.registry)}
-        started, release = threading.Event(), threading.Event()
+        started, release, placed = threading.Event(), threading.Event(), threading.Event()
+        rests = {"coin": "BTC", "side": "B", "limitPx": "80000.0", "sz": "0.001", "oid": 4, "timestamp": 1_700_000_000_000,
+                 "origSz": "0.001", "orderType": "Limit", "reduceOnly": False, "tif": "Gtc", "cloid": None}
 
         def slow_order(**kwargs):
             started.set()
             release.wait(5)
-            return FILLED
+            placed.set()
+            return RESTING
 
         session.trader.exchange.order.side_effect = slow_order
-        buying = threading.Thread(target=tools["buy"].run, args=({"symbol": "BTC", "size": 0.001},))
+        # The buy's limit order is open once the buy has sent it.
+        session.trader.info.frontend_open_orders.side_effect = lambda *a, **k: [rests] if placed.is_set() else []
+        session.trader.info.user_state.return_value = state()
+        session.trader.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
+            "statuses": ["success"]}}}
+        buying = threading.Thread(target=tools["buy"].run, args=({"symbol": "BTC", "size": 0.001, "limit_price": 80000},))
         buying.start()
         assert started.wait(5)
-        halted = tools["kill_switch"].run({})  # while the buy holds the account lock
-        assert halted["halted"] == ["main"] and buying.is_alive()
+        result = {}
+        halting = threading.Thread(target=lambda: result.update(tools["kill_switch"].run({})))
+        halting.start()  # while the buy holds the account lock
+        deadline = time.monotonic() + 5
+        while not session.registry.is_halted(session.target) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert session.registry.is_halted(session.target) and buying.is_alive()  # halted before the buy ends
+        time.sleep(0.3)  # a kill switch that did not wait for the buy would read the orders now
         release.set()
         buying.join(5)
+        halting.join(5)
+        assert result["accounts"][0]["entries"]["canceled"] == [4]  # it waited for the buy, and saw its order
 
     def test_a_halt_never_waits_for_capacity_while_reports_hang(self):
         # Two kill switches whose reports hang on the network hold every emergency thread; a
@@ -837,7 +1222,7 @@ perp_dexs = ["xyz"]
         reader.info.frontend_open_orders.return_value = []
         account = session.one("kill_switch", {})[1]["accounts"][0]
         assert (account["dexes_read"], account["dexes_traded"]) == (["default", "xyz"], ["default"])
-        assert account["positions"] == [{"symbol": "xyz:NVDA", "dex": "xyz", "side": "long", "size": "3"}]
+        assert account["positions"] == [{"symbol": "xyz:NVDA", "dex": "xyz", "side": "long", "size": "3", "unprotected_size": "3"}]
 
     def test_a_halt_never_waits_for_a_blocked_log(self):
         # A blocked stderr (the server's log handler) must not delay another account's halt.
@@ -900,6 +1285,75 @@ max_leverage = 5
         reader.info.frontend_open_orders.return_value = []
         account = session.one("kill_switch", {})[1]["accounts"][0]
         assert account["dexes_read"] == ["default", "xyz"]
+
+
+class TestLimitsWithAMode:
+    """max_day_loss_pct and max_total_notional_x: warn lets the order through with a warning,
+    block refuses it."""
+
+    @staticmethod
+    def session(extra):
+        session = Session(config(extra=extra))
+        session.trader.exchange.order.return_value = FILLED
+        return session
+
+    @pytest.mark.parametrize("mode", ["warn", "block"])
+    def test_todays_loss_over_the_limit(self, mode):
+        session = self.session(f'max_day_loss_pct = 4\nmax_day_loss_mode = "{mode}"')
+        now = int(time.time() * 1000)
+        before = guards.day_start_ms(now, "00:00", "UTC") - 600_000  # Hyperliquid's last record before the day
+        session.trader.get_portfolio = lambda: {"day": {"accountValueHistory": [[before, "1000"], [now, "940"]],
+                                                        "pnlHistory": [[before, "0"], [now, "-60"]]}}
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001})
+        if mode == "warn":
+            assert not is_error and [w["rule"] for w in body["warnings"]] == ["max_day_loss_pct"]
+            assert "6 % reached 4 %" in body["warnings"][0]["detail"]
+        else:
+            assert is_error and body["error"]["code"] == "GUARD_BLOCKED"
+            session.trader.exchange.order.assert_not_called()
+
+    def test_resting_entries_count_toward_the_total_notional(self):
+        # They can fill: two of them could otherwise pass one at a time.
+        session = self.session('max_total_notional_x = 3\nmax_total_notional_mode = "block"')
+        position = SimpleNamespace(size=Decimal("0.02"), position_value=Decimal("1800"))
+        session.trader.get_account_summary = lambda: SimpleNamespace(
+            account_value=Decimal(1000), margin_used=Decimal(0), dexes=[SimpleNamespace(positions=[position])])
+        entry = _answers.parse_open_order({
+            "coin": "BTC", "side": "B", "limitPx": "80000.0", "sz": "0.015", "oid": 5, "timestamp": 1_700_000_000_000,
+            "origSz": "0.015", "isTrigger": False, "orderType": "Limit", "reduceOnly": False, "tif": "Gtc"}, "BTC")
+        session.trader.get_open_orders = lambda: [entry]
+        assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "GUARD_BLOCKED"  # 1800 + 1200 + 86 > 3000
+        session.trader.get_open_orders = lambda: []
+        assert not session.one("buy", {"symbol": "BTC", "size": 0.001})[0]
+
+    def test_a_pending_sell_counts_at_the_mid_as_a_new_one_would(self):
+        # A sell stop at 81000 below the 85000 mid: 1215 at its trigger, 1275 at the mid, which a
+        # new sell is valued at. 1650 + 1275 + the buy's 86 is over 3000; at the trigger it was not.
+        session = self.session('max_total_notional_x = 3\nmax_total_notional_mode = "block"')
+        position = SimpleNamespace(size=Decimal("0.02"), position_value=Decimal("1650"))
+        session.trader.get_account_summary = lambda: SimpleNamespace(
+            account_value=Decimal(1000), margin_used=Decimal(0), dexes=[SimpleNamespace(positions=[position])])
+        pending = _answers.parse_open_order({
+            "coin": "BTC", "side": "A", "limitPx": "72900.0", "sz": "0.015", "oid": 5, "timestamp": 1_700_000_000_000,
+            "origSz": "0.015", "isTrigger": True, "triggerPx": "81000.0", "orderType": "Stop Market",
+            "reduceOnly": False, "tif": None}, "BTC")
+        session.trader.get_open_orders = lambda: [pending]
+        assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "GUARD_BLOCKED"
+        # Without the mid the pending sell's value is not known: the total cannot be checked.
+        price = session.trader.get_price
+        session.trader.get_price = lambda symbol=None: {} if symbol is None else price(symbol)
+        position.position_value = Decimal("100")
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001})
+        assert is_error and "the total notional cannot be checked" in body["error"]["message"]
+
+    def test_a_limit_in_warn_mode_that_cannot_be_read_warns_and_the_order_goes_through(self):
+        session = self.session("max_day_loss_pct = 4")  # warn by default
+
+        def down():
+            raise NetworkException("Connection reset by peer")
+        session.trader.get_portfolio = down
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001})
+        assert not is_error and "cannot be checked" in body["warnings"][0]["detail"]
 
 
 class TestRiskGuardrailsThroughTheTools:
@@ -984,19 +1438,19 @@ class TestDayLoss:
 
     def test_a_deposit_is_not_a_gain_and_raises_the_base(self):
         # 1008 a day ago, 598 deposited, then 75 lost: 75 of 1606, not of 1008.
-        from fractrade_hl_simple.mcp_server.tools.trade import _day_loss
+        from fractrade_hl_simple.mcp_server.guards import portfolio_day_loss as _day_loss
         assert _day_loss(self.day(["1008", "1606", "1531"], ["0", "0", "-75"])) == (Decimal(75), Decimal(1606))
 
     def test_an_account_funded_today_is_covered(self):
         # 0 a day ago: the value 24 hours ago alone would make every loss 0 % (or a division by 0).
-        from fractrade_hl_simple.mcp_server.tools.trade import _day_loss
+        from fractrade_hl_simple.mcp_server.guards import portfolio_day_loss as _day_loss
         loss, capital = _day_loss(self.day(["0", "1000", "880"], ["0", "0", "-120"]))
         assert (loss, capital) == (Decimal(120), Decimal(1000))
 
     @pytest.mark.parametrize("portfolio", [None, [["day", None]], [["day", {"pnlHistory": [[0, "x"]],
                                                                                 "accountValueHistory": [[0, "1"]]}]]])
     def test_an_answer_in_no_documented_format_is_not_established(self, portfolio):
-        from fractrade_hl_simple.mcp_server.tools.trade import _day_loss
+        from fractrade_hl_simple.mcp_server.guards import portfolio_day_loss as _day_loss
         assert _day_loss(portfolio) == (None, None)
 
 
@@ -1268,15 +1722,6 @@ class TestWhenTheSharedStateCannotBeWritten:
         is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001})
         assert not is_error and body["data"]["status"] == "filled"
 
-    def test_an_unexpected_error_is_logged_once(self, caplog):
-        # The tool's own log line built the whole error body, which logged the traceback too.
-        session = Session()
-        session.trader.exchange.order.side_effect = AttributeError("a bug")
-        with caplog.at_level(logging.INFO):
-            assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "INTERNAL"
-        assert [r.getMessage() for r in caplog.records].count("unexpected error in a tool call") == 1
-        assert any(r.getMessage().endswith(": INTERNAL") for r in caplog.records)
-
     def test_any_failure_of_the_bookkeeping_after_an_order_leaves_its_result(self, monkeypatch):
         # Not only a full disk: e.g. a damaged file's decoding error came back as INTERNAL,
         # and the agent never saw the filled order.
@@ -1299,11 +1744,18 @@ class TestWhenTheSharedStateCannotBeWritten:
         assert "the order was not sent" in body["error"]["message"]
         session.trader.exchange.order.assert_not_called()
 
-    def test_a_halt_that_cannot_be_shared_still_halts_this_chat_and_says_so(self, monkeypatch):
+    def test_a_halt_that_cannot_be_shared_still_halts_this_chat_cancels_and_says_so(self, monkeypatch):
         session = Session()
         self.full_disk(monkeypatch, session, "halt")
+        session.trader.info.user_state.return_value = state()
+        session.trader.info.frontend_open_orders.return_value = [
+            {"coin": "BTC", "side": "B", "limitPx": "80000.0", "sz": "0.001", "oid": 4, "timestamp": 1_700_000_000_000,
+             "origSz": "0.001", "orderType": "Limit", "reduceOnly": False, "tif": "Gtc", "cloid": None}]
+        session.trader.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
+            "statuses": ["success"]}}}
         is_error, body = session.one("kill_switch", {})
         assert is_error and "halted in this server only" in body["error"]["message"]
+        assert body["error"]["details"]["accounts"][0]["entries"]["canceled"] == [4]  # canceled all the same
         assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "KILL_SWITCH_ENGAGED"
 
 
@@ -1482,6 +1934,122 @@ max_leverage = 5
         assert len(self.orders(session)) == 3  # the entry, the first stop, the rejected second: no close
 
 
+class TestTriggerEntry:
+    """place_trigger_entry: a stop order of its own (Hyperliquid attaches no stop loss to one),
+    checked as an order that adds risk at the most it can enter at."""
+
+    LONG = {"symbol": "BTC", "side": "long", "size": 0.001, "trigger_price": 90000}
+
+    @staticmethod
+    def session(conf=None):
+        session = Session(conf)
+        session.trader.exchange.order.return_value = resting(20)
+        return session
+
+    @staticmethod
+    def capped(cap):
+        return parse_config(CONFIG_CAP.replace("max_order_usd = 99.9999", f"max_order_usd = {cap}"), "test.toml")
+
+    def test_it_places_a_stop_order_that_opens_the_position(self):
+        session = self.session()
+        is_error, body = session.one("place_trigger_entry", self.LONG)
+        assert not is_error and (body["data"]["order_id"], body["data"]["status"]) == (20, "open")
+        assert body["data"]["type"] == "trigger_entry"  # no stop loss of a position
+        signed = sent(session.trader)
+        assert (signed["is_buy"], signed["reduce_only"], signed["order_type"]) == (
+            True, False, {"trigger": {"triggerPx": 90000.0, "isMarket": True, "tpsl": "sl"}})
+        session.trader.exchange.bulk_orders.assert_not_called()
+
+    @pytest.mark.parametrize("arguments, cap, valued", [
+        # a long stop market: 99 USD at Hyperliquid's 10 % tolerance above the 90000 trigger
+        ({}, "95", "0.001 at 99000"),
+        # a short stop market below the price: at the mid (85000), the higher, not at 81000 or 72900
+        ({"side": "short", "trigger_price": 81000}, "84", "0.001 at 85000"),
+        # 90006 * 1.1 = 99006.6, signed as 99007: valued at the price that is signed
+        ({"trigger_price": 90006}, "99.0068", "0.001 at 99007"),
+    ])
+    def test_it_is_valued_at_the_most_it_can_enter_at(self, arguments, cap, valued):
+        session = self.session(self.capped(cap))
+        is_error, body = session.one("place_trigger_entry", {**self.LONG, **arguments})
+        assert is_error and body["error"]["code"] == "GUARD_BLOCKED" and f"({valued})" in body["error"]["message"]
+        session.trader.exchange.order.assert_not_called()
+
+    @pytest.mark.parametrize("arguments, signed", [
+        ({}, 0.00111),                      # 100 USD at the 90000 trigger
+        ({"limit_price": 90450}, 0.0011),  # at its limit
+    ])
+    def test_notional_usd_is_sized_at_the_entry_price(self, arguments, signed):
+        session = self.session(self.capped(1000))
+        trade = {key: value for key, value in self.LONG.items() if key != "size"}
+        assert not session.one("place_trigger_entry", {**trade, "notional_usd": 100, **arguments})[0]
+        assert sent(session.trader)["sz"] == signed
+
+    def test_it_counts_as_one_order_for_the_order_rate(self):
+        session = self.session(config(extra="max_orders_per_hour = 1"))
+        assert not session.one("place_trigger_entry", self.LONG)[0]
+        assert session.code("place_trigger_entry", self.LONG) == "GUARD_BLOCKED"
+
+    def test_its_cloid_stays_used_after_an_unknown_outcome(self):
+        session = self.session()
+        session.trader.exchange.order.side_effect = requests.ConnectionError("Connection aborted")
+        session.trader.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"):
+            is_error, body = session.one("place_trigger_entry", {**self.LONG, "cloid": CLOID})
+        assert is_error and body["error"]["code"] == "OUTCOME_UNKNOWN"
+        session.trader.exchange.order.side_effect = None
+        session.trader.exchange.order.return_value = FILLED
+        assert session.code("buy", {"symbol": "BTC", "size": 0.001, "cloid": CLOID}) == "INVALID_ARGUMENT"
+
+    def test_without_a_stop_loss_it_is_refused_under_max_risk_pct(self):
+        session = self.session(config(extra="max_risk_pct = 1"))
+        session.trader.get_account_summary = lambda: SimpleNamespace(account_value=Decimal(1000), margin_used=Decimal(0))
+        is_error, body = session.one("place_trigger_entry", self.LONG)
+        assert is_error and "open the trade with open_position" in body["error"]["message"]
+        session.trader.exchange.order.assert_not_called()
+
+    def test_attached_orders_show_under_their_entry_until_it_fills(self):
+        session = self.session()
+        child = {"coin": "BTC", "side": "A", "limitPx": "79200.0", "sz": "0.001", "oid": 21,
+                 "timestamp": 1_700_000_000_000, "origSz": "0.001", "triggerPx": "88000.0", "isTrigger": True,
+                 "orderType": "Stop Market", "reduceOnly": True, "tif": None, "cloid": None}
+        entry = dict(child, oid=20, side="B", limitPx="84000.0", isTrigger=False, triggerPx="0.0",
+                     orderType="Limit", reduceOnly=False, tif="Gtc", children=[child])
+        stop_entry = dict(child, oid=22, side="B", triggerPx="90000.0", limitPx="99000.0", reduceOnly=False)
+        session.registry.read_client(session.target).info.frontend_open_orders.return_value = [entry, stop_entry]
+        is_error, body = session.one("get_open_orders", {"account": "main"})
+        shown, trigger = body["data"]
+        assert not is_error and (shown["order_id"], shown["reduce_only"], shown["side"]) == (20, False, "buy")
+        assert (trigger["order_id"], trigger["type"]) == (22, "trigger_entry")
+        assert [(c["order_id"], c["type"], c["side"], c["reduce_only"]) for c in shown["children"]] == [
+            (21, "stop_loss", "sell", True)]
+
+
+class TestRestingEntry:
+    """open_position with limit_price: the limit rests with its stop loss and take profit attached."""
+
+    def test_its_stop_loss_and_take_profit_are_attached_to_the_limit(self):
+        session = Session(config())
+        session.trader.exchange.bulk_orders.side_effect = lambda orders, grouping="na": bulk(
+            {"resting": {"oid": 20}}, "waitingForFill", "waitingForFill")
+        is_error, body = session.one("open_position", {
+            "symbol": "BTC", "side": "long", "size": 0.001, "limit_price": 84000,
+            "stop_losses": [{"price": 82000, "fraction": 1}], "take_profits": [{"price": 90000, "fraction": 1}]})
+        assert not is_error, body
+        assert (body["data"]["entry"]["order_id"], body["data"]["entry"]["status"]) == (20, "open")
+        assert [(a["kind"], a["trigger_price"]) for a in body["data"]["attached"]] == [
+            ("stop_loss", "82000.0"), ("take_profit", "90000.0")]  # as signed
+        assert session.trader.exchange.bulk_orders.call_args.kwargs["grouping"] == "normalTpsl"
+        session.trader.exchange.order.assert_not_called()
+
+    def test_several_levels_with_a_resting_entry_are_refused(self):
+        session = Session(config())
+        is_error, body = session.one("open_position", {
+            "symbol": "BTC", "side": "long", "size": 0.001, "limit_price": 84000,
+            "stop_losses": [{"price": 82000, "fraction": 0.5}, {"price": 81000, "fraction": 0.5}]})
+        assert is_error and body["error"]["code"] == "INVALID_ARGUMENT"
+        session.trader.exchange.bulk_orders.assert_not_called()
+
+
 class TestMaxRiskPctThroughTheTools:
     """max_risk_pct: an open_position may lose at most this share of the account at its stops."""
 
@@ -1505,6 +2073,21 @@ class TestMaxRiskPctThroughTheTools:
         is_error, body = session.one("open_position", TestOpenPosition.ARGS)
         assert is_error and body["error"]["code"] == "GUARD_BLOCKED" and "above 0.5 %" in body["error"]["message"]
         session.trader.exchange.order.assert_not_called()
+
+    @pytest.mark.parametrize("max_risk_pct, refused", [("0.2", True), ("0.207", True), ("0.209", False)])
+    def test_a_limit_entry_is_measured_from_its_limit(self, max_risk_pct, refused):
+        # 0.001 BTC from the 84000 limit to its stop at 82000: 2 USD of move, the taker fee at entry
+        # (a Gtc limit can fill at once) and at the stop, and the book's impact: 2.084 USD of 1000.
+        # With the maker fee at entry it would be 2.059, under 0.207 %.
+        session = self.session(max_risk_pct)
+        session.trader.exchange.bulk_orders.side_effect = lambda orders, grouping="na": bulk(
+            {"resting": {"oid": 20}}, *["waitingForFill"] * (len(orders) - 1))
+        is_error, body = session.one("open_position", {"symbol": "BTC", "side": "long", "size": 0.001,
+                                                       "limit_price": 84000,
+                                                       "stop_losses": [{"price": 82000, "fraction": 1}]})
+        assert is_error == refused, body
+        if refused:
+            assert f"above {max_risk_pct} %" in body["error"]["message"]
 
     def test_buy_and_sell_that_add_risk_are_refused_and_reducing_works(self):
         session = self.session(1)

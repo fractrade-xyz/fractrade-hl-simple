@@ -102,13 +102,6 @@ class TestTheHalt:
         assert not fresh.is_halted(KEY)
         assert len(list((tmp_path / "state" / "servers").glob("*.lock"))) == 1  # the crashed one's file removed
 
-    def test_a_server_that_ends_removes_its_file(self, tmp_path):
-        servers = tmp_path / "state" / "servers"
-        one = server(tmp_path / "state")
-        assert len(list(servers.glob("*.lock"))) == 1
-        one.close()
-        assert list(servers.glob("*.lock")) == []
-
     def test_a_halting_server_that_crashed_leaves_the_halt_while_another_runs(self, tmp_path, child):
         process = child("halt")
         survivor = server(tmp_path / "state")

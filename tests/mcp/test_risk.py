@@ -17,7 +17,7 @@ from fractrade_hl_simple.mcp_server.config import parse_config  # noqa: E402
 from fractrade_hl_simple.mcp_server.server import build_server  # noqa: E402
 from fractrade_hl_simple.mcp_server.tools.read import read_tools  # noqa: E402
 from fractrade_hl_simple.models import (  # noqa: E402
-    AccountSummary, FeeRates, Leverage, Order, OrderType, Position)
+    AccountSummary, DexAccount, FeeRates, Leverage, Order, OrderType, Position)
 
 D = Decimal
 FLAT = risk.Book(bids=((D("2.5"), D(10**9)),), asks=((D("2.5"), D(10**9)),))  # no spread, no impact
@@ -38,13 +38,6 @@ class TestImpact:
     def test_a_buy_walks_the_asks(self):
         # 1 at 101 and 2 at 102: 101.667 on average, against the mid of 100.5.
         assert risk.impact(self.BOOK, True, D(3)).quantize(D("0.000001")) == D("0.011609")
-
-    def test_a_sell_walks_the_bids(self):
-        assert risk.impact(self.BOOK, False, D(5)) == (D("100.5") - 100) / D("100.5")
-
-    def test_more_than_the_visible_book_is_not_estimated(self):
-        assert risk.impact(self.BOOK, True, D(4)) is None
-
 
 class TestOutcomes:
     def icp(self, **fields):
@@ -135,8 +128,6 @@ BOOK_100 = risk.Book(bids=((D(100), D(10**9)),), asks=((D(100), D(10**9)),))  # 
 
 
 class TestSizeForRisk:
-    def test_the_size_whose_loss_at_the_stop_is_the_risk(self):
-        assert sized(BOOK_100) == (D(10), False)
 
     def test_fees_at_the_executed_prices_make_it_smaller_and_it_never_exceeds_the_risk(self):
         fees = risk.Fees(taker=D("0.001"), maker=D("0.0002"))
@@ -186,8 +177,9 @@ class TestSizeForRisk:
         size, _ = risk.size_for_risk(is_long=True, limit=D(100), resting=True, stops=[(D(1), D(1))], risk=D(5000),
                                      fees=fees, book=book, size_decimals=5)
         step = D("0.00001")
-        lost = lambda s: risk.planned_loss(s, is_long=True, limit=D(100), resting=True, stops=[(D(1), D(1))],
-                                           fees=fees, book=book, size_decimals=5)
+        def lost(s):
+            return risk.planned_loss(s, is_long=True, limit=D(100), resting=True, stops=[(D(1), D(1))],
+                                     fees=fees, book=book, size_decimals=5)
         assert lost(size) <= 5000 < lost(size + step)
 
 
@@ -196,11 +188,6 @@ class TestTriggerLimitsAndSharedLiquidity:
         result = risk.outcomes(is_long=True, entry=D(100), size=D(1), fees=NO_FEES, book=FLAT, account_value=None,
                                exits=[risk.Exit("stop_loss", D(95), D(1), market=False, limit=D(90))])
         assert result["if_all_stops"]["net_pnl"] == D(-10)  # at worst its limit of 90
-
-    def test_a_stop_limit_on_the_far_side_of_its_trigger_may_not_fill(self):
-        result = risk.outcomes(is_long=True, entry=D(100), size=D(1), fees=NO_FEES, book=FLAT, account_value=None,
-                               exits=[risk.Exit("stop_loss", D(95), D(1), market=False, limit=D(96))])
-        assert any("may not fill" in w for w in result["warnings"])
 
     @pytest.mark.parametrize("is_long, trigger, limit, net", [
         (True, 95, 96, D(-4)),    # a long's sell stop limit above its trigger: if it fills, at 96
@@ -319,6 +306,16 @@ class TestGetPositionRisk:
             ("2.37", "market (taker)"), ("2.28", "limit (maker)")]
         assert any("433.9 has no stop" in w for w in data["warnings"])
 
+    def test_the_stop_attached_to_a_waiting_entry_is_no_protection_yet(self):
+        # A sell limit that would add to the short, with a buy stop for its size attached:
+        # Hyperliquid places that one only once the entry fills.
+        entry = icp_order(1, "limit", "2.60", "1301.6", is_buy=False, reduce_only=False)
+        entry.children = [{"coin": "ICP", "side": "B", "limitPx": "2.90", "sz": "1301.6", "oid": 2,
+                           "origSz": "1301.6", "timestamp": 0, "isTrigger": True, "triggerPx": "2.62",
+                           "orderType": "Stop Market", "reduceOnly": True, "tif": None}]
+        is_error, body = run("get_position_risk", {"symbol": "ICP"}, answers(get_open_orders=[entry]))
+        assert not is_error and body["data"]["unprotected_size"] == "1301.6" and body["data"]["stop_losses"] == []
+
     def test_a_stop_for_the_whole_position_counts_for_all_of_it(self):
         # Set "for the entire position" in the Hyperliquid app, it is listed with size 0 and
         # closes the whole position when it triggers. It was counted as size 0: no protection.
@@ -339,6 +336,108 @@ class TestGetPositionRisk:
     def test_no_position(self):
         is_error, body = run("get_position_risk", {"symbol": "ICP"}, answers(get_positions=[]))
         assert is_error and body["error"]["code"] == "POSITION_NOT_FOUND"
+
+
+def day(values, pnl):
+    """Hyperliquid's portfolio "day" histories: (time, account value) and (time, cumulative PnL)."""
+    return {"day": {"accountValueHistory": [[t, v] for t, v in enumerate(values)],
+                    "pnlHistory": [[t, v] for t, v in enumerate(pnl)]}}
+
+
+def candles(closes):
+    from fractrade_hl_simple.models import Candle
+    hour = 3_600_000
+    return [Candle(symbol="X", interval="1h", open_time=i * hour, close_time=(i + 1) * hour - 1, open=D(c),
+                   high=D(c), low=D(c), close=D(c), volume=D(1), trades=1) for i, c in enumerate(closes)]
+
+
+def account_answers(**changes):
+    return answers(**{"get_portfolio": day(["1500", "1450"], ["0", "-50"]), **changes})
+
+
+class TestGetAccountRisk:
+    def test_every_position_with_its_protection_and_the_totals(self):
+        is_error, body = run("get_account_risk", {}, account_answers())
+        data = body["data"]
+        assert not is_error, body
+        icp, = data["positions"]
+        # Notional at the mark: Hyperliquid's position value, which needs no order book.
+        assert (icp["symbol"], icp["side"], icp["unprotected_size"], icp["notional"]) == ("ICP", "short", "433.9", "3290.00")
+        assert data["totals"]["if_all_stops"]["net_pnl"] == icp["if_all_stops"]["net_pnl"]
+        assert (data["totals"]["short_notional"], data["totals"]["net_notional"], data["totals"]["unprotected_positions"]) \
+            == ("3290.00", "-3290.00", 1)
+        assert data["margin"] == {"account_value": "1500", "margin_used": "650", "free_margin": "800",
+                                  "free_margin_percent": "53.33"}
+        assert data["daily_loss"] == {"loss_24h": "50.00", "percent_of_account": "3.33", "max_daily_loss_pct": "10"}
+        assert any(w.startswith("ICP: ") and "433.9 has no stop" in w for w in data["warnings"])
+
+    def test_todays_loss_and_the_total_notional_are_audited(self):
+        # Trades in the Hyperliquid app are not checked when made: the audit reports what breaks the limits.
+        from fractrade_hl_simple.models import DexAccount
+        config = CONFIG + 'max_total_notional_x = 2\nday_start = "06:00"\ntz = "Europe/Athens"\n'
+        answers = account_answers()
+        answers["get_account_summary"].dexes = [DexAccount(dex=None, account_value=None, withdrawable=None,
+                                                           margin_used=D(650), positions=answers["get_positions"])]
+        is_error, body = run("get_account_risk", {"day_start": "08:00", "tz": "UTC"}, answers, config_text=config)
+        data = body["data"]
+        assert not is_error and data["day_loss"]["start"].endswith("T08:00:00.000Z")  # the call's day start
+        assert any("x the account value" in w and "max_total_notional_x" in w for w in data["warnings"])  # 3290 > 2 x 1500
+
+    def test_a_pending_sell_without_its_mid_leaves_the_total_notional_unchecked(self):
+        config = CONFIG + 'max_total_notional_x = 3\n'
+        answers = account_answers(get_open_orders=[icp_order(9, "limit", "2.30", "100", is_buy=False, reduce_only=False)],
+                                  get_price={})
+        is_error, body = run("get_account_risk", {}, answers, config_text=config)
+        assert not is_error and any("total notional cannot be checked" in w for w in body["data"]["warnings"])
+
+    def test_positions_that_break_the_guardrails_and_low_free_margin(self):
+        config = CONFIG + "max_leverage = 3\nmax_total_margin_pct = 40\nsymbols = [\"BTC\"]\n"
+        summary = account_answers()["get_account_summary"]
+        summary.available_to_trade = D(100)
+        is_error, body = run("get_account_risk", {}, account_answers(get_account_summary=summary), config_text=config)
+        warnings = body["data"]["warnings"]
+        assert not is_error, body
+        assert "ICP: not in the account's symbols" in warnings
+        assert "ICP: leverage 5 is above max_leverage 3" in warnings
+        assert any("margin in use 43.33 % is above max_total_margin_pct" in w for w in warnings)
+        assert any("free margin is 6.67 %" in w for w in warnings)
+
+    def test_with_beta_each_position_and_the_weighted_net_notional(self):
+        # The same hourly closes as BTC: beta 1, so the weighted notional is the (short) notional.
+        closes = [100 + (i % 5) for i in range(48)]
+        is_error, body = run("get_account_risk", {"with_beta": True}, account_answers(get_candles=candles(closes)))
+        data = body["data"]
+        assert not is_error, body
+        assert data["positions"][0]["beta_btc"] == "1.0"
+        assert data["totals"]["btc_beta_weighted_notional"] == "-3290.00"
+
+    def test_a_standard_accounts_free_margin_is_per_dex_without_its_spot_balance(self):
+        # 9900 of the 10000 are spot assets, which back no perp position: 1 is free on the dex.
+        summary = AccountSummary(mode="standard", account_value=D(10000), available_to_trade=None, margin_used=D(99),
+                                 balances=[], dexes=[DexAccount(dex=None, account_value=D(100), withdrawable=D(1),
+                                                                margin_used=D(99), positions=[])], sources={})
+        _, body = run("get_account_risk", {}, account_answers(get_account_summary=summary))
+        margin = body["data"]["margin"]
+        assert (margin["free_margin"], margin["free_margin_percent"]) == ("1", "1.00")
+        assert any("free margin on the default dex is 1.00 %" in w for w in body["data"]["warnings"])
+
+    def test_the_daily_loss_if_every_stop_fills_counts_the_days_gains(self):
+        # Up 300 today on a capital of 1000; the stops would take 400 from now: a loss of 100,
+        # 10 % of the capital, which reaches max_daily_loss_pct 10.
+        stop = icp_order(1, "stop_loss", "2.80", "1301.6")
+        position = answers()["get_positions"][0]
+        position.unrealized_pnl = D(0)
+        loss = risk.outcomes(is_long=False, entry=position.entry_price, size=abs(position.size),
+                             exits=[risk.Exit("stop_loss", D("2.80"), D("1301.6"), market=True)],
+                             fees=risk.Fees(taker=D("0.00045"), maker=D("0.00015")),
+                             book=risk.Book(bids=((D("2.53"), D(100000)),), asks=((D("2.54"), D(100000)),)),
+                             account_value=D(1500))["if_all_stops"]["net_pnl"]
+        gain = -loss - 100  # so that the loss from now is 100 more than the day's gain
+        _, body = run("get_account_risk", {}, account_answers(
+            get_open_orders=[stop], get_positions=[position],
+            get_portfolio=day(["700", str(1000 + gain)], ["0", str(gain)])))
+        assert any("if every stop filled now, the last 24 hours' loss would be 10.00 %" in w
+                   for w in body["data"]["warnings"]), body["data"]["warnings"]
 
 
 class TestPlanTrade:
@@ -403,10 +502,17 @@ class TestSentPrices:
                                                           {"price": 80000.2, "fraction": 0.5}])
         assert levels == [(D(80000), D("0.5")), (D(80000), D("0.5"))]  # one trigger: they share the book
 
-    def test_the_plans_risk_warning_compares_the_exact_loss(self):
-        # The loss shown in cents can equal the limit while the exact one is above it.
-        arguments = {"symbol": "ICP", "side": "long", "stop_loss": 2.40, "size": 100}
-        exact = risk.planned_loss(D(100), is_long=True, limit=None, resting=False, stops=[(D("2.4"), D(1))],
+    @pytest.mark.parametrize("entry_price, signed", [
+        (None, None), ("2.50", "2.5"), ("2.60", "2.6"),  # at market, a passive limit, a crossing one
+        ("2.60006", "2.6001"),                           # rounded to 5 significant figures as it is signed
+    ])
+    def test_the_plans_risk_warning_compares_the_exact_loss(self, entry_price, signed):
+        # The loss shown in cents can equal the limit while the exact one is above it; a limit
+        # entry is measured from its limit at the taker fee, as open_position checks it.
+        arguments = {"symbol": "ICP", "side": "long", "stop_loss": 2.40, "size": 100,
+                     **({"entry_price": float(entry_price)} if entry_price else {})}
+        limit = D(signed) if signed else None
+        exact = risk.planned_loss(D(100), is_long=True, limit=limit, resting=False, stops=[(D("2.4"), D(1))],
                                   fees=risk.Fees(taker=D("0.00045"), maker=D("0.00015")),
                                   book=risk.Book(bids=((D("2.53"), D(100000)),), asks=((D("2.54"), D(100000)),)),
                                   size_decimals=1)

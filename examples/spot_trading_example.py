@@ -74,7 +74,7 @@ def main():
         print(f"\nError: {e}")
         try:
             client.spot_cancel_all_orders(TOKEN)
-        except:
+        except Exception:
             pass
         raise
 

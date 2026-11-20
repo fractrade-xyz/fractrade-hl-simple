@@ -1,7 +1,6 @@
 import pytest
-import math
 import time
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
 from fractrade_hl_simple.exceptions import ServerErrorException, UnknownSymbolException
 
@@ -18,7 +17,7 @@ def mock_client():
     HyperliquidClient._cached_meta = None
     HyperliquidClient._cached_spot_meta = None
     with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
-         patch('fractrade_hl_simple.hyperliquid.Exchange') as mock_exchange_cls:
+         patch('fractrade_hl_simple.hyperliquid.Exchange'):
         mock_info = mock_info_cls.return_value
         mock_info.post.return_value = [
             {"universe": [

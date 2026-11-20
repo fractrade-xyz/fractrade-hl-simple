@@ -6,7 +6,6 @@ These tests place REAL orders with minimum position sizes (< $1 each).
 """
 import pytest
 import time
-from decimal import Decimal
 from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
 
 

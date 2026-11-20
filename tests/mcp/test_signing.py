@@ -14,7 +14,7 @@ import pytest
 pytest.importorskip("mcp")  # the server needs the [mcp] extra
 
 from hyperliquid import exchange  # noqa: E402
-from hyperliquid.utils import constants, signing  # noqa: E402
+from hyperliquid.utils import signing  # noqa: E402
 
 from fractrade_hl_simple.hyperliquid import HyperliquidClient  # noqa: E402
 from fractrade_hl_simple.mcp_server.accounts import AccountRegistry  # noqa: E402
@@ -42,6 +42,7 @@ class Hyperliquid:
 
     def __init__(self, role):
         self.role, self.requests, self.unanswered = role, [], []
+        self.trigger = None  # the last stop or take profit placed: it rests, as order 9
 
     def __call__(self, api, url_path, payload=None):
         self.requests.append((url_path, payload))
@@ -74,13 +75,12 @@ class Hyperliquid:
             return {"marginSummary": SUMMARY, "crossMarginSummary": SUMMARY, "withdrawable": "800",
                     "assetPositions": [{"type": "oneWay", "position": POSITION}]}
         if kind == "frontendOpenOrders":
-            return [STOP]
+            return [STOP] + ([self.trigger] if self.trigger else [])
         if kind == "openOrders":
             return [{"coin": "BTC", "oid": 6}]
         return None
 
-    @staticmethod
-    def exchange(action):
+    def exchange(self, action):
         kind = action["type"]
         if kind in ("cancel", "cancelByCloid"):
             return {"status": "ok", "response": {"type": "cancel", "data": {
@@ -88,6 +88,11 @@ class Hyperliquid:
         if kind not in ("order", "batchModify"):  # updateLeverage, and anything else: accepted, as a transfer would be
             return {"status": "ok", "response": {"type": "default"}}
         orders = action["orders"] if kind == "order" else [m["order"] for m in action["modifies"]]
+        for o in orders:
+            if "trigger" in o["t"]:
+                self.trigger = {**STOP, "oid": 9, "side": "B" if o["b"] else "A", "sz": o["s"], "origSz": o["s"],
+                                "triggerPx": o["t"]["trigger"]["triggerPx"], "reduceOnly": o["r"],
+                                "orderType": "Stop Market" if o["t"]["trigger"]["tpsl"] == "sl" else "Take Profit Market"}
         statuses = [{"filled": {"oid": 9, "totalSz": o["s"], "avgPx": o["p"]}} if o["t"].get("limit", {}).get("tif") == "Ioc"
                     else {"resting": {"oid": 9}} for o in orders]
         return {"status": "ok", "response": {"type": "order", "data": {"statuses": statuses}}}
@@ -100,14 +105,25 @@ CALLS = [
     ("open_position", {"symbol": "BTC", "side": "long", "size": 0.002,
                        "stop_losses": [{"price": 70000, "fraction": 0.5}, {"price": 69000, "fraction": 0.5}],
                        "take_profits": [{"price": 99000, "fraction": 1}]}),
-    ("modify_order", {"order_id": 9, "symbol": "BTC", "is_buy": True, "size": 0.001, "price": 79000,
+    ("place_trigger_entry", {"symbol": "BTC", "side": "long", "size": 0.001, "trigger_price": 90000}),
+    ("open_position", {"symbol": "BTC", "side": "long", "size": 0.001, "limit_price": 84000,
+                       "stop_losses": [{"price": 82000, "fraction": 1}], "take_profits": [{"price": 90000, "fraction": 1}]}),
+    ("modify_order", {"order_id": 7, "symbol": "BTC", "is_buy": True, "size": 0.001, "price": 79000,  # a limit order
                       "order_type": {"limit": {"tif": "Gtc"}}}),
+    ("place_orders", {"orders": [{"symbol": "BTC", "is_buy": True, "size": 0.001, "limit_price": 80000},
+                                 {"symbol": "BTC", "is_buy": False, "size": 0.001, "limit_price": 90000,
+                                  "post_only": True, "cloid": "0x" + "d" * 32}]}),
+    ("place_ladder", {"symbol": "BTC", "is_buy": True, "from_price": 80000, "to_price": 79000, "steps": 3,
+                      "notional_usd": 100}),
     ("cancel_order", {"order_id": 9, "symbol": "BTC"}),
     ("cancel_order_by_cloid", {"cloid": CLOID, "symbol": "BTC"}),
+    ("cancel_orders", {"orders": [{"order_id": 9, "symbol": "BTC"}, {"order_id": 10, "symbol": "BTC"}]}),
     ("stop_loss", {"symbol": "BTC", "size": 0.002, "trigger_price": 80000}),
     ("take_profit", {"symbol": "BTC", "size": 0.002, "trigger_price": 95000}),
     ("update_stop_loss", {"symbol": "BTC", "new_price": 81000}),
     ("update_take_profit", {"symbol": "BTC", "new_price": 96000}),
+    # The fake's stop already is this level: kept, nothing to sign.
+    ("sync_protection", {"symbol": "BTC", "stop_losses": [{"price": 80000, "fraction": 1}]}),
     ("set_leverage", {"symbol": "BTC", "leverage": 3}),
     ("close", {"symbol": "BTC"}),
     ("close_all_positions", {}),
@@ -154,6 +170,7 @@ max_leverage = 5
     tools = {spec.name: spec for spec in trade_tools(registry)}
     assert {name for name, _ in CALLS} == set(tools)  # every trade tool is run
     outcomes = []
+    HyperliquidClient._cached_key = HyperliquidClient._cached_market_specs = None  # this fake's markets
     try:
         with ExitStack() as stack:
             stack.enter_context(patch("hyperliquid.api.API.post",
@@ -204,3 +221,62 @@ def shared_state():
     import shutil
     weakref.finalize(state, shutil.rmtree, folder, True)
     return state
+
+
+class ThreeDexes(Hyperliquid):
+    """Hyperliquid with two HIP-3 dexes listed, xyz and para, each with its own markets: their
+    asset ids are 110000 and 120000 plus the market's place in its dex (SDK Info)."""
+    UNIVERSES = {"": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}],
+                 "xyz": [{"name": "xyz:NVDA", "szDecimals": 3, "maxLeverage": 10},
+                         {"name": "xyz:TSLA", "szDecimals": 3, "maxLeverage": 10}],
+                 "para": [{"name": "para:ABC", "szDecimals": 1, "maxLeverage": 5}]}
+
+    def __call__(self, api, url_path, payload=None):
+        kind = payload.get("type") if url_path == "/info" and isinstance(payload, dict) else None
+        dex = payload.get("dex") or "" if kind else ""
+        if kind == "perpDexs":
+            answer = [None, {"name": "xyz"}, {"name": "para"}]
+        elif kind == "meta":
+            answer = {"universe": self.UNIVERSES[dex]}
+        elif kind == "metaAndAssetCtxs":
+            answer = [{"universe": self.UNIVERSES[dex]},
+                      [{"funding": "0", "openInterest": "1", "markPx": "100"} for _ in self.UNIVERSES[dex]]]
+        else:
+            return super().__call__(api, url_path, payload)
+        self.requests.append((url_path, payload))
+        return answer
+
+
+def test_a_batch_on_three_dexes_signs_each_order_and_cancel_for_its_own_market():
+    conf = parse_config(f'''
+[accounts.main]
+address = "{MAIN}"
+key_env = "HL_KEY_MAIN"
+trading = true
+max_order_usd = 1000
+max_leverage = 5
+perp_dexs = ["xyz", "para"]
+''', "test.toml")
+    hyperliquid = ThreeDexes({"role": "agent", "data": {"user": MAIN}})
+    registry = AccountRegistry(conf, {"main": KEY}, make_client, shared_state())
+    tools = {spec.name: spec for spec in trade_tools(registry)}
+    HyperliquidClient._cached_key = HyperliquidClient._cached_market_specs = None  # this fake's markets
+    try:
+        with patch("hyperliquid.api.API.post", lambda api, url_path, payload=None: hyperliquid(api, url_path, payload)):
+            tools["place_orders"].run({"orders": [
+                {"symbol": "xyz:TSLA", "is_buy": True, "size": 0.1, "limit_price": 100, "cloid": CLOID},
+                {"symbol": "BTC", "is_buy": True, "size": 0.001, "limit_price": 80000, "reduce_only": True},
+                {"symbol": "para:ABC", "is_buy": True, "size": 1, "limit_price": 50, "post_only": True}]})
+            tools["cancel_orders"].run({"orders": [{"order_id": 7, "symbol": "para:ABC"},
+                                                   {"order_id": 8, "symbol": "xyz:NVDA"}]})
+    finally:
+        HyperliquidClient._cached_key = HyperliquidClient._cached_market_specs = None
+    actions = [payload["action"] for path, payload in hyperliquid.requests if path == "/exchange"]
+    assert [action["type"] for action in actions] == ["order", "cancel"]
+    orders = actions[0]["orders"]
+    assert [(o["a"], o["b"], o["p"], o["s"], o["r"], o["t"]) for o in orders] == [
+        (110001, True, "100", "0.1", False, {"limit": {"tif": "Gtc"}}),
+        (0, True, "80000", "0.001", True, {"limit": {"tif": "Gtc"}}),
+        (120000, True, "50", "1", False, {"limit": {"tif": "Alo"}})]
+    assert orders[0]["c"] == CLOID and all(len(o["c"]) == 34 for o in orders)
+    assert actions[1]["cancels"] == [{"a": 120000, "o": 7}, {"a": 110000, "o": 8}]

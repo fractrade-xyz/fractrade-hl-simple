@@ -21,10 +21,10 @@ Estimates, as the result says:
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from decimal import ROUND_DOWN, Decimal
+from decimal import Decimal
 from typing import Any, Optional, Sequence
 
-from ..hyperliquid import split_size
+from .._protection import split_size
 
 
 @dataclass(frozen=True)
@@ -103,8 +103,8 @@ def exit_outcome(is_long: bool, entry: Decimal, exit: Exit, fees: Fees, book: Bo
     return {"kind": exit.kind, "order_id": exit.order_id, "price": exit.price, "size": exit.size,
             "executes_as": ("limit (maker)" if exit.resting else "market (taker)" if exit.market
                             else f"limit {executed} once triggered (taker, at worst)"),
-            "gross_pnl": _usd(gross), "fee": _usd(fee), "slippage": None if slippage is None else _usd(slippage),
-            "net_pnl": _usd(net), "net_exact": net}
+            "gross_pnl": usd(gross), "fee": usd(fee), "slippage": None if slippage is None else usd(slippage),
+            "net_pnl": usd(net), "net_exact": net}
 
 
 def outcomes(*, is_long: bool, entry: Decimal, size: Decimal, exits: list[Exit], fees: Fees, book: Book,
@@ -139,7 +139,7 @@ def outcomes(*, is_long: bool, entry: Decimal, size: Decimal, exits: list[Exit],
         at_liquidation = ""
         if liquidation_price is not None:
             loss = abs(entry - liquidation_price) * bare
-            at_liquidation = f" (at the liquidation price {liquidation_price} it alone loses {_usd(loss)} USD)"
+            at_liquidation = f" (at the liquidation price {liquidation_price} it alone loses {usd(loss)} USD)"
         warnings.append(f"the stop losses cover {stopped} of {size}: {bare} has no stop{at_liquidation}")
     if profits and taken < size:
         warnings.append(f"the take profits cover {taken} of {size}: the rest stays open after them")
@@ -162,23 +162,23 @@ def outcomes(*, is_long: bool, entry: Decimal, size: Decimal, exits: list[Exit],
     if stops and worst < 0:
         if profits:
             risk_reward = _ratio(best / -worst)
-            break_even = _percent(-worst / (-worst + best)) if best > 0 else None
+            break_even = percent(-worst / (-worst + best)) if best > 0 else None
     elif stops:
         warnings.append("the stops close in profit: the position cannot lose at them (before slippage)")
-    loss_pct = None if account_value is None or account_value <= 0 or not stops else _percent(-worst / account_value)
+    loss_pct = None if account_value is None or account_value <= 0 or not stops else percent(-worst / account_value)
     if (max_daily_loss_pct is not None and loss_pct is not None and Decimal(loss_pct) >= max_daily_loss_pct):
         warnings.append(f"if every stop fills, the loss ({loss_pct} % of the account) reaches max_daily_loss_pct "
                         f"({max_daily_loss_pct} %)")
     return {
         "side": "long" if is_long else "short", "size": size, "entry_price": entry, "mid_price": mid,
         "stop_losses": stop_levels, "take_profits": profit_levels,
-        "if_all_stops": None if not stops else {"size": stopped, "net_pnl": _usd(worst), "percent_of_account": loss_pct},
+        "if_all_stops": None if not stops else {"size": stopped, "net_pnl": usd(worst), "percent_of_account": loss_pct},
         "if_all_take_profits": None if not profits else {
-            "size": taken, "net_pnl": _usd(best),
-            "percent_of_account": None if account_value is None or account_value <= 0 else _percent(best / account_value)},
+            "size": taken, "net_pnl": usd(best),
+            "percent_of_account": None if account_value is None or account_value <= 0 else percent(best / account_value)},
         "risk_reward": risk_reward, "break_even_win_rate_percent": break_even,
         "unprotected_size": max(Decimal(0), size - stopped),
-        "fees": {"taker": fees.taker, "maker": fees.maker, "entry_fee": _usd(entry_fee) if entry_fee else None},
+        "fees": {"taker": fees.taker, "maker": fees.maker, "entry_fee": usd(entry_fee) if entry_fee else None},
         "warnings": warnings,
         "notes": "PnL after fees and estimated slippage (the price impact on today's order book, applied to "
                  "each trigger price; a thinner book in a fast market makes it worse). Funding is not included.",
@@ -297,7 +297,8 @@ def _share(part: Decimal, whole: Decimal) -> Decimal:
     return part / whole if whole > 0 else Decimal(0)
 
 
-def _usd(value: Decimal) -> Decimal:
+def usd(value: Decimal) -> Decimal:
+    """An amount in cents."""
     return value.quantize(Decimal("0.01"))
 
 
@@ -305,5 +306,6 @@ def _ratio(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.01"))
 
 
-def _percent(value: Decimal) -> Decimal:
+def percent(value: Decimal) -> Decimal:
+    """A fraction as a percentage, to 2 decimals."""
     return (value * 100).quantize(Decimal("0.01"))

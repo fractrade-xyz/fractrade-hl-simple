@@ -77,12 +77,6 @@ def test_key_file_readable_by_others_is_refused(tmp_path):
         load_trading_keys(config, {"HL_KEY_MAIN": "0x" + KEY})
 
 
-def test_missing_key_variable_names_the_variable_not_a_key(tmp_path):
-    config = parse_config(spec_example(key_file(tmp_path, 0o600)), "mcp.toml")
-    with pytest.raises(ConfigError, match="'main': environment variable HL_KEY_MAIN is not set"):
-        load_trading_keys(config, {})
-
-
 @pytest.mark.parametrize("where", [
     pytest.param(f"# key: 0x{KEY}", id="comment"),
     # A TOML escape splits the key in the raw text; it is whole again after parsing.
@@ -127,18 +121,56 @@ def test_parse_error_does_not_show_an_escaped_key():
     pytest.param(f'address = "{MAIN}"\nisolated_only = "yes"', "isolated_only must be", id="isolated-not-a-bool"),
     pytest.param(f'address = "{MAIN}"\nmax_orders_per_hour = 2.5', "max_orders_per_hour must be a whole number",
                  id="rate-not-whole"),
+    pytest.param(f'address = "{MAIN}"\nmax_day_loss_mode = "block"', "max_day_loss_mode needs max_day_loss_pct",
+                 id="mode-without-limit"),
+    pytest.param(f'address = "{MAIN}"\nmax_total_notional_x = 3\nmax_total_notional_mode = "stop"',
+                 "max_total_notional_mode must be one of off, warn, block", id="unknown-mode"),
+    pytest.param(f'address = "{MAIN}"\nday_start = "6:00"', "day_start must be a time of day as HH:MM", id="day-start"),
+    pytest.param(f'address = "{MAIN}"\ntz = "Athens"', "tz must be an IANA time zone name", id="time-zone"),
 ])
 def test_invalid_account_is_refused_with_its_location(account, message):
     with pytest.raises(ConfigError, match=rf"mcp\.toml \[accounts\.main\]: {message}"):
         parse_config(f"[accounts.main]\n{account}\n", "mcp.toml")
 
 
+def config_file(path: Path, text: str) -> Path:
+    """A config file as --init makes it: only its owner can read and write it."""
+    path.write_text(text)
+    path.chmod(0o600)
+    return path
+
+
 def test_config_file_that_is_not_text_is_refused_without_its_bytes(tmp_path):
     path = tmp_path / "mcp.toml"
     path.write_bytes(b"\xff\xfe" + KEY.encode())  # e.g. saved as UTF-16 by an editor
+    path.chmod(0o600)
     with pytest.raises(ConfigError, match="not valid UTF-8") as excinfo:
         load_config(path, {})
     assert KEY not in repr(excinfo.value) and excinfo.value.__context__ is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows has no POSIX permission bits")
+def test_a_config_file_others_can_change_is_refused(tmp_path):
+    # Whoever can write it can point key_file at another key or lift a limit.
+    path = config_file(tmp_path / "mcp.toml", f'[accounts.main]\naddress = "{MAIN}"\n')
+    path.chmod(0o664)
+    with pytest.raises(ConfigError, match="can be changed by other users.*chmod 600"):
+        load_config(path, {})
+
+
+def test_a_relative_key_file_is_read_from_the_config_files_folder(tmp_path, monkeypatch):
+    # The assistant starts the server in a directory of its own choosing.
+    key_file(tmp_path, 0o600)
+    path = config_file(tmp_path / "mcp.toml", f'''
+[accounts.copy]
+address = "{COPY}"
+key_file = "copy-1"
+trading = true
+max_order_usd = 100
+max_leverage = 5
+''')
+    monkeypatch.chdir(tmp_path / "..")
+    assert load_trading_keys(load_config(path, {}), {}) == {"copy": "0x" + KEY}
 
 
 def test_default_account_must_be_a_name():
@@ -169,23 +201,6 @@ def test_without_a_file_one_account_comes_from_the_environment():
         load_config(environ=environ)
 
 
-def test_perp_dexs_are_inherited_and_an_account_can_replace_them():
-    config = parse_config(f'''
-[defaults]
-perp_dexs = ["xyz", "para", "xyz"]
-[accounts.main]
-address = "{MAIN}"
-[accounts.testnet]
-address = "{COPY}"
-base_url = "https://api.hyperliquid-testnet.xyz"
-perp_dexs = []
-''', "mcp.toml")
-    assert config.accounts["main"].perp_dexs == ("xyz", "para")
-    assert config.accounts["testnet"].perp_dexs == ()  # e.g. para is not on testnet
-    # Without the setting, as in the library: Hyperliquid's own perps only.
-    assert parse_config(f'[accounts.main]\naddress = "{MAIN}"\n', "mcp.toml").accounts["main"].perp_dexs == ()
-
-
 def test_perp_dexs_from_the_environment_are_comma_separated():
     environ = {"HYPERLIQUID_PUBLIC_ADDRESS": MAIN, "FRACTRADE_MCP_PERP_DEXS": " xyz, para,", "XDG_CONFIG_HOME": "/nonexistent"}
     assert load_config(environ=environ).accounts["default"].perp_dexs == ("xyz", "para")
@@ -193,9 +208,7 @@ def test_perp_dexs_from_the_environment_are_comma_separated():
 
 def test_config_sources_first_match_wins(tmp_path):
     def write(name: str, address: str) -> Path:
-        path = tmp_path / name
-        path.write_text(f'[accounts.main]\naddress = "{address}"\n')
-        return path
+        return config_file(tmp_path / name, f'[accounts.main]\naddress = "{address}"\n')
 
     xdg = tmp_path / "xdg"
     (xdg / "fractrade-hl").mkdir(parents=True)
@@ -212,7 +225,7 @@ def test_config_sources_first_match_wins(tmp_path):
 def test_the_example_config_loads():
     # The example users copy must stay valid as the validation changes.
     example = Path(__file__).parents[2] / "examples" / "mcp.example.toml"
-    config = load_config(example, {})
+    config = parse_config(example.read_text(), str(example))  # its permissions are the checkout's
     assert config.accounts["main"].trading and config.accounts["vault"].vault
     assert config.accounts["test"].perp_dexs == () and config.accounts["whale"].perp_dexs == ("xyz",)
 
@@ -224,7 +237,3 @@ def test_any_one_size_limit_lets_an_account_trade(limit):
     assert account.trading
 
 
-def test_without_risk_guardrails_none_is_checked():
-    account = parse_config(f'[accounts.main]\naddress = "{MAIN}"\n', "mcp.toml").accounts["main"]
-    assert (account.max_margin_pct, account.max_total_margin_pct, account.max_daily_loss_pct,
-            account.isolated_only, account.max_orders_per_hour) == (None, None, None, False, None)

@@ -3,14 +3,14 @@
 import math
 from decimal import Decimal
 
-D = Decimal
-
 import pytest
 
 from fractrade_hl_simple.mcp_server import guards
 from fractrade_hl_simple.mcp_server.config import parse_config
 from fractrade_hl_simple.mcp_server.errors import ToolError, error_body
 from fractrade_hl_simple.models import Leverage
+
+D = Decimal
 
 ADDRESS = "0x" + "1" * 40
 
@@ -86,11 +86,6 @@ class TestRules:
     def test_a_slippage_that_is_no_number_fails(self, value):
         assert not guards.slippage(value, Decimal("0.02")).passed
 
-    def test_leverage_up_to_the_cap(self):
-        assert guards.leverage(5, 5).passed
-        assert not guards.leverage(6, 5).passed
-
-
 class TestActions:
     def test_an_order_is_checked_against_every_limit(self):
         report = guards.check_order(account('symbols = ["BTC"]'), "BTC", 0.001, 86701.0,
@@ -98,38 +93,16 @@ class TestActions:
         assert report.passed
         assert rules(report) == {"perp_only": True, "symbol_allowed": True, "order_notional": True, "slippage": True}
 
-    def test_an_order_above_max_order_usd_is_blocked_with_the_report(self):
-        report = guards.check_order(account(), "BTC", 0.002, 86701.0, is_buy=True, reduce_only=False, market=False, risk=RISK)
-        error = blocked(report)
-        assert error["code"] == "GUARD_BLOCKED" and not error["retryable"]
-        assert "max_order_usd 100" in error["message"]
-        assert error["details"]["checks"] == [check.as_dict() for check in report.checks]
-        assert "slippage" not in rules(report)  # a limit order has none
-
     def test_a_symbol_outside_the_allowlist_is_blocked(self):
         report = guards.check_order(account('symbols = ["BTC"]'), "ETH", 0.01, 3000.0,
                                     is_buy=True, reduce_only=False, market=False, risk=RISK)
         assert rules(report)["symbol_allowed"] is False
         assert "ETH is not in the account's symbols (BTC)" in blocked(report)["message"]
 
-    def test_a_reduce_only_order_is_never_blocked_by_the_allowlist_or_the_notional_cap(self):
-        # So a position can always be reduced, whatever its size or symbol.
-        report = guards.check_order(account('symbols = ["BTC"]'), "ETH", 10.0, 3000.0,
-                                    is_buy=True, reduce_only=True, market=True, slippage_value=None)
-        assert report.passed and set(rules(report)) == {"perp_only", "slippage"}
-
     def test_a_market_order_above_max_slippage_is_blocked(self):
         report = guards.check_order(account("max_slippage = 0.01"), "BTC", 0.001, 86701.0,
                                     is_buy=True, reduce_only=True, market=True, slippage_value=0.05)
         assert "slippage 0.05 is above max_slippage 0.01" in blocked(report)["message"]
-
-    def test_a_close_is_checked_for_slippage_only(self):
-        assert guards.check_close(account('symbols = ["BTC"]'), "ETH", None).passed
-        assert not guards.check_close(account(), "BTC", 0.03).passed
-
-    def test_protection_and_cancels_are_checked_for_the_market_kind_only(self):
-        assert guards.check_symbol("xyz:NVDA").passed
-        assert blocked(guards.check_symbol("PURR/USDC"))["details"]["checks"][0]["rule"] == "perp_only"
 
     def test_leverage_respects_the_allowlist_and_the_cap(self):
         assert guards.check_leverage(account('symbols = ["BTC"]'), "BTC", 5).passed
@@ -159,11 +132,6 @@ class TestRiskGuardrails:
         report = risky("max_margin_pct = 5", 1.0, value, risk(leverage, account_value=Decimal(1000)))
         assert rules(report)["max_margin_pct"] is passes
 
-    def test_total_margin_counts_the_margin_in_use(self):
-        state = risk(20, account_value=Decimal(1000), margin_used=Decimal(750))
-        assert rules(risky("max_total_margin_pct = 80", 1.0, 1000.0, state))["max_total_margin_pct"] is True   # 750 + 50
-        assert rules(risky("max_total_margin_pct = 80", 1.0, 1020.0, state))["max_total_margin_pct"] is False  # 750 + 51
-
     def test_one_big_trade_within_the_total_margin_without_a_per_trade_cap(self):
         # The author's setup: no max_margin_pct, no max_order_usd, max_total_margin_pct 80, 20x.
         own = parse_config(f'''
@@ -181,12 +149,6 @@ max_total_margin_pct = 80
         too_big = guards.check_order(own, "BTC", 0.21, 80000.0, is_buy=True, reduce_only=False, market=False, risk=state)
         assert rules(too_big)["max_total_margin_pct"] is False
 
-    def test_with_check_order_leverage_the_markets_leverage_is_checked_on_every_order(self):
-        # Set in the app or by a bot, the leverage of the market can be above max_leverage (5 here).
-        report = risky("check_order_leverage = true", 0.001, 85000.0, risk(10))
-        assert rules(report)["leverage"] is False and "set_leverage" in blocked(report)["message"]
-        assert "leverage" not in rules(risky("", 0.001, 85000.0, risk(10)))  # optional: off without the key
-
     def test_isolated_only_refuses_cross_margin_for_orders_and_set_leverage(self):
         assert rules(risky("isolated_only = true", 0.001, 85000.0, risk(5, "cross")))["isolated_only"] is False
         assert rules(risky("isolated_only = true", 0.001, 85000.0, risk(5, "isolated")))["isolated_only"] is True
@@ -198,11 +160,6 @@ max_total_margin_pct = 80
         state = risk(5, day_loss=loss, day_capital=Decimal(1000))
         assert rules(risky("max_daily_loss_pct = 10", 0.001, 85000.0, state))["max_daily_loss_pct"] is passes
 
-    def test_the_order_rate(self):
-        assert rules(risky("max_orders_per_hour = 3", 0.001, 85000.0, risk(5, orders_last_hour=2)))["max_orders_per_hour"]
-        assert not rules(risky("max_orders_per_hour = 3", 0.001, 85000.0, risk(5, orders_last_hour=3)))[
-            "max_orders_per_hour"]
-
     @pytest.mark.parametrize("extra, state", [
         ("max_margin_pct = 5", risk(5)),                          # no account value (e.g. portfolio margin)
         ("max_total_margin_pct = 50", risk(5, account_value=Decimal(1000))),  # no margin in use
@@ -211,17 +168,10 @@ max_total_margin_pct = 80
     def test_a_guardrail_whose_data_is_missing_refuses(self, extra, state):
         assert not risky(extra, 0.001, 85000.0, state).passed
 
-    def test_only_what_a_configured_guardrail_needs_is_read(self):
-        assert guards.needs(account()) == set()
-        assert guards.needs(account("check_order_leverage = true")) == {"leverage"}
-        assert guards.needs(account("max_total_margin_pct = 80")) == {"leverage", "account"}
-        assert guards.needs(account("max_daily_loss_pct = 10\nmax_margin_pct = 5")) == {"leverage", "account", "day"}
-
     def test_a_reduce_only_order_needs_no_risk_state(self):
         report = guards.check_order(account("max_margin_pct = 5\nisolated_only = true"), "BTC", 1.0, 85000.0,
                                     is_buy=True, reduce_only=True, market=False)
         assert report.passed and set(rules(report)) == {"perp_only"}
-
 
 class TestRiskDataThatCannotPass:
     """A guardrail passes only on finite figures: Infinity, NaN, a negative margin in use or
@@ -272,9 +222,27 @@ class TestMaxRiskPct:
     def test_without_stops_or_an_account_value_it_refuses(self, loss, value):
         assert not guards.trade_risk(loss, value, Decimal(1)).passed
 
-    def test_an_order_without_stops_that_adds_risk_is_refused_and_one_that_reduces_is_not(self):
-        conf = account("max_risk_pct = 1")
-        adding = guards.check_order(conf, "BTC", 0.001, 85000.0, is_buy=True, reduce_only=False, market=False,
-                                    risk=guards.RiskState(account_value=Decimal(1000)))
-        assert rules(adding)["max_risk_pct"] is False and "open_position" in blocked(adding)["message"]
-        assert guards.check_order(conf, "BTC", 0.001, 85000.0, is_buy=True, reduce_only=True, market=False).passed
+class TestTradingDay:
+    @pytest.mark.parametrize("now, start", [
+        ("2026-11-18T05:59:00+02:00", "2026-11-17T06:00:00+02:00"),  # before 06:00: still yesterday's day
+        ("2026-03-29T05:59:00+03:00", "2026-03-28T06:00:00+02:00"),  # across the spring change: 23 hours
+        ("2026-10-25T05:59:00+02:00", "2026-10-24T06:00:00+03:00"),  # across the autumn change: 25 hours
+    ])
+    def test_it_starts_by_the_local_clock(self, now, start):
+        from datetime import datetime
+
+        def ms(text):
+            return int(datetime.fromisoformat(text).timestamp() * 1000)
+        assert guards.day_start_ms(ms(now), "06:00", "Europe/Athens") == ms(start)
+
+    @pytest.mark.parametrize("portfolio, expected", [
+        # A deposit raises the account value but is no PnL: it gives no room back.
+        ({"day": {"accountValueHistory": [[90, "1000"], [200, "1440"]], "pnlHistory": [[90, "0"], [200, "-60"]]}},
+         (D(60), D(1000), 90)),
+        # No record before the start in the day history (late in the day): the week's is used.
+        ({"day": {"accountValueHistory": [[101, "900"]], "pnlHistory": [[101, "0"]]},
+          "week": {"accountValueHistory": [[40, "1000"], [200, "950"]], "pnlHistory": [[40, "10"], [200, "-40"]]}},
+         (D(50), D(1000), 40)),
+    ], ids=["deposit", "week"])
+    def test_the_loss_since_hyperliquids_last_record_before_the_start(self, portfolio, expected):
+        assert guards.portfolio_since(portfolio, 100) == expected

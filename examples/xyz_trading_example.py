@@ -30,7 +30,7 @@ def main():
     # ── Market info ───────────────────────────────────────────────────
 
     tsla_info = client.get_market_info("xyz:TSLA")
-    print(f"\nxyz:TSLA market info:")
+    print("\nxyz:TSLA market info:")
     print(f"  Size decimals: {tsla_info['szDecimals']}")
     print(f"  Max leverage:  {tsla_info['maxLeverage']}x")
 
@@ -41,7 +41,7 @@ def main():
     # ── Order book ────────────────────────────────────────────────────
 
     book = client.get_order_book("xyz:TSLA")
-    print(f"\nxyz:TSLA order book:")
+    print("\nxyz:TSLA order book:")
     print(f"  Best bid: ${book['best_bid']:,.2f}")
     print(f"  Best ask: ${book['best_ask']:,.2f}")
     print(f"  Spread:   ${book['spread']:,.4f}")

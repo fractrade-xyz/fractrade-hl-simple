@@ -33,7 +33,7 @@ def main():
             print("No open positions")
 
         # Place a limit buy order slightly below market
-        print(f"\nPlacing limit buy order...")
+        print("\nPlacing limit buy order...")
         limit_price = price * 0.99
         order = client.buy(SYMBOL, POSITION_SIZE, limit_price=limit_price)
         print(f"Limit order placed: {order}")
@@ -48,7 +48,7 @@ def main():
         time.sleep(2)
 
         # Open a market long position
-        print(f"\nOpening long position...")
+        print("\nOpening long position...")
         order = client.buy(SYMBOL, POSITION_SIZE)
         print(f"Filled: {order}")
 
@@ -67,7 +67,7 @@ def main():
         time.sleep(2)
 
         # Open and close a short position
-        print(f"\nOpening short position...")
+        print("\nOpening short position...")
         order = client.sell(SYMBOL, POSITION_SIZE)
         print(f"Filled: {order}")
 
@@ -89,7 +89,7 @@ def main():
         try:
             client.cancel_all_orders(SYMBOL)
             client.close(SYMBOL)
-        except:
+        except Exception:
             pass
         raise
 

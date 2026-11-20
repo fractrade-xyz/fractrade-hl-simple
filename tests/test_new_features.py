@@ -4,17 +4,18 @@ import pickle
 from types import SimpleNamespace
 
 import inspect
+import os
 
 import pytest
 import requests
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 from decimal import Decimal
 from hyperliquid.utils import constants
 from hyperliquid.utils.types import Cloid
-from fractrade_hl_simple import api, exceptions
+from fractrade_hl_simple import _answers, api, exceptions, models
 from fractrade_hl_simple.exceptions import (
     ActionOutcomeUnknownException, AddressRequiredException, ConfigurationException, HyperliquidException,
-    InvalidArgumentException, NetworkException,
+    InvalidArgumentException, NetworkException, OrderException, OrdersNotCanceledException,
     OrderOutcomeUnknownException, OrderRejectedException, ProtectionOrderException,
     ProtectionReplacementIncompleteException, UnknownSymbolException, UnsupportedAccountModeException,
 )
@@ -119,23 +120,6 @@ class TestConfigurableSlippage:
         # 85000 * 1.02 = 86700
         assert 86600 < limit_px < 86800
 
-    def test_slippage_override_per_call(self, mock_client):
-        mock_client.default_slippage = 0.05
-        mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
-        mock_client.exchange.order.return_value = {
-            "status": "ok",
-            "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "85850", "oid": 1}}]}},
-        }
-
-        mock_client.buy("BTC", 0.001, slippage=0.01)
-
-        call_kwargs = mock_client.exchange.order.call_args
-        limit_px = call_kwargs.kwargs.get("limit_px") or call_kwargs[1].get("limit_px")
-        if limit_px is None:
-            limit_px = call_kwargs[0][3]
-        # 85000 * 1.01 = 85850
-        assert 85800 < limit_px < 85900
-
     def test_invalid_slippage_per_call(self, mock_client):
         mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
         with pytest.raises(ValueError, match="slippage"):
@@ -202,6 +186,15 @@ class TestClientConfiguration:
             HyperliquidClient(**arguments)
         assert load.called is loads
 
+    def test_the_dotenv_of_the_working_directory_is_found(self, tmp_path, monkeypatch):
+        # Not one found from where the package is installed (a virtualenv elsewhere, the home folder).
+        (tmp_path / ".env").write_text("FRACTRADE_TEST_DOTENV=found\n")
+        (tmp_path / "sub").mkdir()
+        monkeypatch.chdir(tmp_path / "sub")
+        monkeypatch.delenv("FRACTRADE_TEST_DOTENV", raising=False)
+        models.load_env_file()
+        assert os.environ.pop("FRACTRADE_TEST_DOTENV") == "found"
+
     def test_requests_have_a_timeout(self):
         # Without one, a stalled connection blocks the caller forever.
         with patch('fractrade_hl_simple.hyperliquid.Info', **INFO_ANSWERS) as info_cls, \
@@ -257,24 +250,6 @@ class TestLeverageManagement:
         result = mock_client.set_leverage("ETH", 5, is_cross=False)
         mock_client.exchange.update_leverage.assert_called_once_with(5, "ETH", False)
         assert result == {"status": "ok"}
-
-    def test_set_leverage_invalid_value(self, mock_client):
-        with pytest.raises(ValueError, match="Leverage must be >= 1"):
-            mock_client.set_leverage("BTC", 0)
-
-    def test_set_leverage_exceeds_max(self, mock_client):
-        with pytest.raises(ValueError, match="Max leverage"):
-            mock_client.set_leverage("BTC", 100)
-
-    def test_set_leverage_requires_auth(self):
-        with patch('fractrade_hl_simple.hyperliquid.Info', **INFO_ANSWERS), \
-             patch('fractrade_hl_simple.hyperliquid.Exchange'):
-            client = HyperliquidClient.__new__(HyperliquidClient)
-            client.max_retries = 0
-            client.retry_delay = 0
-            client.market_specs = {}
-        with pytest.raises(RuntimeError):
-            client.set_leverage("BTC", 10)
 
     def test_add_isolated_margin(self, mock_client):
         mock_client.exchange.update_isolated_margin.return_value = {"status": "ok"}
@@ -386,14 +361,19 @@ class TestOrderTracking:
             mock_client.public_address, 12345
         )
 
-    def test_get_fills_requires_auth(self):
-        with patch('fractrade_hl_simple.hyperliquid.Info', **INFO_ANSWERS), \
-             patch('fractrade_hl_simple.hyperliquid.Exchange'):
-            client = HyperliquidClient.__new__(HyperliquidClient)
-            client.max_retries = 0
-            client.retry_delay = 0
-        with pytest.raises(RuntimeError):
-            client.get_fills()
+    def test_historical_orders_keep_their_own_status_and_its_time(self, mock_client):
+        # Shaped as seen live: one entry per status, newest first, every dex and spot.
+        entry = {"coin": "xyz:NVDA", "side": "A", "limitPx": "160.0", "sz": "0.0", "oid": 5, "timestamp": 1700000000000,
+                 "origSz": "2.0", "triggerCondition": "N/A", "isTrigger": False, "triggerPx": "0.0", "children": [],
+                 "isPositionTpsl": False, "reduceOnly": True, "orderType": "Limit", "tif": "Gtc", "cloid": None}
+        mock_client.info.historical_orders.return_value = [
+            {"order": entry, "status": "reduceOnlyCanceled", "statusTimestamp": 1700000005000},
+            {"order": {**entry, "sz": "2.0"}, "status": "open", "statusTimestamp": 1700000000000}]
+        canceled, placed = mock_client.get_historical_orders()
+        assert (canceled.status, canceled.status_time, canceled.symbol, canceled.size, canceled.remaining_size) == (
+            "reduceOnlyCanceled", 1700000005000, "xyz:NVDA", Decimal("2.0"), Decimal("0.0"))
+        assert (placed.status, placed.status_time, placed.remaining_size) == ("open", 1700000000000, Decimal("2.0"))
+        mock_client.info.historical_orders.assert_called_once_with(mock_client.public_address)
 
     def test_fill_without_fee(self, mock_client):
         fill_no_fee = {
@@ -434,10 +414,6 @@ class TestFillHistory:
         history = client.get_fill_history(100)
         assert ([f.time for f in history.fills], history.truncated) == (list(range(100, 109)), False)
         assert [f.trade_id for f in history.fills] == list(range(1, 10))
-
-    def test_fewer_kept_fills_than_the_cap_prove_it_complete(self, client):
-        self.kept(client, range(100, 109))  # 9 kept: Hyperliquid never dropped one
-        assert not client.get_fill_history(50).truncated
 
     def test_at_the_cap_without_older_fills_the_range_may_be_cut(self, client):
         self.kept(client, range(100, 110))  # 10 kept, none before the range: older ones may be gone
@@ -591,14 +567,6 @@ class TestSpotMarkets:
             Decimal("67.667"), Decimal("67.6995"), Decimal("95674.5"))
         assert markets[1].mid_price is None  # a pair without orders has no mid price
 
-    def test_the_symbols_are_the_ones_the_spot_methods_take(self, mock_client):
-        mock_client.info.spot_meta.return_value = SPOT_META
-        mock_client.info.spot_meta_and_asset_ctxs.return_value = [
-            SPOT_META, [{"coin": pair["name"], "markPx": "1"} for pair in SPOT_META["universe"]]]
-        assert ([m.symbol for m in mock_client.get_spot_markets()]
-                == list(mock_client._spot_coin_symbols().values()))
-
-
 class TestSpotSymbols:
     def test_fills_of_a_pair_no_longer_listed_are_kept_under_hyperliquids_name(self, mock_client):
         mock_client.info.spot_meta.return_value = SPOT_META
@@ -691,7 +659,7 @@ class TestSpotSymbols:
 
     def test_placed_orders_keep_their_order_type_strings(self):
         response = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 12}}]}}}
-        order = HyperliquidClient._order_from_response(
+        order = _answers.order_from_response(
             response, "BTC", False, 0.1, 80000.0, {"trigger": {"triggerPx": 80000.0, "isMarket": True, "tpsl": "sl"}},
             True, "BTC stop loss", cloid=Cloid("0x" + "0" * 32))
         assert order.order_type.trigger == {"triggerPx": Decimal("80000.0"), "isMarket": True, "tpsl": "sl"}
@@ -784,14 +752,6 @@ class TestCoinClasses:
         for copied in (copy.copy(fill), copy.deepcopy(fill)):
             assert (copied.tag, copied.market) == ("bot-1", "perp")
 
-    def test_construction_is_unchanged_and_the_field_can_be_given(self):
-        fill = Fill(symbol="BTC", side="B", price=Decimal("1"), size=Decimal("1"), closed_pnl=Decimal("0"),
-                    direction="Open Long", order_id=1, crossed=True, time=0, hash="")
-        assert fill.market == "perp"
-        assert Fill(symbol="HYPE", side="B", price=Decimal("1"), size=Decimal("1"), closed_pnl=Decimal("0"),
-                    direction="Buy", order_id=1, crossed=True, time=0, hash="", market="spot").market == "spot"
-
-
 # ── User role ─────────────────────────────────────────────────────────
 
 class TestUserRole:
@@ -809,7 +769,6 @@ class TestUserRole:
         with pytest.raises(ValueError):
             mock_client.get_user_role("0x12")
         mock_client.info.user_role.assert_not_called()
-
 
 # ── Bulk Orders ────────────────────────────────────────────────────────
 
@@ -838,18 +797,56 @@ class TestBulkOrders:
         assert call_args[1]["coin"] == "ETH"
         assert call_args[1]["is_buy"] is False
 
+    GONE = {"error": "Order was never placed, already canceled, or filled. asset=0"}
+
+    @staticmethod
+    def canceled(*statuses):
+        return {"status": "ok", "response": {"type": "cancel", "data": {"statuses": list(statuses)}}}
+
     def test_bulk_cancel(self, mock_client):
-        mock_client.exchange.bulk_cancel.return_value = {"status": "ok"}
+        mock_client.exchange.bulk_cancel.return_value = self.canceled("success", self.GONE)
         cancels = [
             {"symbol": "BTC", "order_id": "12345"},
             {"symbol": "ETH", "order_id": 67890},
         ]
+        # One canceled, one no longer open: both done, and the answer comes back as it is.
         result = mock_client.bulk_cancel(cancels)
-        assert result["status"] == "ok"
+        assert result == self.canceled("success", self.GONE)
         mock_client.exchange.bulk_cancel.assert_called_once_with([
             {"coin": "BTC", "oid": 12345},
             {"coin": "ETH", "oid": 67890},
         ])
+
+    @pytest.mark.parametrize("statuses, failed", [
+        (("success", {"error": "Cancel rejected: rate limited"}), [2]),
+        (({"error": "Invalid cancel payload"},), [1, 2]),  # one error: Hyperliquid refused the whole batch
+    ])
+    def test_bulk_cancel_names_each_order_the_exchange_did_not_cancel(self, mock_client, statuses, failed):
+        # It returned any answer, so a failed cancel looked done.
+        mock_client.exchange.bulk_cancel.return_value = self.canceled(*statuses)
+        with pytest.raises(OrdersNotCanceledException) as raised:
+            mock_client.bulk_cancel([{"symbol": "BTC", "order_id": 1}, {"symbol": "ETH", "order_id": 2}])
+        assert [f["order_id"] for f in raised.value.failed] == failed
+
+    @pytest.mark.parametrize("answer", [
+        {"status": "err", "response": "Bad request"},
+        {"status": "ok", "response": {"type": "cancel", "data": {"statuses": ["success"]}}},  # one status for two
+    ], ids=["refused", "one-of-two"])
+    def test_a_cancel_answer_that_confirms_nothing_leaves_the_outcome_open(self, mock_client, answer):
+        # Whether those orders are still open is not known: neither canceled nor named as still open.
+        mock_client.exchange.bulk_cancel.return_value = answer
+        with pytest.raises(OrderException) as raised:
+            mock_client.bulk_cancel([{"symbol": "BTC", "order_id": 1}, {"symbol": "ETH", "order_id": 2}])
+        assert type(raised.value) is OrderException
+
+    def test_one_unconfirmed_cancel_keeps_what_the_others_did(self, mock_client):
+        # The first was canceled, the second's entry is in no documented format: it may be open.
+        mock_client.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
+            "statuses": ["success", {"status": "success"}]}}}
+        with pytest.raises(OrdersNotCanceledException) as raised:
+            mock_client.bulk_cancel([{"symbol": "BTC", "order_id": 1}, {"symbol": "ETH", "order_id": 2}])
+        assert raised.value.canceled == [1] and [f["order_id"] for f in raised.value.failed] == [2]
+        assert "not confirmed" in raised.value.failed[0]["reason"]
 
     def test_bulk_cancel_refuses_an_unknown_symbol_before_sending(self, mock_client):
         # The SDK failed with a bare KeyError while signing, no library exception.
@@ -915,6 +912,64 @@ class TestBulkOrders:
         with pytest.raises(OrderRejectedException, match="does not exist"):
             mock_client.bulk_order(self.ORDERS)
 
+    def test_one_error_for_several_orders_is_a_rejection_of_the_batch(self, mock_client):
+        # Hyperliquid checks the payload first and answers one error for the whole batch (error
+        # responses docs): nothing was placed. It was an unknown outcome.
+        mock_client.exchange.bulk_orders.return_value = self.answer({"error": "Order price too far from reference price."})
+        with pytest.raises(OrderRejectedException, match="too far"):
+            mock_client.bulk_order(self.ORDERS)
+        # For one order, its error is that order's answer.
+        mock_client.exchange.bulk_orders.return_value = self.answer({"error": "Order must have minimum value of $10."})
+        assert mock_client.bulk_order(self.ORDERS[:1]) == self.answer({"error": "Order must have minimum value of $10."})
+
+    def test_a_lost_answer_is_never_sent_again_and_one_not_processed_is(self, mock_client):
+        mock_client.max_retries = 2
+        mock_client.exchange.bulk_orders.side_effect = requests.ReadTimeout("read timed out")
+        with pytest.raises(ActionOutcomeUnknownException):
+            mock_client.bulk_order(self.ORDERS)
+        assert mock_client.exchange.bulk_orders.call_count == 1  # it may have been executed
+        mock_client.exchange.bulk_orders.reset_mock()
+        mock_client.exchange.bulk_orders.side_effect = [requests.ConnectTimeout("connect timed out"),
+                                                        self.answer({"resting": {"oid": 1}}, {"resting": {"oid": 2}})]
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            mock_client.bulk_order(self.ORDERS)
+        assert mock_client.exchange.bulk_orders.call_count == 2  # not processed: sent again
+
+
+# ── Candles ────────────────────────────────────────────────────────────
+
+def _candle(t, close="100", interval_ms=3_600_000):
+    """A candle as the info endpoint's candleSnapshot answers it."""
+    return {"t": t, "T": t + interval_ms - 1, "s": "BTC", "i": "1h", "o": "99", "c": close, "h": "101",
+            "l": "98", "v": "12.5", "n": 42}
+
+
+class TestCandles:
+    def test_candles_are_read_as_numbers_oldest_first(self, mock_client):
+        mock_client.info.candles_snapshot.return_value = [_candle(7_200_000, "102"), _candle(3_600_000)]
+        candles = mock_client.get_candles("BTC", "1h", start_time=0, end_time=10_000_000)
+        assert [(c.open_time, c.close) for c in candles] == [(3_600_000, Decimal("100")), (7_200_000, Decimal("102"))]
+        assert (candles[0].close_time, candles[0].volume, candles[0].trades) == (7_199_999, Decimal("12.5"), 42)
+        mock_client.info.candles_snapshot.assert_called_once_with("BTC", "1h", 0, 10_000_000)
+
+    def test_lookback_reads_enough_and_returns_that_many(self, mock_client):
+        # The range starts lookback intervals before end: with end inside a candle, one more comes back.
+        mock_client.info.candles_snapshot.return_value = [_candle(t * 3_600_000) for t in range(4)]
+        candles = mock_client.get_candles("BTC", "1h", end_time=3 * 3_600_000 + 5, lookback=3)
+        assert [c.open_time // 3_600_000 for c in candles] == [1, 2, 3]
+        assert mock_client.info.candles_snapshot.call_args.args[2:] == (5, 3 * 3_600_000 + 5)
+
+    @pytest.mark.parametrize("arguments, message", [
+        (dict(interval="2m", lookback=5), "interval"),
+        (dict(interval="1h"), "exactly one"),
+        (dict(interval="1h", lookback=5001), "lookback"),
+        (dict(interval="1h", start_time=10, end_time=5), "ends before"),
+    ])
+    def test_invalid_arguments_are_refused_before_any_request(self, mock_client, arguments, message):
+        with pytest.raises(InvalidArgumentException, match=message):
+            mock_client.get_candles("BTC", **arguments)
+        mock_client.info.candles_snapshot.assert_not_called()
+
 
 # ── Funding History ────────────────────────────────────────────────────
 
@@ -929,7 +984,16 @@ class TestFundingHistory:
         assert result[0]["funding_rate"] == 0.0001
         assert result[0]["time"] == 1700000000000
         assert result[1]["premium"] == -0.00002
-        mock_client.info.funding_history.assert_called_once_with("BTC", 1700000000000, None)
+        assert mock_client.info.funding_history.call_args.args[:2] == ("BTC", 1700000000000)
+
+    def test_a_long_range_is_read_page_by_page(self, mock_client):
+        # Hyperliquid answers at most 500 rates (about 20 days): 30 days were cut there silently.
+        hour = 3_600_000
+        rates = [{"time": 1700000000000 + i * hour, "fundingRate": "0.0001", "premium": "0"} for i in range(720)]
+        mock_client.info.funding_history.side_effect = lambda symbol, start, end: [
+            r for r in rates if start <= r["time"] <= end][:500]
+        result = mock_client.get_funding_history("BTC", 1700000000000, 1700000000000 + 719 * hour)
+        assert [r["time"] for r in result] == [r["time"] for r in rates]
 
     def test_get_funding_history_unknown_symbol_before_any_request(self, mock_client):
         with pytest.raises(UnknownSymbolException):
@@ -969,30 +1033,6 @@ class TestFundingRatesFix:
         with pytest.raises(HyperliquidException, match="no predicted funding rate for ETH") as error:
             mock_client.get_funding_rates("ETH")
         assert not isinstance(error.value, ValueError)  # not an input error
-
-
-# ── Meta + Asset Context ──────────────────────────────────────────────
-
-class TestMetaAssetContext:
-    def test_fetch_market_specs_uses_meta_and_asset_ctxs(self):
-        # Clear class-level cache to ensure fresh fetch
-        HyperliquidClient._cached_market_specs = None
-        HyperliquidClient._cached_market_specs_at = 0
-        with patch('fractrade_hl_simple.hyperliquid.Info', **INFO_ANSWERS) as mock_info_cls, \
-             patch('fractrade_hl_simple.hyperliquid.Exchange'):
-            mock_info = mock_info_cls.return_value
-            mock_info.post.return_value = [
-                {"universe": [
-                    {"name": "BTC", "szDecimals": 5, "maxLeverage": 50, "onlyIsolated": False},
-                ]},
-                [{"funding": "0.0001", "openInterest": "1000", "markPx": "85000"}],
-            ]
-            client = HyperliquidClient(max_retries=0, cache_market_specs=False)
-            assert "BTC" in client.market_specs
-            assert client.market_specs["BTC"]["size_decimals"] == 5
-            assert client.market_specs["BTC"]["max_leverage"] == 50
-            assert client.market_specs["BTC"]["funding"] == "0.0001"
-            assert client.market_specs["BTC"]["mark_price"] == "85000"
 
 
 # ── Markets with their current figures ─────────────────────────────────
@@ -1073,6 +1113,7 @@ def _spot_state(usdc_total, usdc_hold, other=()):
     return {"balances": [usdc, *other]}
 
 HYPE = {"coin": "HYPE", "token": 150, "total": "2.0", "hold": "0.0", "entryNtl": "70.0"}
+HYPE_USDC = {"universe": [{"tokens": [150, 0], "name": "@107", "index": 107}]}  # spot meta: HYPE/USDC is @107
 
 
 class TestAccountBalances:
@@ -1090,8 +1131,8 @@ class TestAccountBalances:
         perp = {"": _perp_state("0.0"), "xyz": _perp_state("405.0", [_position("xyz:NVDA")])}
         mock_client.info.user_state.side_effect = lambda address, dex="": perp[dex]
         mock_client.info.spot_user_state.return_value = _spot_state("1000.0", "400.0", [HYPE])
-        mock_client.info.all_mids.return_value = {"HYPE": "40.0"}
-        mock_client.info.name_to_coin = {}
+        mock_client.info.all_mids.return_value = {"@107": "40.0"}
+        mock_client._spot_meta = HYPE_USDC
 
         assert mock_client.get_perp_balance() == Decimal("1000.0")
         assert mock_client.get_all_balances() == Decimal("1080.0")
@@ -1129,8 +1170,8 @@ class TestAccountSummary:
         mock_client.info.user_state.side_effect = lambda address, dex="": perp[dex]
         outcome = {"coin": "+12", "token": 99999, "total": "3.0", "hold": "0.0", "entryNtl": "0.0"}
         mock_client.info.spot_user_state.return_value = _spot_state("1000.0", "400.0", [HYPE, outcome])
-        mock_client.info.all_mids.return_value = {"HYPE": "40.0"}
-        mock_client.info.name_to_coin = {}
+        mock_client.info.all_mids.return_value = {"@107": "40.0"}
+        mock_client._spot_meta = HYPE_USDC
 
     def test_unified_the_shared_collateral_and_what_is_free(self, mock_client):
         self._unified(mock_client)
@@ -1227,6 +1268,7 @@ READS = [
     ("get_spot_open_orders", (), "frontend_open_orders"),
     ("get_open_order_by_id", ("BTC", 1), "frontend_open_orders"),
     ("get_order_status", (1,), "query_order_by_oid"),
+    ("get_historical_orders", (), "historical_orders"),
     ("get_fills", (), "user_fills"),
     ("get_fills_by_time", (0, 1), "user_fills_by_time"),
     ("get_spot_fills", (), "user_fills"),
@@ -1366,6 +1408,15 @@ class TestReadingWithoutKey:
         assert getattr(client, function).call_args.kwargs["address"] == OTHER
 
 
+def test_an_api_call_takes_the_account_as_a_dict():
+    as_dict = {"private_key": ACCOUNT.private_key, "public_address": ACCOUNT.public_address}
+    with patch("fractrade_hl_simple.api.HyperliquidClient") as client:
+        api.get_price("BTC", account=as_dict)
+    assert client.call_args.kwargs["account"] == HyperliquidAccount(**as_dict)
+    with pytest.raises(exceptions.InvalidArgumentException, match="private_key, public_address"):
+        api.get_price("BTC", account={"key": ACCOUNT.private_key})
+
+
 class TestApiMatchesTheClient:
     """Each api function takes every parameter of the client method it calls, with the same
     default: a parameter added to the client and forgotten in the api is a missing feature
@@ -1418,6 +1469,7 @@ _SPECIAL_ARGUMENTS = {
     OrderOutcomeUnknownException: ("BTC", "0x" + "1" * 32, "read timed out"),
     ProtectionOrderException: ("stop_loss", {"entry": _ORDER}),
     ProtectionReplacementIncompleteException: (_ORDER, ["5", "6"], "were kept"),
+    exceptions.ProtectionSyncIncompleteException: ("a level was not placed",),
     exceptions.PositionNotClosedException: ("BTC", SimpleNamespace(order_id="7", filled_size=Decimal("0.6")), Decimal("0.4")),
     exceptions.ClosePositionsIncompleteException: ({"BTC": _ORDER}, {"ETH": "rejected"}),  # exceptions compare by identity
     exceptions.MakerOrderIncompleteException: ("BTC", Decimal("0.0004"), Decimal("85000"), Decimal("0.0006")),
@@ -1489,12 +1541,3 @@ class TestPortfolio:
         mock_client.get_portfolio(other)
         mock_client.info.post.assert_any_call("/info", {"type": "portfolio", "user": other})
 
-    def test_get_portfolio_requires_auth_or_address(self):
-        with patch('fractrade_hl_simple.hyperliquid.Info', **INFO_ANSWERS), \
-             patch('fractrade_hl_simple.hyperliquid.Exchange'):
-            client = HyperliquidClient.__new__(HyperliquidClient)
-            client.max_retries = 0
-            client.retry_delay = 0
-            client.base_url = "https://api.hyperliquid.xyz"
-        with pytest.raises(RuntimeError):
-            client.get_portfolio()

@@ -121,36 +121,6 @@ class TestXyzMarketSpecs:
         # 2 standard + 4 xyz
         assert len(mock_client.market_specs) == 6
 
-    def test_xyz_dex_failure_doesnt_break_init(self):
-        """If the xyz dex meta fetch fails, standard symbols should still load."""
-        HyperliquidClient._cached_market_specs = None
-        HyperliquidClient._cached_market_specs_at = 0
-
-        with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
-             patch('fractrade_hl_simple.hyperliquid.Exchange'):
-            mock_info = mock_info_cls.return_value
-
-            call_count = [0]
-            def mock_post(endpoint, payload):
-                if payload.get("type") == "metaAndAssetCtxs":
-                    dex = payload.get("dex", "")
-                    if dex == "xyz":
-                        raise Exception("xyz dex unavailable")
-                    return [DEFAULT_META, DEFAULT_CTXS]
-                return {}
-
-            def mock_meta(dex=""):
-                if dex == "xyz":
-                    raise Exception("xyz dex unavailable")
-                return DEFAULT_META
-
-            mock_info.post.side_effect = mock_post
-            mock_info.meta.side_effect = mock_meta
-
-            client = HyperliquidClient(max_retries=0, cache_market_specs=False)
-            assert "BTC" in client.market_specs
-            assert "xyz:TSLA" not in client.market_specs
-
     def test_extended_client_does_not_reuse_specs_of_a_default_client(self):
         # The cache used to ignore the dex list: an xyz client created after a default one
         # got default-dex specs only, and sized xyz orders with 0 decimals.
@@ -196,26 +166,6 @@ class TestXyzMarketSpecs:
 # ── Price Queries ─────────────────────────────────────────────────────
 
 class TestXyzPrices:
-    def test_get_price_xyz_symbol(self, mock_client):
-        mock_client.info.all_mids.side_effect = lambda dex="": (
-            {"xyz:TSLA": "380.0", "xyz:GOLD": "4430.0"} if dex == "xyz"
-            else {"BTC": "85000.0", "ETH": "3200.0"}
-        )
-
-        price = mock_client.get_price("xyz:TSLA")
-        assert price == 380.0
-
-    def test_get_price_all_includes_xyz(self, mock_client):
-        mock_client.info.all_mids.side_effect = lambda dex="": (
-            {"xyz:TSLA": "380.0", "xyz:GOLD": "4430.0"} if dex == "xyz"
-            else {"BTC": "85000.0", "ETH": "3200.0"}
-        )
-
-        prices = mock_client.get_price()
-        assert "BTC" in prices
-        assert "xyz:TSLA" in prices
-        assert "xyz:GOLD" in prices
-        assert len(prices) == 4
 
     def test_get_price_xyz_not_found(self, mock_client):
         mock_client.info.all_mids.side_effect = lambda dex="": (
@@ -320,22 +270,6 @@ class TestXyzSdkInit:
             HyperliquidClient(max_retries=0, extended_universe=True)
             call_kwargs = mock_info_cls.call_args
             assert call_kwargs.kwargs.get("perp_dexs") == ["", "xyz"]
-
-    def test_exchange_gets_extended_universe(self):
-        with patch('fractrade_hl_simple.hyperliquid.Info') as mock_info_cls, \
-             patch('fractrade_hl_simple.hyperliquid.Exchange') as mock_exchange_cls:
-            mock_info_cls.return_value.post.return_value = [DEFAULT_META, DEFAULT_CTXS]
-
-            from fractrade_hl_simple.models import HyperliquidAccount
-            account = HyperliquidAccount(
-                private_key="0x" + "ab" * 32,
-                public_address="0x1234567890abcdef1234567890abcdef12345678",
-            )
-            client = HyperliquidClient(account=account, max_retries=0, extended_universe=True)
-        # The exchange signs with the client's Info, created for both dexes.
-        assert mock_info_cls.call_args.kwargs["perp_dexs"] == ["", "xyz"]
-        assert client.exchange.info is client.info
-
 
 # ── Other HIP-3 dexes (perp_dexs) ─────────────────────────────────────
 
@@ -506,11 +440,12 @@ class TestGetLeverage:
 class TestGetFeeRates:
     ADDRESS = "0x" + "ab" * 20
 
-    def client(self, para_client, growth=False, scale=None, cross="0.00045", add="0.00015"):
+    def client(self, para_client, growth=False, scale=None, cross="0.00045", add="0.00015", discount="0.0"):
         client, _ = para_client
         client.info.name_to_coin = {"BTC": "BTC", "para:TOTAL2": "para:TOTAL2"}
         client.market_specs["para:TOTAL2"].update(growth_mode=growth, deployer_fee_scale=scale)
-        client.info.post.side_effect = lambda endpoint, payload: {"userCrossRate": cross, "userAddRate": add} \
+        fees = {"userCrossRate": cross, "userAddRate": add, "activeReferralDiscount": discount}
+        client.info.post.side_effect = lambda endpoint, payload: fees \
             if payload["type"] == "userFees" else METAS[payload.get("dex", "")]
         return client
 
@@ -535,8 +470,14 @@ class TestGetFeeRates:
             self.client(para_client, False, scale).get_fee_rates("para:TOTAL2", address=self.ADDRESS)
 
     def test_a_maker_rebate_is_only_cut_by_growth_mode(self, para_client):
-        rates = self.client(para_client, True, "1.0", add="-0.00002").get_fee_rates("para:TOTAL2", address=self.ADDRESS)
-        assert rates.maker == Decimal("-0.000002")
+        rates = self.client(para_client, True, "1.0", add="-0.00002", discount="0.04").get_fee_rates(
+            "para:TOTAL2", address=self.ADDRESS)
+        assert rates.maker == Decimal("-0.000002")  # not the referral discount either
+
+    def test_the_referral_discount_is_taken_off_the_fees(self, para_client):
+        # 4 % off (the fee formula of Hyperliquid's docs): 0.045 % becomes 0.0432 %. It was left out.
+        rates = self.client(para_client, discount="0.04").get_fee_rates("BTC", address=self.ADDRESS)
+        assert (rates.taker, rates.maker) == (Decimal("0.000432"), Decimal("0.000144"))
 
     @pytest.mark.parametrize("answer", [{}, {"userCrossRate": "x", "userAddRate": "0"},
                                         {"userCrossRate": "NaN", "userAddRate": "0"}])

@@ -14,6 +14,7 @@ from __future__ import annotations
 import importlib.metadata
 import json
 import math
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from decimal import Decimal
@@ -21,7 +22,7 @@ from typing import Any, Optional
 
 import anyio
 import anyio.to_thread
-from jsonschema import Draft202012Validator, validators
+from jsonschema import Draft202012Validator, ValidationError, validators
 from mcp import types
 from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
@@ -58,8 +59,8 @@ Trade tools trade real money for `account`, or without it the only account that 
 (never the default account), within its limits. Orders without limit_price are market \
 orders. On OUTCOME_UNKNOWN never call again: follow the hint; an order not found by its cloid \
 can still arrive. After a trade call without an answer, check \
-positions, open orders and fills first. kill_switch halts trading but keeps stop losses; \
-cancel_all_orders and close_all_positions are separate steps."""
+positions, open orders and fills first. kill_switch halts trading, cancels entry orders (with \
+stops attached to them) and keeps stop losses."""
 
 
 @dataclass(frozen=True)
@@ -113,9 +114,18 @@ def _is_integer(checker: Any, instance: Any) -> bool:
     return isinstance(instance, int) and not isinstance(instance, bool)
 
 
-# Draft 2020-12, with "integer" meaning an int (no integral floats).
+def _pattern(validator: Any, pattern: str, instance: Any, schema: Any) -> Any:
+    """A pattern matches the whole string. Python's re.search lets `$` match before a final
+    newline, so "^0x...$" would take "0x...\n" (JavaScript's would not); the tools' patterns
+    are all anchored."""
+    if validator.is_type(instance, "string") and re.fullmatch(pattern, instance) is None:
+        yield ValidationError(f"{instance!r} does not match {pattern!r}")
+
+
+# Draft 2020-12, with "integer" meaning an int (no integral floats) and whole-string patterns.
 Validator = validators.extend(
-    Draft202012Validator, type_checker=Draft202012Validator.TYPE_CHECKER.redefine("integer", _is_integer))
+    Draft202012Validator, validators={"pattern": _pattern},
+    type_checker=Draft202012Validator.TYPE_CHECKER.redefine("integer", _is_integer))
 
 
 def _json_default(value: Any) -> Any:

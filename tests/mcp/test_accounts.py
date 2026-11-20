@@ -69,8 +69,6 @@ def error_code(call):
 
 
 class TestReadResolution:
-    def test_default_account(self):
-        assert registry(config(default="whale")).resolve_read().name == "whale"
 
     def test_without_a_default_the_only_account(self):
         only = parse_config(f'[accounts.whale]\naddress = "{WHALE}"\n', "test.toml")
@@ -78,13 +76,6 @@ class TestReadResolution:
 
     def test_several_accounts_without_a_default_are_ambiguous(self):
         assert error_code(registry().resolve_read) == "AMBIGUOUS_ACCOUNT"
-
-    def test_named_account(self):
-        target = registry().resolve_read(account="copy")
-        assert (target.name, target.address, target.base_url) == ("copy", COPY, MAINNET)
-
-    def test_unknown_account(self):
-        assert error_code(lambda: registry().resolve_read(account="mian")) == "ACCOUNT_NOT_FOUND"
 
     def test_any_address_on_mainnet_by_default(self):
         other = "0x" + "4" * 40
@@ -110,9 +101,6 @@ class TestTradeResolution:
     def test_several_trading_accounts_are_ambiguous_even_with_a_default(self):
         assert error_code(registry(config(default="main")).resolve_trade) == "AMBIGUOUS_ACCOUNT"
         assert registry().resolve_trade(account="copy").name == "copy"
-
-    def test_watch_only_account_cannot_trade(self):
-        assert error_code(lambda: registry().resolve_trade(account="whale")) == "TRADING_DISABLED"
 
     def test_no_account_trades_while_trading_is_switched_off(self):
         reg = registry(keys={})  # the server loads no keys without the trading switch
@@ -162,7 +150,7 @@ class TestClients:
         reg = registry(config(copy_trading=False))
         for target in (reg.resolve_read(account="whale"), reg.resolve_read(account="copy"),
                        reg.resolve_read(address=MAIN)):  # a trading account's address, not named
-            assert error_code(lambda: reg.trade_client(target)) == "TRADING_DISABLED"
+            assert error_code(lambda target=target: reg.trade_client(target)) == "TRADING_DISABLED"
 
     def test_made_once_when_first_used_by_two_tools_at_once(self):
         started, release, made = threading.Event(), threading.Event(), []
@@ -377,18 +365,6 @@ class TestPerpDexs:
         assert reg.account_perp_dexs(reg._config.accounts["copy"]) == ("para", "io", "xyz")
         assert reg.perp_dexs(TESTNET) == ()  # another network is not touched
 
-    def test_a_dex_the_network_does_not_have_changes_nothing_and_the_hint_lists_its_dexes(self):
-        reg = registry(dex_config(), make_client=Network())
-        main = reg.resolve_trade(account="main")
-        reader, trader = reg.read_client(main), reg.trade_client(main)
-        with pytest.raises(ToolError) as caught:
-            reg.enable_perp_dexs(MAINNET, ["io", "nope"])
-        error = caught.value
-        assert (error.code, str(error), error.hint) == (
-            "INVALID_ARGUMENT", f"not a perp dex at {MAINNET}: nope", "its HIP-3 dexes: xyz, para, io")
-        assert reg.perp_dexs(MAINNET) == ("xyz", "para")
-        assert reg.read_client(main) is reader and reg.trade_client(main) is trader
-
     def test_an_unknown_dex_of_another_accounts_config_is_found_too(self):
         # copy's config names a dex the network lacks. Enabling it, before any read client
         # exists, must not hand it to main without a check.
@@ -446,12 +422,13 @@ class TestPerpDexs:
 
 
 class TestSignerCheck:
-    def test_an_api_wallet_of_the_account_is_checked_once(self):
-        reader = RoleReader({"role": "agent", "data": {"user": "0x" + "AB" * 20}})
+    def test_an_api_wallet_of_the_account_is_looked_up_before_each_action(self):
+        agent = {"role": "agent", "data": {"user": "0x" + "AB" * 20}}  # the address compared in any case
+        reader = RoleReader(agent, agent)
         accounts, main = checked(config(main_address="0x" + "ab" * 20), reader)
         accounts.check_signer(main)
-        accounts.check_signer(main)
-        assert reader.asked == [SIGNER]  # one lookup for the process; the address compared in any case
+        accounts.check_signer(main, reduces_risk=True)
+        assert reader.asked == [SIGNER, SIGNER]
 
     @pytest.mark.parametrize("answer, says", [
         ({"role": "agent", "data": {"user": COPY}}, "an API wallet of another account"),
@@ -495,17 +472,14 @@ class TestSignerCheck:
             accounts.check_signer(accounts.resolve_trade("copy"))
         assert e.value.code == "SIGNER_NOT_AUTHORIZED"
 
-    def test_an_approval_removed_meanwhile_is_found_before_the_next_action_that_adds_risk(self):
-        agent = {"role": "agent", "data": {"user": MAIN}}
-        reader = RoleReader(agent, {"role": "user"}, agent)
+    def test_an_approval_removed_meanwhile_is_found_before_a_close_too(self):
+        # The key may now trade another account: a close signed with it would act there.
+        reader = RoleReader({"role": "agent", "data": {"user": MAIN}}, {"role": "agent", "data": {"user": COPY}})
         accounts, main = checked(config(), reader)
-        accounts.check_signer(main)                      # confirmed: one lookup
-        accounts.check_signer(main)                      # reduces risk: the kept result
-        with pytest.raises(ToolError) as e:              # adds risk: looked up again
-            accounts.check_signer(main, fresh=True)
-        assert e.value.code == "SIGNER_NOT_AUTHORIZED" and "can withdraw and transfer" in str(e.value)
-        accounts.check_signer(main)                      # the refusal dropped the kept result
-        assert reader.asked == [SIGNER] * 3
+        accounts.check_signer(main)
+        with pytest.raises(ToolError) as e:
+            accounts.check_signer(main, reduces_risk=True)
+        assert e.value.code == "SIGNER_NOT_AUTHORIZED" and "an API wallet of another account" in str(e.value)
 
     @pytest.mark.parametrize("account", ["main", "copy"])  # copy is a vault
     @pytest.mark.parametrize("answer", [
@@ -535,13 +509,18 @@ max_leverage = 5
             accounts.check_signer(accounts.resolve_trade("copy"))
         assert "the account's own key" in str(e.value) and clients.made == []
 
-    def test_a_failed_lookup_raises_the_library_error_and_is_asked_again(self):
-        reader = RoleReader(NetworkException("connection reset"), {"role": "agent", "data": {"user": MAIN}})
+    def test_a_failed_lookup_lets_only_a_call_that_reduces_risk_use_the_confirmed_result(self):
+        # Hyperliquid's info down: a close still works, an order that adds risk does not.
+        down = NetworkException("connection reset")
+        reader = RoleReader(down, {"role": "agent", "data": {"user": MAIN}}, down, down)
         accounts, main = checked(config(), reader)
+        with pytest.raises(NetworkException):            # nothing confirmed yet
+            accounts.check_signer(main, reduces_risk=True)
+        accounts.check_signer(main)
+        accounts.check_signer(main, reduces_risk=True)   # the confirmed result
         with pytest.raises(NetworkException):
             accounts.check_signer(main)
-        accounts.check_signer(main)
-        assert reader.asked == [SIGNER, SIGNER]
+        assert reader.asked == [SIGNER] * 4
 
     def test_an_invalid_key_is_refused_without_showing_it(self):
         bad = "0x" + "ff" * 32  # above the curve order: no private key

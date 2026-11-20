@@ -13,15 +13,15 @@ import anyio  # noqa: E402
 from hyperliquid.utils import constants  # noqa: E402
 from mcp import Client  # noqa: E402
 
+from fractrade_hl_simple import _answers  # noqa: E402
 from fractrade_hl_simple.exceptions import HyperliquidException, NetworkException  # noqa: E402
-from fractrade_hl_simple.hyperliquid import HyperliquidClient  # noqa: E402
 from fractrade_hl_simple.mcp_server.accounts import AccountRegistry  # noqa: E402
 from fractrade_hl_simple.mcp_server.config import parse_config  # noqa: E402
 from fractrade_hl_simple.mcp_server.server import build_server  # noqa: E402
 from fractrade_hl_simple.mcp_server.tools.read import RECENT_FILLS, read_tools  # noqa: E402
 from fractrade_hl_simple.models import (  # noqa: E402
     AccountSummary, CollateralBalance, CumFunding, DexAccount, Fill, FillHistory, FundingPayment, Leverage, Order,
-    OrderType, Position,
+    OrderType, PnLReport, Position, coin_market,
 )
 
 MAIN = "0x" + "1" * 40
@@ -70,6 +70,7 @@ class FakeClient:
         # What the client knows without a request: the perp markets of the dexes it reads.
         self.perp_dexs = ["", "xyz"]
         self.market_specs = {name: {} for name in ("BTC", "ETH", "xyz:NVDA", "xyz:TSLA")}
+        self.market_specs.update(answers.get("market_specs", {}))  # e.g. a dex's collateral
         self.listed_since = answers.get("listed_since", [])  # markets get_markets() finds too
 
     def get_markets(self):
@@ -128,9 +129,15 @@ WALLET_TOOLS = [
     ("get_open_orders", {"market": "spot"}, {"get_spot_open_orders": []}),
     ("get_fills", {}, {"get_fills": []}),
     ("get_fills", {"start": "2026-11-01T00:00:00Z"}, {"get_fill_history": history([])}),
+    ("get_changes", {}, {"get_open_orders": [], "get_fill_history": history([]), "get_positions": [],
+                         "get_historical_orders": []}),
     ("get_order_status", {"order_id": 1}, {"get_order_status": {"status": "unknownOid"}}),
     ("get_portfolio", {}, {"get_portfolio": []}),
     ("get_funding_payments", {}, {"get_user_funding": []}),
+    ("get_pnl", {"start": "2026-11-01T00:00:00Z", "end": "2026-11-10T00:00:00Z"},
+     {"get_pnl": PnLReport(start_time=T0, end_time=T0, trades=[], realized_pnl=Decimal(0), fees=Decimal(0),
+                           fees_other={}, funding=Decimal(0), net_pnl=Decimal(0), unrealized_pnl=None,
+                           truncated=False)}),
 ]
 WALLETS = [  # (arguments, account in the envelope, address read, base_url read)
     ({}, "main", MAIN, MAINNET),
@@ -149,7 +156,7 @@ class TestWhichWallet:
         assert (body["account"], body["address"], body["base_url"]) == (account, address, base_url)
         assert list(clients) == [base_url]
         calls = clients[base_url].calls
-        assert calls and all(kwargs == {"address": address} for _, _, kwargs in calls)
+        assert calls and all(kwargs.get("address") == address for _, _, kwargs in calls)
 
     @pytest.mark.parametrize("arguments, code", [
         ({"account": "mian"}, "ACCOUNT_NOT_FOUND"),
@@ -270,10 +277,11 @@ class TestOpenOrders:
         answers = {"get_open_orders": [order(11, filled="0.004", trigger_price=Decimal("79000"))]}
         is_error, body, clients = run_tool("get_open_orders", {"symbol": "BTC"}, answers)
         assert not is_error and body["data"] == [{
-            "order_id": 11, "cloid": None, "symbol": "BTC", "side": "buy", "type": "limit", "size": "0.01",
-            "filled_size": "0.004", "remaining_size": "0.006", "limit_price": "80000", "trigger_price": "79000",
+            "order_id": 11, "cloid": None, "symbol": "BTC", "side": "buy", "type": "limit", "order_type": "Limit",
+            "is_market": False, "size": "0.01", "filled_size": "0.004", "reduced_size": None,
+            "remaining_size": "0.006", "limit_price": "80000", "trigger_price": "79000", "slippage_cap_pct": None,
             "trigger_condition": None, "reduce_only": False, "is_position_tpsl": None, "time_in_force": "Gtc",
-            "created_at": "2026-11-06T21:20:00.000Z"}]
+            "created_at": "2026-11-06T21:20:00.000Z", "children": []}]
         assert clients[MAINNET].calls == [("get_open_orders", ("BTC",), {"address": MAIN})]
 
     def test_perp_orders_leave_out_the_spot_and_outcome_orders_of_the_default_dex(self):
@@ -292,6 +300,38 @@ class TestOpenOrders:
     def test_an_unknown_market_is_refused(self):
         is_error, body, _ = run_tool("get_open_orders", {"market": "futures"}, {})
         assert is_error and body["error"]["code"] == "INVALID_ARGUMENT"
+
+    # Seen live: a stop showed limit_price = trigger_price, so whether it was a market stop had
+    # to be checked on Hyperliquid.
+    @pytest.mark.parametrize("name, side, limit, kind, is_market, cap", [
+        ("Limit", "B", "2900.0", "Limit", False, None),
+        ("Stop Market", "A", "3000.0", "Stop Market", True, 10.0),  # limitPx as sent: not its bound
+        ("Stop Limit", "A", "2940.0", "Stop Limit", False, 2.0),     # a sell may fill 2 % below the trigger
+        ("Take Profit Limit", "A", "3030.0", "Take Profit Limit", False, 0.0),  # a sell's limit above: no slippage
+    ])
+    def test_each_order_type_says_how_it_executes(self, name, side, limit, kind, is_market, cap):
+        trigger = name != "Limit"
+        raw = {"coin": "ETH", "side": side, "limitPx": limit, "sz": "0.5", "oid": 5, "timestamp": T0,
+               "triggerCondition": "Price below 3000" if trigger else "N/A", "isTrigger": trigger,
+               "triggerPx": "3000.0" if trigger else "0.0", "reduceOnly": trigger, "orderType": name,
+               "origSz": "0.5", "tif": None if trigger else "Gtc", "cloid": None}
+        _, body, _ = run_tool("get_open_orders", {}, {
+            "get_open_orders": [_answers.parse_open_order(raw, raw["coin"])]})
+        listed = body["data"][0]
+        assert (listed["order_type"], listed["is_market"], listed["slippage_cap_pct"]) == (kind, is_market, cap)
+
+    def test_a_reduce_only_order_shrunk_or_filled_shows_no_fill(self):
+        # Seen live: a take profit limit Hyperliquid shrank to the position after a partial close by
+        # hand was shown with filled_size 46296.2, although nothing of it had filled.
+        raw = {"coin": "USUAL", "side": "A", "limitPx": "0.0106", "sz": "53703.8", "oid": 5, "timestamp": T0,
+               "triggerCondition": "N/A", "isTrigger": False, "triggerPx": "0.0", "reduceOnly": True,
+               "orderType": "Limit", "origSz": "100000.0", "tif": "Gtc", "cloid": None}
+        _, listed, _ = run_tool("get_open_orders", {}, {
+            "get_open_orders": [_answers.parse_open_order(raw, raw["coin"])]})
+        _, by_id, _ = run_tool("get_order_status", {"order_id": 5}, {"get_order_status": status(raw, state="open")})
+        for shown in (listed["data"][0], by_id["data"]["order"]):
+            assert (shown["size"], shown["filled_size"], shown["reduced_size"], shown["remaining_size"]) == (
+                "100000.0", None, "46296.2", "53703.8")
 
 
 class TestFills:
@@ -373,10 +413,11 @@ class TestOrderStatus:
         is_error, body, clients = run_tool("get_order_status", {"order_id": 99}, {"get_order_status": raw})
         assert not is_error and body["data"] == {
             "found": True, "status": "filled", "status_time": "2026-11-06T21:20:00.500Z", "order": {
-                "order_id": 99, "cloid": None, "symbol": "BTC", "side": "sell", "type": "limit", "size": "0.001",
-                "filled_size": "0.001", "remaining_size": "0.000", "limit_price": "85000.0", "trigger_price": None,
+                "order_id": 99, "cloid": None, "symbol": "BTC", "side": "sell", "type": "limit", "order_type": "Market",
+                "is_market": True, "size": "0.001", "filled_size": "0.001", "reduced_size": None,
+                "remaining_size": "0.000", "limit_price": "85000.0", "trigger_price": None, "slippage_cap_pct": None,
                 "trigger_condition": "N/A", "reduce_only": True, "is_position_tpsl": None, "time_in_force": "Ioc",
-                "created_at": "2026-11-06T21:20:00.000Z"}}
+                "created_at": "2026-11-06T21:20:00.000Z", "children": []}}
         assert clients[MAINNET].calls == [("get_order_status", (99,), {"address": MAIN})]
 
     def test_a_trigger_order(self):
@@ -397,7 +438,7 @@ class TestOrderStatus:
                "reduceOnly": True, "orderType": "Stop Limit", "origSz": "0.5", "tif": None, "cloid": None}
         _, by_id, _ = run_tool("get_order_status", {"order_id": 5}, {"get_order_status": status(raw)})
         _, listed, _ = run_tool("get_open_orders", {}, {
-            "get_open_orders": [HyperliquidClient._parse_open_order(raw, raw["coin"])]})
+            "get_open_orders": [_answers.parse_open_order(raw, raw["coin"])]})
         assert by_id["data"]["order"] == listed["data"][0]
 
     def test_an_unknown_order(self):
@@ -411,8 +452,56 @@ class TestOrderStatus:
 
 
 def payment(time, usdc, symbol="BTC"):
-    return FundingPayment(time=time, symbol=symbol, market="perp", size=Decimal("-2"), funding_rate=Decimal("0.0000125"),
+    return FundingPayment(time=time, symbol=symbol, market=coin_market(symbol), size=Decimal("-2"),
+                          funding_rate=Decimal("0.0000125"),
                           usdc=Decimal(usdc))
+
+
+def pnl_report():
+    """Two BTC trades (a win and a loss) and an open ETH trade, built by the library."""
+    from fractrade_hl_simple import pnl
+
+    def f(time, side, size, start, symbol="BTC", price="100", closed="0"):
+        return Fill(symbol=symbol, side=side, price=Decimal(price), size=Decimal(size), closed_pnl=Decimal(closed),
+                    direction="", order_id=1, crossed=True, time=time, hash="", fee=Decimal("0.123"),
+                    start_position=Decimal(start), fee_token="USDC")
+
+    fills = [f(T0 + 1, "B", "1", "0", price="100.123456789"), f(T0 + 2, "A", "1", "1", closed="10"),
+             f(T0 + 3, "A", "2", "0"), f(T0 + 4, "B", "2", "-2", closed="-30.004"),
+             f(T0 + 5, "B", "0.5", "0", symbol="ETH")]
+    trades = pnl.perp_trades(fills, [], T0, positions=[position("ETH", "0.5")])
+    return pnl.report(trades, T0, T0 + 9, False, None)
+
+
+class TestPnl:
+    ARGS = {"start": "2026-11-06T00:00:00Z", "end": "2026-11-07T00:00:00Z"}
+
+    def test_trades_oldest_first_in_cents(self):
+        is_error, body, clients = run_tool("get_pnl", {**self.ARGS, "symbol": "BTC", "spot": True},
+                                           {"get_pnl": pnl_report()})
+        assert not is_error, body
+        first = body["data"][0]
+        assert (first["symbol"], first["side"], first["status"], first["entry_price"], first["fees"],
+                first["net_pnl"]) == ("BTC", "long", "closed", "100.123", "0.25", "9.75")
+        assert [t["symbol"] for t in body["data"]] == ["BTC", "BTC", "ETH"]
+        assert body["data"][2]["unrealized_pnl"] == "2.00"
+        assert body["totals"]["net_pnl"] == "-20.62" and body["totals"]["unrealized_pnl"] == "2.00"
+        (call,) = [c for c in clients[MAINNET].calls if c[0] == "get_pnl"]
+        assert call[1][2] == "BTC" and call[2] == {"spot": True, "address": MAIN}
+
+    def test_a_limit_keeps_the_most_recent_trades_and_the_totals_of_all(self):
+        _, body, _ = run_tool("get_pnl", {**self.ARGS, "limit": 2}, {"get_pnl": pnl_report()})
+        assert [(t["side"], t["symbol"]) for t in body["data"]] == [("short", "BTC"), ("long", "ETH")]
+        assert (body["count"], body["truncated"], body["truncated_reason"]) == (2, True, "limit")
+        assert body["totals"]["net_pnl"] == "-20.62"
+
+    def test_by_market_each_currency_on_its_own(self):
+        # A HIP-3 dex may use another collateral: its trades are never added to USDC ones.
+        report = pnl_report()
+        report.trades[1].currency = "USDH"
+        _, body, _ = run_tool("get_pnl", {**self.ARGS, "group_by": "market"}, {"get_pnl": report})
+        assert sorted((m["symbol"], m["currency"], m["trades"]) for m in body["data"]) == [
+            ("BTC", "USDC", 1), ("BTC", "USDH", 1), ("ETH", "USDC", 1)]
 
 
 class TestFundingPayments:
@@ -423,7 +512,15 @@ class TestFundingPayments:
         assert (body["from"], body["to"], body["total_usdc"], body["count"], body["truncated"]) == (
             "2026-11-06T00:00:00.000Z", "2026-11-07T00:00:00.000Z", "-0.4", 2, True)
         assert body["data"][0] == {"time": "2026-11-06T23:20:00.000Z", "symbol": "BTC", "position_size": "-2",
-                                   "funding_rate": "0.0000125", "usdc": "-0.1"}
+                                   "funding_rate": "0.0000125", "amount": "-0.1", "currency": "USDC"}
+
+    def test_each_currency_has_its_own_total(self):
+        # A HIP-3 dex may use another collateral: its payments are never added to USDC ones.
+        answers = {"get_user_funding": [payment(T0, "-0.5"), payment(T0 + 1, "0.25", symbol="xyz:NVDA")],
+                   "market_specs": {"xyz:NVDA": {"collateral": "USDH"}}}
+        _, body, _ = run_tool("get_funding_payments", {}, answers)
+        assert (body["total_usdc"], body["other_currencies"]) == ("-0.5", {"USDH": "0.25"})
+        assert [row["currency"] for row in body["data"]] == ["USDH", "USDC"]
 
     def test_a_history_that_cannot_be_read_completely_is_an_error_not_a_partial_total(self):
         failure = HyperliquidException("More than 500 funding payments at 1 ms: the rest of the range cannot be read")

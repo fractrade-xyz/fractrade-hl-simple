@@ -12,14 +12,15 @@ from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any, Optional
 
+from ... import _answers
 from ...exceptions import UnknownSymbolException
-from ...hyperliquid import HyperliquidClient
 from ...models import (
-    PERP_MARKETS, AccountSummary, CollateralBalance, DexAccount, Fill, Market, SpotMarket, coin_market,
+    PERP_MARKETS, AccountSummary, CollateralBalance, DexAccount, Fill, FundingPayment, Market, SpotMarket, coin_market,
 )
+from ...pnl import UNKNOWN, USDC
 from ..accounts import AccountRegistry, Target, require_enabled_dexes
 from ..convert import dex as _dex, iso as _iso, order as _order, position as _position, side as _side
-from ..config import BASE_URLS, AccountConfig, Config
+from ..config import TOOL_BASE_URLS, AccountConfig, Config
 from ..errors import ToolError
 from ..server import ToolSpec
 
@@ -31,7 +32,7 @@ ACCOUNT_PARAMETERS: dict[str, Any] = {
                 "Without account and address: the default account."},
     "address": {"type": "string", "pattern": "^0x[0-9a-fA-F]{40}$",
                 "description": "Any public address, instead of account."},
-    "base_url": {"type": "string", "enum": list(BASE_URLS),
+    "base_url": {"type": "string", "enum": list(TOOL_BASE_URLS),
                  "description": "Only with address: the Hyperliquid API to read (default mainnet)."},
 }
 SYMBOL = {"type": "string", "minLength": 1,
@@ -54,14 +55,17 @@ def read_tools(config: Config, registry: AccountRegistry) -> list[ToolSpec]:
         _get_positions(registry),
         _get_open_orders(registry),
         _get_fills(registry),
+        *_changes_tools(registry),
         _get_order_status(registry),
         _get_order_status_by_cloid(registry),
         _get_portfolio(registry),
         _get_funding_payments(registry),
+        _get_pnl(registry),
         _get_prices(registry),
         _list_markets(registry),
         _get_market_info(registry),
         _get_order_book(registry),
+        _get_candles(registry),
         _get_funding_rates(registry),
         *_risk_tools(registry),
     ]
@@ -70,6 +74,11 @@ def read_tools(config: Config, registry: AccountRegistry) -> list[ToolSpec]:
 def _risk_tools(registry: AccountRegistry) -> list[ToolSpec]:
     from .risk import risk_tools  # imports this module's shared pieces
     return risk_tools(registry)
+
+
+def _changes_tools(registry: AccountRegistry) -> list[ToolSpec]:
+    from .changes import changes_tools  # imports this module's shared pieces
+    return changes_tools(registry)
 
 
 # ── shared pieces ─────────────────────────────────────────────────────
@@ -203,6 +212,12 @@ def _limits(account: AccountConfig) -> Optional[dict[str, Any]]:
         "max_orders_per_hour": account.max_orders_per_hour,
         "check_order_leverage": account.check_order_leverage,
         "max_risk_pct": account.max_risk_pct,
+        "max_day_loss_pct": account.max_day_loss_pct,
+        "max_day_loss_mode": account.max_day_loss_mode if account.max_day_loss_pct is not None else None,
+        "max_total_notional_x": account.max_total_notional_x,
+        "max_total_notional_mode": account.max_total_notional_mode if account.max_total_notional_x is not None else None,
+        "day_start": account.day_start,
+        "tz": account.tz,
     }
 
 
@@ -211,7 +226,7 @@ def _limits(account: AccountConfig) -> Optional[dict[str, Any]]:
 
 def _enable_perp_dexs(registry: AccountRegistry) -> ToolSpec:
     def run(arguments: dict[str, Any]) -> dict[str, Any]:
-        base_url = arguments.get("base_url", BASE_URLS[0])
+        base_url = arguments.get("base_url", TOOL_BASE_URLS[0])
         read, added = registry.enable_perp_dexs(base_url, arguments["dexes"])
         return {"base_url": base_url, "perp_dexs": list(read), "enabled": list(added),
                 "note": "until the server restarts; to keep them, add perp_dexs to the config "
@@ -319,9 +334,15 @@ def _get_open_orders(registry: AccountRegistry) -> ToolSpec:
     return _wallet_tool(
         registry, "get_open_orders",
         "Open orders of a wallet, stop loss and take profit triggers included: order id, client order id "
-        "(cloid), symbol, side (buy/sell), type, size, filled and remaining size, limit and trigger price, "
-        "reduce-only, time in force, created at. market: perp (default, every dex) or spot (symbol is then a "
-        "token, e.g. HYPE).",
+        "(cloid), symbol, side (buy/sell), type (limit, stop_loss, take_profit, or trigger_entry for a trigger "
+        "order without reduce_only, such as a place_trigger_entry; one on the side that closes a position can "
+        "still close or reverse it, so check side and position before canceling one), order_type (Hyperliquid's "
+        "name: Limit, Stop Market, Take Profit "
+        "Limit, ...), is_market, slippage_cap_pct (10 for a TP/SL market order), size, filled and remaining size, "
+        "limit and trigger price, reduce-only, time in force, created at. For a reduce-only order with less open "
+        "than placed, Hyperliquid may have shrunk it to the position: filled_size is then null and reduced_size "
+        "the size no longer open. market: perp (default, every enabled dex) or spot (symbol is then a token, "
+        "e.g. HYPE).",
         {"symbol": SYMBOL, "market": MARKET_KIND},
         read)
 
@@ -372,8 +393,9 @@ def _get_fills(registry: AccountRegistry) -> ToolSpec:
         "(symbols as in get_open_orders: HYPE, HYPE/USDT0). Without start: from the 2000 most "
         "recent fills; with start (and optionally end): that time range, complete unless truncated says otherwise. "
         "truncated_reason: limit (more fills than limit), recent_fills (only the 2000 most recent were read; pass "
-        "start for older ones), retention_window (Hyperliquid keeps only an account's 10000 most recent fills; older "
-        "ones in the range are gone) or same_millisecond_overflow.",
+        "start for older ones), retention_window (Hyperliquid keeps only an account's 10000 most recent fills: "
+        "fills of the range may be missing) or same_millisecond_overflow (2000 or more fills in one millisecond: "
+        "the rest of the range cannot be read).",
         {"symbol": SYMBOL, "market": MARKET_KIND, "start": TIME, "end": TIME,
          "limit": {"type": "integer", "minimum": 1, "maximum": FILLS_LIMIT, "default": 50,
                    "description": f"Most fills to return (default 50, at most {FILLS_LIMIT})."}},
@@ -440,7 +462,7 @@ def _status_order(order: dict[str, Any]) -> dict[str, Any]:
     """The order of an orderStatus response, with the fields and values of get_open_orders: it has
     the format of frontendOpenOrders, so the library's parser reads it (type stop_loss, not
     Hyperliquid's "Stop Market")."""
-    return _order(HyperliquidClient._parse_open_order(order, order["coin"]))
+    return _order(_answers.parse_open_order(order, order["coin"]))
 
 
 # ── get_portfolio ─────────────────────────────────────────────────────
@@ -493,25 +515,138 @@ def _get_funding_payments(registry: AccountRegistry) -> ToolSpec:
             _check_unmatched_symbol(client, arguments.get("symbol"), every_dex=True)
         newest_first = sorted(payments, key=lambda p: p.time, reverse=True)
         listed = _listed([{"time": _iso(p.time), "symbol": p.symbol, "position_size": p.size,
-                           "funding_rate": p.funding_rate, "usdc": p.usdc}
+                           "funding_rate": p.funding_rate, "amount": p.usdc, "currency": _currency(client, p)}
                           for p in newest_first[:arguments.get("limit", 100)]], total=len(newest_first))
-        return {"from": _iso(start_ms), "to": _iso(end_ms), "total_usdc": sum((p.usdc for p in payments), Decimal(0)),
-                **listed}
+        totals: dict[str, Decimal] = {}  # by currency: amounts in two currencies are never added up
+        for p in payments:
+            currency = _currency(client, p)
+            totals[currency] = totals.get(currency, Decimal(0)) + p.usdc
+        return {"from": _iso(start_ms), "to": _iso(end_ms), "total_usdc": totals.pop(USDC, Decimal(0)),
+                "other_currencies": totals or None, **listed}
 
     return _wallet_tool(
         registry, "get_funding_payments",
         "Funding a wallet paid or received, newest first: time, symbol, the position size then (negative: short), "
-        "the hourly rate and usdc (positive: received, negative: paid), plus total_usdc over the whole range. "
+        "the hourly rate, amount (positive: received, negative: paid) and its currency (the dex's collateral: "
+        "USDC, or e.g. USDH on some HIP-3 dexes; unknown for a dex that is not read), plus over the whole range "
+        "total_usdc and other_currencies (the totals of other currencies, else null). "
         f"Default range: the last {FUNDING_DEFAULT_DAYS} days; at most {FUNDING_MAX_DAYS} days.",
         {"symbol": SYMBOL, "start": TIME, "end": TIME,
          "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100,
-                   "description": "Most payments to return (default 100, at most 500); total_usdc covers all."}},
+                   "description": "Most payments to return (default 100, at most 500); the totals cover all."}},
         read)
+
+
+def _currency(client: Any, payment: FundingPayment) -> str:
+    """The currency of a funding payment: its dex's collateral, as get_pnl reads it."""
+    collateral = (client.market_specs.get(payment.symbol) or {}).get("collateral")
+    return str(collateral) if collateral else (USDC if payment.market == "perp" else UNKNOWN)
+
+
+CENT = Decimal("0.01")
+
+
+def _usd(value: Optional[Decimal]) -> Optional[Decimal]:
+    return None if value is None else value.quantize(CENT)
+
+
+def _price6(value: Optional[Decimal]) -> Optional[Decimal]:
+    """An average price to 6 significant digits, its whole digits all kept (1234567.89 stays
+    1234568)."""
+    return None if value is None else value.quantize(Decimal(1).scaleb(min(0, value.adjusted() - 5)))
+
+
+def _get_pnl(registry: AccountRegistry) -> ToolSpec:
+    def read(client: Any, target: Target, arguments: dict[str, Any]) -> dict[str, Any]:
+        start_ms = _ms(arguments["start"], "start")
+        end_ms = None if "end" not in arguments else _ms(arguments["end"], "end")
+        if end_ms is not None and end_ms < start_ms:
+            raise ToolError("INVALID_ARGUMENT", "end: before start")
+        if (end_ms or time.time() * 1000) - start_ms > FUNDING_MAX_DAYS * DAY_MS:
+            raise ToolError("INVALID_ARGUMENT", f"start: the range is longer than {FUNDING_MAX_DAYS} days",
+                            hint="ask for several shorter ranges")
+        report = client.get_pnl(start_ms, end_ms, arguments.get("symbol"), spot=arguments.get("spot", False),
+                                address=target.address)
+        if not report.trades:
+            _check_unmatched_symbol(client, arguments.get("symbol"), every_dex=True)
+        limit = arguments.get("limit", 100)
+        if arguments.get("group_by", "trade") == "market":
+            rows = _pnl_by_market(report.trades)
+            cut, data = len(rows) > limit, rows[:limit]  # the largest losses
+        else:
+            cut = len(report.trades) > limit
+            data = [{"symbol": t.symbol, "side": t.side, "currency": t.currency, "status": t.status,
+                     "opened": _iso(t.opened_at),
+                     "closed": _iso(t.closed_at), "opened_before_start": t.opened_before_start,
+                     "entry_price": _price6(t.entry_price), "exit_price": _price6(t.exit_price),
+                     "max_size": t.max_size, "realized_pnl": _usd(t.realized_pnl), "fees": _usd(t.fees),
+                     "fees_other": t.fees_other or None, "funding": _usd(t.funding), "net_pnl": _usd(t.net_pnl),
+                     "unrealized_pnl": _usd(t.unrealized_pnl), "fills": t.fills}
+                    for t in report.trades[-limit:]]  # the most recent, oldest first
+        totals = {"realized_pnl": _usd(report.realized_pnl), "fees": _usd(report.fees),
+                  "fees_other": report.fees_other or None, "funding": _usd(report.funding),
+                  "net_pnl": _usd(report.net_pnl), "unrealized_pnl": _usd(report.unrealized_pnl),
+                  "other_currencies": {currency: {key: _usd(value) for key, value in figures.items()}
+                                       for currency, figures in report.other_currencies.items()} or None}
+        spot = None if report.spot is None else [
+            {"symbol": m.symbol, "realized_pnl": m.realized_pnl, "fees": m.fees, "fills": m.fills} for m in report.spot]
+        # As in get_fills: Hyperliquid's reason first, as it leaves the totals incomplete too.
+        reason = report.truncated_reason if report.truncated else ("limit" if cut else None)
+        return {"from": _iso(report.start_time), "to": _iso(report.end_time), "totals": totals, "spot": spot,
+                "count": len(data), "truncated": reason is not None, "truncated_reason": reason, "data": data}
+
+    return _wallet_tool(
+        registry, "get_pnl",
+        "A wallet's perp trades of a time range with their PnL, from its fills and funding. A trade runs from "
+        "flat to a position and back to flat (adds and partial exits belong to it; a fill that turns long into "
+        "short splits into two trades). Per trade, oldest first, or per market (largest loss first) with group_by "
+        "market: realized "
+        "PnL (Hyperliquid's closed PnL, before fees), fees, funding and net in the trade's currency (its dex's "
+        "collateral: USDC, or e.g. USDH on some HIP-3 dexes; totals add up USDC trades, other currencies apart; a "
+        "fee in another token in "
+        "fees_other), and for a trade still open its unrealized PnL when the range ends now (positions of the "
+        "account's dexes). "
+        "opened_before_start: open when the range began, so its entry price covers only fills in the range. "
+        "spot: also each spot market's closed PnL in its quote token and fees by token. The totals cover the "
+        "whole range, whatever limit leaves out. truncated_reason: limit (more trades or markets than limit), or "
+        "as in get_fills when Hyperliquid's limits may have cut the range's fills (then the totals miss them too). "
+        f"At most {FUNDING_MAX_DAYS} days.",
+        {"start": TIME, "end": {**TIME, "description": "ISO 8601 time (default now)."},
+         "group_by": {"type": "string", "enum": ["trade", "market"], "default": "trade",
+                      "description": "trade (default) or market."},
+         "symbol": SYMBOL, "spot": {"type": "boolean", "default": False, "description": "Also spot markets."},
+         "limit": {"type": "integer", "minimum": 1, "maximum": 500, "default": 100,
+                   "description": "Most rows to return (default 100, at most 500): the most recent trades, or the "
+                                  "markets with the largest losses."}},
+        read, required=["start"])
+
+
+def _pnl_by_market(trades: list[Any]) -> list[dict[str, Any]]:
+    markets: dict[tuple[str, str], dict[str, Any]] = {}
+    for t in trades:  # by market and currency: figures in two currencies are never added up
+        m = markets.setdefault((t.symbol, t.currency), {"symbol": t.symbol, "currency": t.currency, "trades": 0, "open": 0,
+                                          "realized_pnl": Decimal(0),
+                                          "fees": Decimal(0), "fees_other": {}, "funding": Decimal(0),
+                                          "net_pnl": Decimal(0), "unrealized_pnl": None})
+        m["trades"] += 1
+        m["open"] += t.status == "open"
+        for key in ("realized_pnl", "fees", "funding", "net_pnl"):
+            m[key] += getattr(t, key)
+        for token, fee in t.fees_other.items():
+            m["fees_other"][token] = m["fees_other"].get(token, Decimal(0)) + fee
+        if t.unrealized_pnl is not None:
+            m["unrealized_pnl"] = (m["unrealized_pnl"] or Decimal(0)) + t.unrealized_pnl
+    rows = sorted(markets.values(), key=lambda m: m["net_pnl"])  # the largest loss first
+    for m in rows:
+        for key in ("realized_pnl", "fees", "funding", "net_pnl", "unrealized_pnl"):
+            m[key] = _usd(m[key])
+        m["fees_other"] = m["fees_other"] or None
+    return rows
 
 
 # ── market tools ──────────────────────────────────────────────────────
 
-MARKET_BASE_URL = {"type": "string", "enum": list(BASE_URLS),
+MARKET_BASE_URL = {"type": "string", "enum": list(TOOL_BASE_URLS),
                    "description": "The Hyperliquid API to read (default mainnet)."}
 DEX = {"type": "string", "minLength": 1,
        "description": "Only the markets of one perp dex: default (Hyperliquid's own perps) or an enabled HIP-3 "
@@ -531,7 +666,7 @@ def _market_tool(registry: AccountRegistry, name: str, description: str, propert
     def run(arguments: dict[str, Any]) -> dict[str, Any]:
         if check is not None:
             check(arguments)
-        base_url = arguments.get("base_url", BASE_URLS[0])
+        base_url = arguments.get("base_url", TOOL_BASE_URLS[0])
         if arguments.get("market", "perp") == "perp":
             require_enabled_dexes(registry.perp_dexs(base_url),
                                   [arguments["symbol"]] if "symbol" in arguments else arguments.get("symbols", []))
@@ -583,7 +718,7 @@ def _check_dex(registry: AccountRegistry, arguments: dict[str, Any]) -> None:
     dex = arguments.get("dex")
     if dex is None or dex == "default":
         return
-    read = registry.perp_dexs(arguments.get("base_url", BASE_URLS[0]))
+    read = registry.perp_dexs(arguments.get("base_url", TOOL_BASE_URLS[0]))
     if dex not in read:
         raise ToolError("INVALID_ARGUMENT", f"dex: {dex!r} is not enabled",
                         hint=f"enabled: {', '.join(['default', *read])}; enable_perp_dexs adds a HIP-3 dex")
@@ -748,6 +883,42 @@ def _get_order_book(registry: AccountRegistry) -> ToolSpec:
 
 def _level(level: dict[str, Any]) -> dict[str, Any]:
     return {"price": level["price"], "size": level["size"], "orders": level.get("num_orders")}
+
+
+CANDLE_INTERVALS = ["1m", "5m", "15m", "1h", "4h", "1d"]
+CANDLE_COLUMNS = ["open_time", "open", "high", "low", "close", "volume", "trades"]
+
+
+def _get_candles(registry: AccountRegistry) -> ToolSpec:
+    def check(arguments: dict[str, Any]) -> None:
+        if ("lookback" in arguments) == ("start" in arguments):
+            raise ToolError("INVALID_ARGUMENT", "pass lookback or start, exactly one",
+                            hint="lookback: the number of candles up to end (default now)")
+
+    def read(client: Any, arguments: dict[str, Any]) -> dict[str, Any]:
+        symbol, interval = arguments["symbol"], arguments["interval"]
+        end_ms = _ms(arguments["end"], "end") if "end" in arguments else None
+        if "lookback" in arguments:
+            candles = client.get_candles(symbol, interval, end_time=end_ms, lookback=arguments["lookback"])
+        else:
+            candles = client.get_candles(symbol, interval, start_time=_ms(arguments["start"], "start"), end_time=end_ms)
+        shown = candles[-arguments.get("max_points", 500):]
+        rows = [[_iso(c.open_time), c.open, c.high, c.low, c.close, c.volume, c.trades] for c in shown]
+        forming = bool(shown) and shown[-1].close_time > time.time() * 1000
+        return {"symbol": symbol, "interval": interval, "columns": CANDLE_COLUMNS, "forming": forming,
+                **_listed(rows, total=len(candles))}
+
+    return _market_tool(
+        registry, "get_candles",
+        "Candles of a perp market (also HIP-3, e.g. xyz:SPCX), oldest first, as rows of columns: open time, "
+        "open, high, low, close, volume in base units, number of trades. Pass lookback (how many candles up to "
+        "end, default now) or start (and optionally end). Hyperliquid keeps only the most recent 5000 candles "
+        "per interval (about 3.5 days of 1m, 52 days of 15m, 208 days of 1h). The newest max_points are "
+        "returned (truncated: some older ones left out); forming: the last candle is still open.",
+        {"symbol": SYMBOL, "interval": {"type": "string", "enum": CANDLE_INTERVALS, "description": "The candle length."},
+         "lookback": {"type": "integer", "minimum": 1, "maximum": 5000, "description": "How many candles, up to end."},
+         "start": TIME, "end": TIME, "max_points": _limit("Most candles to return", 500, 5000)},
+        read, required=["symbol", "interval"], check=check)
 
 
 def _get_funding_rates(registry: AccountRegistry) -> ToolSpec:

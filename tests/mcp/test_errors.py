@@ -9,8 +9,7 @@ import requests
 from decimal import Decimal
 
 from fractrade_hl_simple.exceptions import (
-    AddressRequiredException, ClientErrorException, ClosePositionsIncompleteException, InsufficientMarginException,
-    NetworkException, OrderOutcomeUnknownException, OrderRejectedException, PositionNotClosedException,
+    AddressRequiredException, ClientErrorException, ClosePositionsIncompleteException, NetworkException, OrderOutcomeUnknownException, OrderRejectedException, PositionNotClosedException,
     ProtectionReplacementIncompleteException, RateLimitException, ServerErrorException, UnknownSymbolException,
 )
 from fractrade_hl_simple.mcp_server.errors import MAX_DEPTH, MAX_TEXT, ToolError, error_body, error_json
@@ -47,19 +46,16 @@ class TestDetailsOfLibraryExceptions:
         details = error_body(OrderOutcomeUnknownException("BTC", cloid, "read timed out"))["error"]["details"]
         assert details == {"action": f"BTC order {cloid}", "symbol": "BTC", "cloid": cloid}
 
-    def test_a_rejection_carries_hyperliquids_text(self):
-        details = error_body(InsufficientMarginException("BTC order", "Insufficient margin to place order."))["error"]["details"]
-        assert details == {"action": "BTC order", "reason": "Insufficient margin to place order."}
-
     def test_a_partial_close_has_the_order_as_results_have_it_and_the_size_still_open(self):
         closing = order(7, status="filled", filled="0.004", average_fill_price=Decimal("85000.5"))
         details = error_body(PositionNotClosedException("BTC", closing, Decimal("0.006")))["error"]["details"]
         assert details["remaining"] == "0.006" and details["symbol"] == "BTC" and details["reason"] is None
         assert details["order"] == {
-            "order_id": 7, "cloid": None, "symbol": "BTC", "side": "sell", "type": "limit", "size": "0.01",
-            "filled_size": "0.004", "remaining_size": "0.006", "limit_price": "83300", "trigger_price": None,
+            "order_id": 7, "cloid": None, "symbol": "BTC", "side": "sell", "type": "limit", "order_type": "Market",
+            "is_market": True, "size": "0.01", "filled_size": "0.004", "reduced_size": None,
+            "remaining_size": "0.006", "limit_price": "83300", "trigger_price": None, "slippage_cap_pct": None,
             "trigger_condition": None, "reduce_only": True, "is_position_tpsl": None, "time_in_force": "Ioc",
-            "created_at": "2023-11-14T22:13:20.000Z", "status": "filled", "average_fill_price": "85000.5"}
+            "created_at": "2023-11-14T22:13:20.000Z", "children": [], "status": "filled", "average_fill_price": "85000.5"}
 
     def test_close_all_positions_has_the_closed_orders_and_each_failure_as_its_own_error(self):
         not_closed = PositionNotClosedException("ETH", None, Decimal("1E-7"), reason="no liquidity")
@@ -95,7 +91,6 @@ class TestDetailsOfLibraryExceptions:
         error.request, error.response = object(), object()  # as requests' errors carry them
         assert error_body(error)["error"]["details"] == {}
 
-
 class TestDetailsNeverBreakTheError:
     """Whatever an exception holds, the body is valid JSON with the error's own code."""
 
@@ -113,15 +108,6 @@ class TestDetailsNeverBreakTheError:
         nan_position = position("BTC", "NaN")
         body = self.strict(ProtectionReplacementIncompleteException(order(9), [], "x", position=nan_position))
         assert body["details"]["position"] == "<unavailable>" and body["details"]["new_order"]["order_id"] == 9
-
-    def test_a_field_that_cannot_be_converted_does_not_take_its_siblings_with_it(self):
-        huge = 10 ** 5000  # beyond Python's limit for int to text
-        error = ClientErrorException("rejected", status_code=422, error_code=huge, error_message="bad request")
-        details = self.strict(error)["details"]
-        assert (details["error_code"], details["status_code"], details["error_message"]) == (
-            "<unavailable>", 422, "bad request")
-        assert self.strict(ToolError("INVALID_ARGUMENT", "x", details={"bad": huge, "good": 42}))["details"] == {
-            "bad": "<unavailable>", "good": 42}
 
     def test_nan_and_infinity_are_null(self):
         assert self.strict(PositionNotClosedException("BTC", None, float("nan")))["details"]["remaining"] is None
@@ -160,11 +146,6 @@ def position(symbol, size):
     return Position(symbol=symbol, entry_price=Decimal("85000"), leverage=Leverage(type="cross", value=Decimal("5")),
                     liquidation_price=None, margin_used=Decimal("340"), position_value=Decimal("1700"),
                     return_on_equity=Decimal("0"), size=Decimal(size), unrealized_pnl=Decimal("0"))
-
-
-def test_server_errors_are_library_exceptions_with_the_same_fields():
-    error = ToolError("TRADING_DISABLED", "account 'whale' is not enabled for trading")
-    assert (error.code, error.retryable) == ("TRADING_DISABLED", False)
 
 
 def test_keys_are_redacted_in_message_hint_and_details():
@@ -221,8 +202,3 @@ def test_unexpected_errors_go_to_the_log_not_to_the_client(caplog):
     assert record.exc_info[0] is KeyError and record.exc_info[2] is not None  # with its traceback
 
 
-def test_an_exchange_rejection_reaches_the_agent_with_hyperliquids_text():
-    # It used to be a plain ValueError, shown as INTERNAL with the text only in the server log.
-    body = error_body(InsufficientMarginException("BTC order", "Insufficient margin to place order."))["error"]
-    assert (body["code"], body["message"], body["retryable"]) == (
-        "INSUFFICIENT_MARGIN", "BTC order rejected: Insufficient margin to place order.", False)

@@ -25,18 +25,18 @@ def main():
         print(f"Balance: ${float(balance):,.2f}")
 
         # Set leverage before trading
-        print(f"\n--- Leverage ---")
+        print("\n--- Leverage ---")
         client.set_leverage(SYMBOL, 20, is_cross=True)
         print(f"Set {SYMBOL} to 20x cross leverage")
 
         # Open position with default slippage (3%)
-        print(f"\n--- Market Buy (3% slippage) ---")
+        print("\n--- Market Buy (3% slippage) ---")
         order = client.buy(SYMBOL, SIZE)
         print(f"Filled: {order}")
         time.sleep(2)
 
         # Check the fill details
-        print(f"\n--- Fill Details ---")
+        print("\n--- Fill Details ---")
         fills = client.get_fills(SYMBOL)
         print(f"Total {SYMBOL} fills: {len(fills)}")
         if fills:
@@ -45,12 +45,12 @@ def main():
             print(f"  Fee: {latest.fee}")
 
         # Query order status
-        print(f"\n--- Order Status ---")
+        print("\n--- Order Status ---")
         status = client.get_order_status(order.order_id)
         print(f"Order {order.order_id}: {status['order']['status']}")
 
         # Set TP/SL
-        print(f"\n--- TP/SL ---")
+        print("\n--- TP/SL ---")
         position = next(p for p in client.get_positions() if p.symbol == SYMBOL)
         entry = float(position.entry_price)
 
@@ -68,7 +68,7 @@ def main():
         time.sleep(2)
 
         # Bulk orders: place multiple limit orders at once
-        print(f"\n--- Bulk Orders ---")
+        print("\n--- Bulk Orders ---")
         price = client.get_price(SYMBOL)
         result = client.bulk_order([
             {"symbol": SYMBOL, "is_buy": True,  "size": SIZE, "limit_price": price * 0.90},
@@ -90,7 +90,7 @@ def main():
         print(f"Bulk cancelled: {result['status']}")
 
         # Market buy with tighter slippage override
-        print(f"\n--- Custom Slippage (1%) ---")
+        print("\n--- Custom Slippage (1%) ---")
         order = client.buy(SYMBOL, SIZE, slippage=0.01)
         print(f"Filled: {order}")
         time.sleep(1)
@@ -101,7 +101,7 @@ def main():
         time.sleep(2)
 
         # Check fills from the last few minutes
-        print(f"\n--- Recent Fills ---")
+        print("\n--- Recent Fills ---")
         recent = client.get_fills_by_time(
             start_time=int((time.time() - 300) * 1000),
             symbol=SYMBOL,

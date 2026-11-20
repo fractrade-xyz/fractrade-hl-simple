@@ -1,4 +1,4 @@
-# fractrade-hl-mcp configuration: copy to ~/.config/fractrade-hl/mcp.toml and edit.
+# fractrade-hl-mcp configuration: copy to ~/.config/fractrade-hl/mcp.toml, chmod 600 it, and edit.
 # Reference: docs/mcp.md. Check it with: fractrade-hl-mcp --check
 # Private keys never go into this file (one in it stops the server): use key_file or key_env.
 
@@ -18,11 +18,19 @@ max_leverage = 5                   # the highest leverage set_leverage may set
 max_margin_pct = 5                 # optional: one order's margin (value / leverage), at most 5 % of the account
 max_total_margin_pct = 30          # optional: the margin of the positions with the new order, at most 30 %
 max_daily_loss_pct = 10            # optional: lost 10 % over 24 hours, then no new risk until it recovers
+# Limits with a mode: off, warn (default: the order goes through with a warning) or block.
+# max_day_loss_pct = 4             # lost 4 % since the trading day started (day_start in tz)
+# max_day_loss_mode = "warn"
+# day_start = "06:00"              # default "00:00"
+# tz = "Europe/Athens"             # default "UTC"
+# max_total_notional_x = 3         # positions and open orders that add risk at most 3x the account value
+# max_total_notional_mode = "warn"
 max_orders_per_hour = 30           # optional: orders that add risk, per hour
 check_order_leverage = true        # optional: refuse orders on a market whose leverage is above max_leverage
 # isolated_only = true             # optional: isolated margin only, so a position loses at most its margin
-# max_risk_pct = 1                 # optional: open_position loses at most 1 % at its stop losses; buy and sell
-                                   # that add risk are then refused
+# max_risk_pct = 1                 # optional: open_position's estimated loss at its stop losses (fees and
+                                   # order-book slippage, at entry) at most 1 %; other orders that add risk
+                                   # are then refused
 max_order_usd = 2000               # optional: the value of one order, at most (keep one of the three size limits)
 symbols = ["BTC", "ETH", "xyz:NVDA"]   # optional: only these markets (closing is never limited)
 

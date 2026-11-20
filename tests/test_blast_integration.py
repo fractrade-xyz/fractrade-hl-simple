@@ -1,9 +1,6 @@
 import pytest
 import time
-from decimal import Decimal
 from fractrade_hl_simple import HyperliquidClient
-from fractrade_hl_simple.models import HyperliquidAccount
-import os
 from dotenv import load_dotenv
 
 # Load environment variables
@@ -39,7 +36,7 @@ class TestBlastIntegration:
         assert "spread" in order_book
         assert "mid_price" in order_book
         
-        print(f"BLAST order book:")
+        print("BLAST order book:")
         print(f"  Best bid: ${order_book['best_bid']:,.6f}")
         print(f"  Best ask: ${order_book['best_ask']:,.6f}")
         print(f"  Spread: ${order_book['spread']:,.6f}")
@@ -90,7 +87,7 @@ class TestBlastIntegration:
         try:
             client.cancel_all_orders(symbol)
             time.sleep(1)
-            print(f"\n=== Testing BLAST Market Buy ===")
+            print("\n=== Testing BLAST Market Buy ===")
             buy_order = client.buy(symbol, position_size)
             print(f"Market buy order placed: {buy_order.order_id}")
             print(f"Order status: {buy_order.status}")
@@ -103,7 +100,7 @@ class TestBlastIntegration:
                 print(f"Position size: {float(blast_position.size):+.3f}")
                 print(f"Entry price: ${float(blast_position.entry_price):,.6f}")
                 print(f"Unrealized PnL: ${float(blast_position.unrealized_pnl):,.2f}")
-            print(f"\n=== Testing BLAST Market Sell ===")
+            print("\n=== Testing BLAST Market Sell ===")
             sell_order = client.sell(symbol, position_size)
             print(f"Market sell order placed: {sell_order.order_id}")
             print(f"Order status: {sell_order.status}")
@@ -144,7 +141,7 @@ class TestBlastIntegration:
             buy_limit_price = current_price * 0.99  # 1% below market
             sell_limit_price = current_price * 1.01  # 1% above market
             
-            print(f"\n=== Testing BLAST Limit Buy ===")
+            print("\n=== Testing BLAST Limit Buy ===")
             print(f"Current price: ${current_price:,.6f}")
             print(f"Buy limit price: ${buy_limit_price:,.6f}")
             
@@ -168,7 +165,7 @@ class TestBlastIntegration:
                 print(f"Position opened: {float(blast_position.size):+.3f} at ${float(blast_position.entry_price):,.6f}")
                 
                 # Limit sell to close
-                print(f"\n=== Testing BLAST Limit Sell ===")
+                print("\n=== Testing BLAST Limit Sell ===")
                 print(f"Sell limit price: ${sell_limit_price:,.6f}")
                 
                 sell_order = client.sell(symbol, position_size, limit_price=sell_limit_price)
@@ -211,7 +208,7 @@ class TestBlastIntegration:
         """Test detailed order book analysis for BLAST."""
         order_book = client.get_order_book(symbol)
         
-        print(f"\n=== BLAST Order Book Analysis ===")
+        print("\n=== BLAST Order Book Analysis ===")
         print(f"Total bids: {len(order_book['bids'])}")
         print(f"Total asks: {len(order_book['asks'])}")
         
@@ -239,7 +236,7 @@ class TestBlastIntegration:
         """Test getting BLAST market specifications."""
         market_info = client.get_market_info(symbol)
         
-        print(f"\n=== BLAST Market Specifications ===")
+        print("\n=== BLAST Market Specifications ===")
         print(f"Market info: {market_info}")
         
         # Check if we have market specs
@@ -254,7 +251,7 @@ class TestBlastIntegration:
         """Test price validation for BLAST orders."""
         current_price = client.get_price(symbol)
         
-        print(f"\n=== BLAST Price Validation ===")
+        print("\n=== BLAST Price Validation ===")
         print(f"Current price: ${current_price:,.6f}")
         
         # Test various price levels

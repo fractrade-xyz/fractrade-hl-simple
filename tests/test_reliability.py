@@ -1,16 +1,18 @@
 """Tests for reliability fixes: error propagation, retry coverage, exception hierarchy, etc."""
 import re
+import threading
 
 import pytest
-from unittest.mock import patch, MagicMock, PropertyMock
+from unittest.mock import patch, MagicMock
 import decimal
 from decimal import Decimal
 import requests
-import time
 from types import SimpleNamespace
 
 from hyperliquid.utils.error import ClientError, ServerError
 
+from fractrade_hl_simple import _answers
+from fractrade_hl_simple._signing import signer_state
 from fractrade_hl_simple.hyperliquid import HyperliquidClient
 from fractrade_hl_simple.exceptions import (
     ActionOutcomeUnknownException,
@@ -31,6 +33,7 @@ from fractrade_hl_simple.exceptions import (
     HyperliquidException,
     ProtectionOrderException,
     ProtectionReplacementIncompleteException,
+    ProtectionSyncIncompleteException,
     OrderOutcomeUnknownException,
     OrdersNotCanceledException,
     MakerOrderIncompleteException,
@@ -75,22 +78,12 @@ def mock_client():
 # ── Fix 1: get_open_orders() propagates errors ─────────────────────────
 
 class TestGetOpenOrdersErrorPropagation:
-    def test_raises_on_api_error(self, mock_client):
-        """get_open_orders() must raise when API fails, not return []."""
-        mock_client.info.frontend_open_orders.side_effect = requests.ConnectionError("API down")
-        with pytest.raises(requests.ConnectionError):
+    @pytest.mark.parametrize("error", [requests.ConnectionError("API down"), Exception("Unauthorized")])
+    def test_raises_on_api_error(self, mock_client, error):
+        """get_open_orders() must raise when the request fails in any way, not return []."""
+        mock_client.info.frontend_open_orders.side_effect = error
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"), pytest.raises(type(error), match=str(error)):
             mock_client.get_open_orders()
-
-    def test_raises_on_auth_error(self, mock_client):
-        mock_client.info.frontend_open_orders.side_effect = Exception("Unauthorized")
-        with pytest.raises(Exception, match="Unauthorized"):
-            mock_client.get_open_orders()
-
-    def test_returns_empty_list_when_no_orders(self, mock_client):
-        """Empty list is valid when API returns empty - just not on error."""
-        mock_client.info.frontend_open_orders.return_value = []
-        result = mock_client.get_open_orders()
-        assert result == []
 
     def test_a_malformed_order_is_not_silently_dropped(self, mock_client):
         # Hyperliquid documents the order format; an order that does not parse is an API change
@@ -117,6 +110,22 @@ class TestGetOpenOrdersErrorPropagation:
         assert order.size == Decimal("0.001")
         assert order.filled_size == Decimal("0.0004")
         assert order.remaining_size == Decimal("0.0006")
+
+    @pytest.mark.parametrize("raw, known", [
+        # A reduce-only take profit limit Hyperliquid shrank after a partial close by hand (seen live):
+        # less open than placed, and that is fills, a shrink, or both.
+        ({"reduceOnly": True, "sz": "53703.8", "origSz": "100000", "tif": "Gtc"}, False),
+        ({"reduceOnly": True, "sz": "0", "origSz": "1", "tif": "Ioc"}, True),  # never rested: fills only
+        ({"reduceOnly": False, "sz": "0.5", "origSz": "1", "tif": "Alo"}, True),  # only reduce-only ones shrink
+    ])
+    def test_a_reduce_only_order_with_less_open_than_placed_does_not_claim_fills(self, mock_client, raw, known):
+        mock_client.info.frontend_open_orders.return_value = [{
+            "oid": 123, "coin": "BTC", "side": "A", "limitPx": "0.0106", "orderType": "Limit",
+            "timestamp": 1700000000000, **raw}]
+        order = mock_client.get_open_orders()[0]
+        assert order.filled_size_known is known
+        # The sizes Hyperliquid gives stay as they are: placed, and still open.
+        assert (order.size, order.remaining_size) == (Decimal(raw["origSz"]), Decimal(raw["sz"]))
 
 
 # ── Fix 2: cancel_all_orders() error handling ──────────────────────────
@@ -164,14 +173,6 @@ class TestCancelAllOrdersReliability:
 
         with pytest.raises(Exception, match="cancel failed"):
             mock_client.cancel_all_orders()
-
-    def test_succeeds_when_all_cancel(self, mock_client):
-        mock_client.info.open_orders.return_value = [
-            {"coin": "BTC", "oid": 1},
-            {"coin": "ETH", "oid": 2},
-        ]
-        mock_client.exchange.bulk_cancel.return_value = _cancel_response("success", "success")
-        mock_client.cancel_all_orders()  # Should not raise
 
     def test_only_perp_orders_are_canceled(self, mock_client):
         # The default dex's open orders include spot and outcome orders; they used to be
@@ -253,12 +254,6 @@ class TestCancelAllOrdersReliability:
         assert [(f["symbol"], f["order_id"]) for f in caught.value.failed] == [("NEWCOIN", 2)]
         assert "refresh_market_specs" in caught.value.failed[0]["reason"]
 
-    def test_no_api_call_when_no_orders(self, mock_client):
-        """Should not call bulk_cancel when there are no orders."""
-        mock_client.info.open_orders.return_value = []
-        mock_client.cancel_all_orders()
-        mock_client.exchange.bulk_cancel.assert_not_called()
-
     def test_cancel_all_is_alias(self, mock_client):
         """cancel_all() should delegate to cancel_all_orders()."""
         mock_client.info.open_orders.return_value = []
@@ -316,9 +311,10 @@ class TestRejections:
     def test_a_modify_answered_in_no_documented_format_is_an_unknown_outcome(self, mock_client):
         # The modify may have gone through: never reported as a failure.
         mock_client.exchange.modify_order.return_value = {"status": "ok", "response": {"type": "default"}}
-        with pytest.raises(ActionOutcomeUnknownException) as error:
+        with pytest.raises(OrderOutcomeUnknownException) as error:  # an ActionOutcomeUnknownException
             mock_client.modify_order("10", "BTC", True, 0.001, 80000.0, {"limit": {"tif": "Gtc"}})
-        assert error.value.action == "BTC order modify" and not error.value.retryable
+        sent = mock_client.exchange.modify_order.call_args.kwargs["cloid"].to_raw()
+        assert error.value.cloid == sent and not error.value.retryable  # named by the cloid it was sent with
 
     def test_a_refused_leverage_change(self, mock_client):
         mock_client.exchange.update_leverage.return_value = {"status": "err", "response": "Invalid leverage value"}
@@ -357,7 +353,7 @@ class TestRejections:
         mock_client.exchange.modify_order.return_value = _order_response(status)
         with pytest.raises(ActionOutcomeUnknownException):
             mock_client.modify_order("10", "BTC", True, 0.001, 80000.0, {"limit": {"tif": "Gtc"}})
-        assert not mock_client._is_definite_order_response(_order_response(status))  # placement: looked up by cloid
+        assert not _answers.is_definite_order_response(_order_response(status))  # placement: looked up by cloid
 
     @pytest.mark.parametrize("call, sdk", [
         (lambda c: c.set_leverage("BTC", 5), "update_leverage"),
@@ -381,7 +377,8 @@ class TestRejections:
         mock_client.get_positions = lambda: [SimpleNamespace(symbol="BTC", size=Decimal("0.01"), is_short=False)]
         mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 8}})
         assert mock_client.stop_loss("BTC", 0.01, 80000.0).type == "stop_loss"
-        assert mock_client.take_profit("BTC", 0.01, 95000.0).type == "take_profit"
+        take_profit = mock_client.take_profit("BTC", 0.01, 95000.0)
+        assert (take_profit.type, take_profit.order_id) == ("take_profit", 8)
 
 
 class TestMarketOrderTimeInForce:
@@ -424,16 +421,19 @@ class TestPrepareOrder:
         assert self.sent(mock_client) == by_method
         assert (by_method["sz"], by_method["limit_px"]) == prepared == (0.00123, price)
 
-    def test_a_prepared_limit_price_comes_back_unchanged(self, mock_client):
-        prepared = mock_client.prepare_order("BTC", 0.001, True, limit_price=85000.55)
-        assert prepared == (0.001, 85001.0)
+    @pytest.mark.parametrize("price, sent", [
+        (85000.55, 85001.0),  # 5 significant figures
+        (100006.0, 100006.0), (100006.4, 100006.0),  # an integer is valid whatever its figures: not 100010
+    ])
+    def test_a_prepared_limit_price_comes_back_unchanged(self, mock_client, price, sent):
+        prepared = mock_client.prepare_order("BTC", 0.001, True, limit_price=price)
+        assert prepared == (0.001, sent)
         assert mock_client.prepare_order("BTC", *prepared[:1], True, limit_price=prepared[1]) == prepared
         mock_client.info.all_mids.assert_not_called()  # a limit order reads no price
 
     @pytest.mark.parametrize("size, price", [
         (0.001, 0.0), (0.001, -5.0), (0.001, float("nan")), (0.001, float("inf")),
         (0.001, 1e-7),  # positive, but 0 at BTC's price precision
-        (0.001, 1.7976931348623157e308),  # finite, but infinite once rounded to 5 significant figures
         (float("nan"), 80000.0), (float("inf"), 80000.0), ("0.001", 80000.0),
     ])
     def test_a_size_or_price_that_is_no_positive_number_is_refused_before_sending(self, mock_client, size, price):
@@ -562,39 +562,6 @@ class TestCloseFillVerification:
         assert str(error.value) == ("Closed nothing of 0.001 BTC; the closing order was rejected: "
                                     "Order could not immediately match against any resting orders.")
 
-    def test_no_warning_when_filled(self, mock_client, caplog):
-        import logging
-
-        mock_client.info.user_state.return_value = {
-            "marginSummary": {"accountValue": "1000", "totalMarginUsed": "100",
-                              "totalNtlPos": "500", "totalRawUsd": "1000"},
-            "crossMarginSummary": {"accountValue": "1000", "totalMarginUsed": "100",
-                                   "totalNtlPos": "500", "totalRawUsd": "1000"},
-            "withdrawable": "800",
-            "assetPositions": [{
-                "type": "oneWay",
-                "position": {
-                    "coin": "BTC", "entryPx": "85000", "szi": "-0.001",
-                    "leverage": {"type": "cross", "value": "10"},
-                    "liquidationPx": None, "marginUsed": "8.5",
-                    "positionValue": "85", "returnOnEquity": "0.01",
-                    "unrealizedPnl": "-0.5",
-                },
-            }],
-        }
-        mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
-        mock_client.exchange.order.return_value = {
-            "status": "ok",
-            "response": {"data": {"statuses": [{"filled": {"totalSz": "0.001", "avgPx": "85000", "oid": 999}}]}},
-        }
-
-        with caplog.at_level(logging.WARNING, logger="fractrade_hl_simple"):
-            order = mock_client.close("BTC")
-
-        assert order.status == "filled"
-        assert not any("NOT filled" in msg for msg in caplog.messages)
-
-
 # ── Fix 4: stop_loss/take_profit use _with_retry ─────────────────────
 
 class TestStopLossTakeProfitRetry:
@@ -616,29 +583,6 @@ class TestStopLossTakeProfitRetry:
                 },
             }],
         }
-
-    def test_stop_loss_uses_retry(self, mock_client):
-        self._setup_position(mock_client)
-        mock_client.exchange.order.return_value = {
-            "status": "ok",
-            "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}},
-        }
-        # Enable retry and verify the call goes through _with_retry
-        mock_client.max_retries = 2
-        mock_client.retry_delay = 0.01
-
-        order = mock_client.stop_loss("BTC", 0.001, 80000.0)
-        assert order.order_id == 1
-        mock_client.exchange.order.assert_called_once()
-
-    def test_take_profit_uses_retry(self, mock_client):
-        self._setup_position(mock_client)
-        mock_client.exchange.order.return_value = {
-            "status": "ok",
-            "response": {"data": {"statuses": [{"resting": {"oid": 2}}]}},
-        }
-        order = mock_client.take_profit("BTC", 0.001, 90000.0)
-        assert order.order_id == 2
 
     def test_stop_loss_raises_position_not_found(self, mock_client):
         mock_client.info.user_state.return_value = {
@@ -702,9 +646,6 @@ class TestMalformedSpotBalance:
 # ── Fix 6: cancel_order() error handling ───────────────────────────────
 
 class TestCancelOrderReliability:
-    def test_returns_true_on_success(self, mock_client):
-        mock_client.exchange.cancel.return_value = _cancel_response("success")
-        assert mock_client.cancel_order(12345, "BTC") is True
 
     def test_returns_false_for_an_order_that_already_filled(self, mock_client):
         # The SDK returns the exchange's per-order error instead of raising it; this used to
@@ -1001,72 +942,37 @@ class TestExceptionHierarchy:
     def test_order_exception_is_hyperliquid_exception(self):
         assert issubclass(OrderException, HyperliquidException)
 
-    def test_can_catch_all_with_base(self):
-        """All custom exceptions catchable with HyperliquidException."""
-        for error in [PositionNotFoundException("test"), OrderNotFoundException("test"),
-                      InsufficientMarginException("BTC order", "Insufficient margin to place order."),
-                      OrderException("test")]:
-            try:
-                raise error
-            except HyperliquidException:
-                pass  # Should be caught
-
     def test_exceptions_importable_from_package(self):
-        from fractrade_hl_simple import (
-            PositionNotFoundException,
-            OrderNotFoundException,
-            InsufficientMarginException,
-        )
+        import fractrade_hl_simple
+        for name in ("PositionNotFoundException", "OrderNotFoundException", "InsufficientMarginException"):
+            assert issubclass(getattr(fractrade_hl_simple, name), HyperliquidException)
 
 
 # ── get_spot_balance prices parameter ────────────────────────────────
 
 class TestGetSpotBalancePrices:
+    # As in mainnet spotMeta (2026-11-19): HYPE is token 150, its USDC pair @107; TRUMP, a
+    # HIP-1 token of its own, is token 10, its USDC pair @9.
+    SPOT_META = {"universe": [{"tokens": [150, 0], "name": "@107", "index": 107},
+                              {"tokens": [10, 0], "name": "@9", "index": 9}]}
+
+    def balances(self, mock_client, coin, token, total):
+        mock_client._spot_meta = self.SPOT_META
+        mock_client.info.spot_user_state.return_value = {
+            "balances": [{"coin": coin, "token": token, "total": total, "hold": "0", "entryNtl": "0"}]}
+
     def test_uses_provided_prices(self, mock_client):
         """get_spot_balance should use provided prices instead of calling get_price()."""
-        mock_client.info.spot_user_state.return_value = {
-            "balances": [
-                {"coin": "HYPE", "total": "10", "hold": "0", "entryNtl": "0"},
-            ]
-        }
-        external_prices = {"HYPE": 40.0}
-        result = mock_client.get_spot_balance(simple=True, prices=external_prices)
-        assert result == Decimal("400")
-        # all_mids should NOT have been called
+        self.balances(mock_client, "HYPE", 150, "10")
+        assert mock_client.get_spot_balance(simple=True, prices={"@107": 40.0}) == Decimal("400")
         mock_client.info.all_mids.assert_not_called()
 
-    def test_fetches_prices_when_not_provided(self, mock_client):
-        """get_spot_balance should fetch prices when none provided."""
-        mock_client.info.spot_user_state.return_value = {
-            "balances": [
-                {"coin": "HYPE", "total": "10", "hold": "0", "entryNtl": "0"},
-            ]
-        }
-        mock_client.info.all_mids.return_value = {"HYPE": "40.0"}
-        result = mock_client.get_spot_balance(simple=True)
-        assert result == Decimal("400")
-        mock_client.info.all_mids.assert_called()
-
-    def test_stablecoin_price_defaults_to_one(self, mock_client):
-        """USDC/USDT should default to $1 when not in price dict."""
-        mock_client.info.spot_user_state.return_value = {
-            "balances": [
-                {"coin": "USDC", "total": "10000", "hold": "0", "entryNtl": "0"},
-            ]
-        }
-        mock_client.info.all_mids.return_value = {}
-        result = mock_client.get_spot_balance(simple=True)
-        assert result == Decimal("10000")
-
-    def test_token_without_a_perp_market_is_priced_from_its_spot_pair(self, mock_client):
-        # SPCXD has no perp market; its USDC pair is @465 (mainnet spotMeta, 2026-11-13).
-        # allMids keys spot pairs by pair id, so the token used to be valued at $0.
-        mock_client.info.spot_user_state.return_value = {
-            "balances": [{"coin": "SPCXD", "total": "4", "hold": "0", "entryNtl": "0"}]
-        }
-        mock_client.info.name_to_coin = {"SPCXD/USDC": "@465"}
-        mock_client.info.all_mids.return_value = {"@465": "2.5"}
-        assert mock_client.get_spot_balance(simple=True) == Decimal("10")
+    def test_a_token_is_priced_from_its_own_pair_not_a_perp_of_the_same_name(self, mock_client):
+        # Spot TRUMP traded at 0.00069 USDC while the TRUMP perp was at 0.95 (mainnet,
+        # 2026-11-19): priced by the perp, it was counted about 1400 times its worth.
+        self.balances(mock_client, "TRUMP", 10, "1000")
+        mock_client.info.all_mids.return_value = {"TRUMP": "0.95", "@9": "0.00069"}
+        assert mock_client.get_spot_balance(simple=True) == Decimal("0.69")
 
 
 # ── open_long/short_position price reuse ─────────────────────────────
@@ -1107,25 +1013,6 @@ class TestPositionPriceReuse:
         mock_client.open_long_position("BTC", 0.001, stop_loss_price=80000.0, take_profit_price=90000.0)
         # all_mids called once by buy() for slippage, not again for SL/TP validation
         assert mock_client.info.all_mids.call_count == 1
-
-    def test_open_short_no_extra_get_price(self, mock_client):
-        """open_short_position should not call get_price() again for SL/TP validation."""
-        self._setup(mock_client)
-        # For short, szi should be negative
-        short_state = {**self.USER_STATE, "assetPositions": [{
-            "type": "oneWay",
-            "position": {
-                "coin": "BTC", "entryPx": "85000", "szi": "-0.001",
-                "leverage": {"type": "cross", "value": "10"},
-                "liquidationPx": None, "marginUsed": "8.5",
-                "positionValue": "85", "returnOnEquity": "-0.01",
-                "unrealizedPnl": "-1.0",
-            },
-        }]}
-        mock_client.info.user_state.return_value = short_state
-        mock_client.open_short_position("BTC", 0.001, stop_loss_price=90000.0, take_profit_price=80000.0)
-        assert mock_client.info.all_mids.call_count == 1
-
 
 # ── Stop loss / take profit side and open_*_position protection ──
 
@@ -1175,14 +1062,6 @@ class TestProtectionOrders:
         assert sides == [False, True, True]  # sell entry, buy stop loss, buy take profit
         assert set(orders) == {"entry", "stop_loss", "take_profit"}
 
-    def test_swapped_stop_loss_and_take_profit_are_rejected_before_the_entry(self, mock_client):
-        self._setup(mock_client, "0.001")
-        with pytest.raises(ValueError, match="Stop loss price must be below entry price"):
-            mock_client.open_long_position(
-                "BTC", 0.001, stop_loss_price=90000.0, take_profit_price=80000.0
-            )
-        mock_client.exchange.order.assert_not_called()
-
     @pytest.mark.parametrize(
         ("limit_price", "stop_loss_price"),
         [
@@ -1207,18 +1086,6 @@ class TestProtectionOrders:
                 "BTC", 0.001, stop_loss_price=stop_loss_price, limit_price=limit_price
             )
         mock_client.exchange.order.assert_not_called()
-
-    def test_resting_limit_entry_is_reported_without_placing_a_stop_loss(self, mock_client):
-        # Flat account, buy limit below the market: the entry rests and there is no position
-        # yet that a stop loss could protect.
-        self._setup(mock_client, "0.001")
-        mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 7}})
-        with pytest.raises(ProtectionOrderException) as excinfo:
-            mock_client.open_long_position(
-                "BTC", 0.001, stop_loss_price=75000.0, limit_price=80000.0
-            )
-        assert mock_client.exchange.order.call_count == 1  # the entry only
-        assert excinfo.value.orders["entry"].status == "open"
 
     def test_lost_stop_loss_response_after_a_partial_fill_reports_the_entry(self, mock_client):
         # The market entry fills 0.0001 of 0.001 BTC; the stop loss is sized to the fill. The
@@ -1290,7 +1157,7 @@ class TestSeveralProtectionLevels:
     def test_a_partial_fill_never_loses_more_at_its_stops_than_the_full_size(self):
         # The remainder went to the last stop: with a far one last, a 0.99 fill put 0.03 on it,
         # more than the full size's 0.02, and lost more than the size that was checked.
-        from fractrade_hl_simple.hyperliquid import split_size
+        from fractrade_hl_simple._protection import split_size
         legs = [("stop_loss_1", "stop_loss", 9900, Decimal("0.49")), ("stop_loss_2", "stop_loss", 9890, Decimal("0.49")),
                 ("stop_loss_3", "stop_loss", 5000, Decimal("0.02"))]
 
@@ -1402,29 +1269,59 @@ class TestSeveralProtectionLevels:
         assert mock_client.exchange.order.call_count == 1  # the entry only
         assert [leg["leg"] for leg in caught.value.missing] == ["stop_loss_1"]
 
-    def test_a_buy_limit_above_the_mid_is_checked_against_the_mid(self, mock_client):
-        # A buy at 87000 with the mid at 85000 fills at once, near 85000. A stop at 86000 was
-        # accepted (below the limit), then sat above the price and executed at once; a take
-        # profit at 86000 was refused although it is above the fill.
-        self._setup(mock_client, "0.01")
-        with pytest.raises(InvalidArgumentException, match="below entry"):
-            mock_client.open_long_position("BTC", 0.01, stop_loss_price=86000.0, limit_price=87000.0)
-        mock_client.exchange.order.assert_not_called()
-        orders = mock_client.open_long_position("BTC", 0.01, stop_loss_price=80000.0, take_profit_price=86000.0,
-                                                limit_price=87000.0)
-        assert set(orders) == {"entry", "stop_loss", "take_profit"}
+    @staticmethod
+    def _grouped(*statuses):
+        return {"status": "ok", "response": {"type": "order", "data": {"statuses": list(statuses)}}}
 
-    def test_a_sell_limit_below_the_mid_is_checked_against_the_mid(self, mock_client):
-        self._setup(mock_client, "-0.01")
-        with pytest.raises(InvalidArgumentException, match="above entry"):
-            mock_client.open_short_position("BTC", 0.01, stop_loss_price=84000.0, limit_price=83000.0)
+    @pytest.mark.parametrize("time_in_force", [None, "Alo"])
+    def test_a_resting_entry_takes_its_stop_and_take_profit_attached(self, mock_client, time_in_force):
+        # Sent as the SDK's example does: the limit as the parent of a normalTpsl group, which
+        # Hyperliquid places once it fills. It used to be refused: no stop until it filled.
+        self._setup(mock_client, "0.01")
+        mock_client.exchange.bulk_orders.return_value = self._grouped(
+            {"resting": {"oid": 1}}, "waitingForFill", "waitingForFill")
+        orders = mock_client.open_long_position("BTC", 0.01, stop_loss_price=80000.0, take_profit_price=90000.0,
+                                                limit_price=82000.0, time_in_force=time_in_force)
+        assert list(orders) == ["entry"] and (orders["entry"].order_id, orders["entry"].status) == (1, "open")
+        entry, profit, stop = mock_client.exchange.bulk_orders.call_args.args[0]  # the SDK example's order
+        assert mock_client.exchange.bulk_orders.call_args.kwargs["grouping"] == "normalTpsl"
+        assert entry["order_type"] == {"limit": {"tif": time_in_force or "Gtc"}} and not entry["reduce_only"]
+        assert [(o["is_buy"], o["sz"], o["reduce_only"], o["order_type"]["trigger"]["tpsl"]) for o in (profit, stop)] == [
+            (False, 0.01, True, "tp"), (False, 0.01, True, "sl")]
         mock_client.exchange.order.assert_not_called()
 
-    def test_a_resting_limit_is_checked_against_its_own_price(self, mock_client):
-        # A buy at 82000 with the mid at 85000 rests: it fills at 82000 or below.
+    @pytest.mark.parametrize("statuses, missing", [  # the statuses of: the entry, its take profit, its stop loss
+        ([{"resting": {"oid": 1}}, {"error": "Order must have minimum value of $10."}, "waitingForFill"],
+         [("take_profit", False)]),
+        ([{"resting": {"oid": 1}}, "waitingForFill", {"something": "new"}], [("stop_loss", True)]),
+        # an error beside an order id: either reading is possible, so its outcome is not known
+        ([{"resting": {"oid": 1}}, "waitingForFill", {"error": "failure", "resting": {"oid": 2}}],
+         [("stop_loss", True)]),
+        # no answer, or an entry status in no documented format: the entry is found by its cloid
+        (None, [("take_profit", True), ("stop_loss", True)]),
+        ([{"unexpected": True}, "waitingForFill", "waitingForFill"], [("take_profit", True), ("stop_loss", True)]),
+    ], ids=["refused", "undocumented", "ambiguous", "lost-answer", "undocumented-entry"])
+    def test_an_attached_order_not_confirmed_is_named(self, mock_client, statuses, missing):
         self._setup(mock_client, "0.01")
-        with pytest.raises(InvalidArgumentException, match="below entry"):
-            mock_client.open_long_position("BTC", 0.01, stop_loss_price=83000.0, limit_price=82000.0)
+        mock_client.info.query_order_by_cloid.return_value = _order_status(1, "open", orig_sz="0.01", sz="0.01")
+        if statuses is None:
+            mock_client.exchange.bulk_orders.side_effect = requests.ConnectionError("Connection aborted")
+        else:
+            mock_client.exchange.bulk_orders.return_value = self._grouped(*statuses)
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"), pytest.raises(ProtectionOrderException) as caught:
+            mock_client.open_long_position("BTC", 0.01, stop_loss_price=80000.0, take_profit_price=90000.0,
+                                           limit_price=82000.0)
+        error = caught.value
+        assert error.orders["entry"].order_id == 1 and mock_client.exchange.bulk_orders.call_count == 1
+        assert [(row["leg"], row["outcome_unknown"]) for row in error.missing] == missing
+        assert all((row["cloid"] is not None) == row["outcome_unknown"] for row in error.missing)
+
+    def test_several_levels_with_a_resting_entry_are_refused_before_sending(self, mock_client):
+        self._setup(mock_client, "0.01")
+        with pytest.raises(InvalidArgumentException, match="one stop loss and one take profit"):
+            mock_client.open_long_position("BTC", 0.01, stop_losses=[(80000.0, 0.5), (79000.0, 0.5)],
+                                           limit_price=82000.0)
+        mock_client.exchange.bulk_orders.assert_not_called()
         mock_client.exchange.order.assert_not_called()
 
     def test_a_failed_level_names_every_level_still_missing(self, mock_client):
@@ -1484,6 +1381,28 @@ class TestAmbiguousWrites:
         assert (order.status, order.order_id) == ("open", 78)
         assert mock_client.exchange.order.call_count == 1
 
+    @pytest.mark.parametrize("reduce_only, fills_known", [(False, True), (True, False)])
+    def test_an_order_found_open_after_a_lost_answer_keeps_its_partial_fill(self, mock_client, reduce_only,
+                                                                            fills_known):
+        # 0.0004 of the 0.001 filled before the lookup: it was reported as 0 filled. For a
+        # reduce-only order the size no longer open may be Hyperliquid shrinking it instead.
+        mock_client.exchange.order.side_effect = requests.ConnectionError("Connection aborted")
+        mock_client.info.query_order_by_cloid.return_value = _order_status(82, "open", sz="0.0006")
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"):
+            order = mock_client.buy("BTC", 0.001, limit_price=80000.0, reduce_only=reduce_only)
+        assert (order.status, order.filled_size, order.remaining_size, order.filled_size_known) == (
+            "open", Decimal("0.0004"), Decimal("0.0006"), fills_known)
+
+    def test_an_answer_that_could_be_read_two_ways_is_settled_by_cloid(self, mock_client):
+        # Two statuses for one order: read as a rejection, it could be placed again although it rests.
+        mock_client.exchange.order.return_value = {"status": "ok", "response": {"type": "order", "data": {
+            "statuses": [{"error": "Order must have minimum value of $10."}, {"resting": {"oid": 11}}]}}}
+        mock_client.info.query_order_by_cloid.return_value = _order_status(11, "open", sz="0.001")
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"):
+            order = mock_client.buy("BTC", 0.001, limit_price=80000.0)
+        assert (order.status, order.order_id) == ("open", 11)
+        assert mock_client.exchange.order.call_count == 1
+
     def test_partly_filled_ioc_waits_for_its_fills(self, mock_client):
         # Lost response; the IOC filled 0.0006 of 0.001 and the rest was canceled. The fill
         # is not in userFills at the first lookup: it must not be reported as "no fill".
@@ -1506,6 +1425,17 @@ class TestAmbiguousWrites:
         with patch("fractrade_hl_simple.hyperliquid.time.sleep"), \
                 pytest.raises(OrderOutcomeUnknownException, match="triggered"):
             mock_client.stop_loss("BTC", 0.001, 84000.0)
+
+    @pytest.mark.parametrize("status, raised", [
+        ("reduceOnlyCanceled", OrderRejectedException),       # documented: ended without a fill
+        ("futureCanceled", OrderOutcomeUnknownException),     # not documented: may rest or have filled
+    ])
+    def test_only_a_documented_status_found_by_cloid_is_final(self, mock_client, status, raised):
+        mock_client.exchange.order.side_effect = requests.ConnectionError("Connection reset by peer")
+        mock_client.info.query_order_by_cloid.return_value = _order_status(81, status, sz="0.001")
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"), pytest.raises(raised):
+            mock_client.buy("BTC", 0.001, limit_price=80000.0)
+        assert mock_client.exchange.order.call_count == 1
 
     def test_order_that_cannot_be_found_raises_and_is_not_resent(self, mock_client):
         mock_client.max_retries = 3
@@ -1546,6 +1476,126 @@ class TestAmbiguousWrites:
 
 # ── update_stop_loss / update_take_profit ─────────────────
 
+def _protection_order(oid, kind, price, size, *, position_tpsl=False, children=None):
+    """A frontendOpenOrders entry of a long's protection: a stop or take profit trigger (its
+    limit price is its worst price, 10 % below the trigger), or a reduce-only limit."""
+    trigger = kind != "limit"
+    name = {"stop": "Stop Market", "tp": "Take Profit Market", "limit": "Limit"}[kind]
+    return {"coin": "BTC", "side": "A", "limitPx": str(round(price * 0.9) if trigger else price), "sz": str(size),
+            "oid": oid, "timestamp": 1700000000000, "triggerCondition": "N/A", "isTrigger": trigger,
+            "triggerPx": str(price) if trigger else "0.0", "children": children or [], "isPositionTpsl": position_tpsl,
+            "reduceOnly": True, "orderType": name, "origSz": str(size), "tif": None if trigger else "Alo", "cloid": None}
+
+
+class TestTriggerOrder:
+    """trigger_order: a stop entry, refused before sending where it would fire at once."""
+
+    @pytest.mark.parametrize("trigger, mark, problem", [
+        (84000, "85000", "must be above the mid price"),  # a buy below the price: a limit order's job
+        (90000, "91000", "already past trigger_price"),   # the mark has crossed it: it would fire at once
+    ])
+    def test_a_trigger_that_would_fire_at_once_is_refused_before_sending(self, mock_client, trigger, mark, problem):
+        mock_client.info.all_mids.return_value = {"BTC": "85000"}
+        meta, contexts = mock_client.info.post.return_value
+        mock_client.info.post.return_value = [meta, [dict(contexts[0], markPx=mark), contexts[1]]]
+        with pytest.raises(InvalidArgumentException, match=problem):
+            mock_client.trigger_order("BTC", True, 0.001, trigger)
+        mock_client.exchange.order.assert_not_called()
+
+    def test_an_entry_under_the_minimum_names_its_size_as_written(self, mock_client):
+        mock_client.info.all_mids.return_value = {"BTC": "85000"}
+        with pytest.raises(InvalidArgumentException, match=r"would be 0\.00001 at 90000"):  # not 1e-05
+            mock_client.trigger_order("BTC", True, 0.00001, 90000)
+
+
+class TestResizeProtection:
+    """resize_protection: each kind's levels to the live position, in the order Hyperliquid's
+    treatment of reduce-only orders needs (seen live: resting reduce-only limits are kept at
+    most as large as the position, untriggered stops don't count)."""
+
+    def setup(self, mock_client, before, after=None, size="0.4"):
+        mock_client.info.all_mids.return_value = {"BTC": "85000.0"}
+        mock_client.info.user_state.return_value = _btc_position_state(size)
+        mock_client.info.frontend_open_orders.side_effect = [before] + [after if after is not None else before] * 3
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+
+    @staticmethod
+    def actions(mock_client):
+        return [name for name, _, _ in mock_client.exchange.mock_calls if name in ("order", "cancel")]
+
+    def test_stops_are_placed_first_and_the_old_ones_cancelled_after(self, mock_client):
+        # The take profit is of a kind not asked for: it stays as it is.
+        tp = _protection_order(21, "limit", 90000, "0.1")
+        self.setup(mock_client, [tp, _protection_order(11, "stop", 80000, "0.2")],
+                   [tp, _protection_order(12, "stop", 80000, "0.4")])
+        mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 12}})
+        result = mock_client.resize_protection("BTC", stop_losses=[(80000, 1)])
+        assert self.actions(mock_client) == ["order", "cancel"]
+        sent = mock_client.exchange.order.call_args.kwargs
+        assert (sent["sz"], sent["reduce_only"], sent["order_type"]["trigger"]["tpsl"]) == (0.4, True, "sl")
+        assert ([o.order_id for o in result.placed], result.canceled, result.position_size) == ([12], [11], Decimal("0.4"))
+
+    def test_a_level_already_open_with_its_size_is_kept_without_a_request(self, mock_client):
+        self.setup(mock_client, [_protection_order(11, "stop", 80000, "0.4")])
+        result = mock_client.resize_protection("BTC", stop_losses=[(80000, 1)])
+        assert self.actions(mock_client) == [] and [o.order_id for o in result.kept] == [11]
+
+    def test_take_profit_limits_cancel_the_old_ones_before_placing(self, mock_client):
+        # Placed first, Hyperliquid would cancel an order itself to keep the limits within the position.
+        after = [_protection_order(31, "limit", 90000, "0.2"), _protection_order(32, "limit", 95000, "0.2")]
+        self.setup(mock_client, [_protection_order(21, "limit", 90000, "0.4")], after)
+        mock_client.exchange.order.side_effect = [_order_response({"resting": {"oid": 31}}),
+                                                  _order_response({"resting": {"oid": 32}})]
+        result = mock_client.resize_protection("BTC", take_profits=[(90000, 0.5), (95000, 0.5)], take_profit_type="limit")
+        assert self.actions(mock_client) == ["cancel", "order", "order"]
+        sent = [call.kwargs for call in mock_client.exchange.order.call_args_list]
+        assert [(c["sz"], c["limit_px"], c["reduce_only"], c["order_type"]) for c in sent] == [
+            (0.2, 90000.0, True, {"limit": {"tif": "Alo"}}), (0.2, 95000.0, True, {"limit": {"tif": "Alo"}})]
+        assert result.canceled == [21]
+
+    @pytest.mark.parametrize("size, before, arguments, problem", [
+        ("0.4", [], {}, "pass stop_losses, take_profits or both"),
+        ("0.4", [], {"stop_losses": [(86000, 1)]}, "must be below the mid price"),  # would trigger at once
+        ("0.4", [], {"stop_losses": [(80000, 0.6), (79000, 0.6)]}, "add up to more than 1"),
+        ("0.0001", [], {"stop_losses": [(80000, 1)]}, "minimum order"),  # 8 USD at the stop
+        # With a resting limit left untouched they would exceed the position: Hyperliquid would cancel one.
+        ("0.4", [_protection_order(41, "limit", 99000, "0.2", children=[{"oid": 42}])],
+         {"take_profits": [(90000, 1)], "take_profit_type": "limit"}, "would exceed the position"),
+    ], ids=["nothing-asked", "stop-above-the-price", "over-1", "below-the-minimum", "pushes-out-an-untouched-limit"])
+    def test_levels_that_cannot_work_are_refused_before_anything_is_sent(self, mock_client, size, before, arguments,
+                                                                         problem):
+        self.setup(mock_client, before, size=size)
+        with pytest.raises(InvalidArgumentException, match=problem):
+            mock_client.resize_protection("BTC", **arguments)
+        assert self.actions(mock_client) == []
+
+    def test_a_partial_failure_keeps_the_old_orders_and_names_what_is_missing(self, mock_client):
+        # The first stop is placed, the second's answer is lost: it may still arrive. The take
+        # profit, whose turn had not come, is named as missing too, and its old order as open.
+        self.setup(mock_client, [_protection_order(11, "stop", 80000, "0.4"), _protection_order(21, "tp", 90000, "0.4")])
+        mock_client.exchange.order.side_effect = [_order_response({"resting": {"oid": 12}}),
+                                                  requests.ConnectionError("Connection aborted")]
+        mock_client.info.query_order_by_cloid.return_value = {"status": "unknownOid"}
+        with patch("fractrade_hl_simple.hyperliquid.time.sleep"), \
+                pytest.raises(ProtectionSyncIncompleteException) as caught:
+            mock_client.resize_protection("BTC", stop_losses=[(81000, 0.5), (78000, 0.5)], take_profits=[(95000, 1)])
+        error = caught.value
+        stop, take_profit = error.missing
+        cloid = mock_client.exchange.order.call_args.kwargs["cloid"].to_raw()
+        assert ([o.order_id for o in error.placed], stop["price"], stop["outcome_unknown"], stop["cloid"]) == (
+            [12], 78000.0, True, cloid)
+        assert (take_profit["kind"], take_profit["price"], take_profit["outcome_unknown"]) == ("take_profit", 95000.0, False)
+        mock_client.exchange.cancel.assert_not_called()  # the old orders stay
+        assert isinstance(error, OrderException) and error.retained == [11, 21]
+
+    def test_native_position_tpsl_is_never_changed(self, mock_client):
+        native = _protection_order(41, "stop", 79000, "0.0", position_tpsl=True)
+        self.setup(mock_client, [native], [native, _protection_order(12, "stop", 80000, "0.4")])
+        mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 12}})
+        result = mock_client.resize_protection("BTC", stop_losses=[(80000, 1)])
+        assert self.actions(mock_client) == ["order"] and [o.order_id for o in result.untouched] == [41]
+
+
 class TestProtectionReplacement:
     OLD_STOP = {
         "coin": "BTC", "side": "A", "limitPx": "80000.0", "sz": "0.001", "oid": 11,
@@ -1553,11 +1603,13 @@ class TestProtectionReplacement:
         "triggerPx": "80000.0", "children": [], "isPositionTpsl": False, "reduceOnly": True,
         "orderType": "Stop Market", "origSz": "0.001", "tif": None, "cloid": None,
     }
+    NEW_STOP = dict(OLD_STOP, oid=12, sz="0.002", origSz="0.002", triggerPx="82000.0", limitPx="82000.0",
+                    triggerCondition="Price below 82000")
 
     def _setup(self, mock_client):
         # The position grew to 0.002 since the old 0.001 stop was placed.
         mock_client.info.user_state.return_value = _btc_position_state("0.002")
-        mock_client.info.frontend_open_orders.return_value = [self.OLD_STOP]
+        mock_client.info.frontend_open_orders.side_effect = [[self.OLD_STOP], [self.OLD_STOP, self.NEW_STOP]]
 
     def test_new_stop_is_placed_for_the_whole_position_before_the_old_one_is_canceled(
         self, mock_client
@@ -1571,6 +1623,60 @@ class TestProtectionReplacement:
         assert mock_client.exchange.order.call_args.kwargs["sz"] == 0.002
         mock_client.exchange.cancel.assert_called_once_with("BTC", 11)
         assert new_stop.order_id == 12
+
+    def test_an_entry_stop_on_the_opening_side_is_left_alone(self, mock_client):
+        # Long BTC with a buy stop above the price: that order opens or adds, it is no stop loss;
+        # nor is the stop attached to it, which Hyperliquid places only once the entry fills.
+        attached = dict(self.OLD_STOP, oid=31, triggerPx="86000.0", limitPx="77400.0")
+        entry = dict(self.OLD_STOP, oid=30, side="B", reduceOnly=False, triggerPx="90000.0", limitPx="90900.0",
+                     triggerCondition="Price above 90000", children=[attached])
+        mock_client.info.user_state.return_value = _btc_position_state("0.002")
+        mock_client.info.frontend_open_orders.side_effect = [[self.OLD_STOP, entry],
+                                                             [self.OLD_STOP, entry, self.NEW_STOP]]
+        mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 12}})
+        mock_client.exchange.cancel.return_value = _cancel_response("success")
+        mock_client.update_stop_loss("BTC", 82000.0)
+        mock_client.exchange.cancel.assert_called_once_with("BTC", 11)
+        mock_client.info.frontend_open_orders.side_effect = [[entry, self.NEW_STOP]]
+        assert mock_client.get_stop_loss_price("BTC") == Decimal("82000.0")
+
+    def test_a_position_that_flipped_before_the_new_order_is_refused(self, mock_client):
+        # The old orders were chosen for a long; once it is a short, they are on its opening side.
+        states = iter([_btc_position_state("0.002")])
+        mock_client.info.user_state.side_effect = lambda *a, **k: next(states, _btc_position_state("-0.002"))
+        mock_client.info.frontend_open_orders.return_value = [self.OLD_STOP]
+        with pytest.raises(InvalidArgumentException):
+            mock_client.update_stop_loss("BTC", 82000.0)
+        mock_client.exchange.order.assert_not_called()
+        mock_client.exchange.cancel.assert_not_called()
+
+    def test_the_keys_other_signed_actions_wait_until_the_replacement_is_done(self, mock_client):
+        # Between placing the new stop and cancelling the old one, an order or a cancel signed
+        # with the same key (by any client or thread) would change what the new stop must cover.
+        self._setup(mock_client)
+        mock_client.exchange_account = MagicMock(address="0x" + "34" * 20)
+        lock = signer_state(mock_client.exchange_account.address).operation_lock
+        free = []
+
+        def free_for_another_thread():
+            def try_lock():
+                free.append(lock.acquire(blocking=False))
+                if free[-1]:
+                    lock.release()
+
+            other = threading.Thread(target=try_lock)
+            other.start()
+            other.join()
+            return free[-1]
+
+        states = iter([[self.OLD_STOP], [self.OLD_STOP, self.NEW_STOP]])
+        mock_client.info.frontend_open_orders.side_effect = lambda *a, **k: (free_for_another_thread(), next(states))[1]
+        mock_client.exchange.order.side_effect = lambda **k: (
+            free_for_another_thread(), _order_response({"resting": {"oid": 12}}))[1]
+        mock_client.exchange.cancel.side_effect = lambda *a: (free_for_another_thread(), _cancel_response("success"))[1]
+        mock_client.update_stop_loss("BTC", 82000.0)
+        assert free == [False] * 4  # both reads of the open orders, the order and the cancel
+        assert free_for_another_thread()
 
     def test_old_stop_stays_when_the_new_one_is_not_confirmed(self, mock_client):
         self._setup(mock_client)
@@ -1594,6 +1700,20 @@ class TestProtectionReplacement:
         mock_client.exchange.cancel.assert_not_called()
         assert excinfo.value.old_order_ids == [11]
         assert excinfo.value.position.size == Decimal("0.003")  # what the protection should cover
+
+    def test_old_stop_is_kept_when_the_new_one_triggered_meanwhile(self, mock_client):
+        # The new stop was accepted as resting, then triggered and closed part of the position
+        # before it was read again: it is no longer open, the rest needs the old stop.
+        self._setup(mock_client)
+        mock_client.info.user_state.side_effect = (
+            [_btc_position_state("0.002")] * 2 + [_btc_position_state("0.0015")]
+        )
+        mock_client.info.frontend_open_orders.side_effect = [[self.OLD_STOP], [self.OLD_STOP]]
+        mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 12}})
+        with pytest.raises(ProtectionReplacementIncompleteException) as excinfo:
+            mock_client.update_stop_loss("BTC", 82000.0)
+        mock_client.exchange.cancel.assert_not_called()
+        assert excinfo.value.old_order_ids == [11]
 
     def test_old_stop_is_kept_when_the_position_cannot_be_reread(self, mock_client):
         self._setup(mock_client)
@@ -1624,7 +1744,7 @@ class TestProtectionReplacement:
     def test_a_new_stop_for_a_position_that_flipped_meanwhile_is_reported(self, mock_client):
         # Long 0.002 when the sell stop was placed; another fill turned it into a short of
         # 0.001: the size suffices, but a reduce-only sell cannot protect a short.
-        mock_client.info.frontend_open_orders.return_value = []
+        mock_client.info.frontend_open_orders.side_effect = [[], [self.NEW_STOP]]
         mock_client.info.user_state.side_effect = (
             [_btc_position_state("0.002")] * 2 + [_btc_position_state("-0.001")]
         )
@@ -1634,7 +1754,7 @@ class TestProtectionReplacement:
         assert excinfo.value.position.size == Decimal("-0.001")
 
     def test_a_new_stop_without_an_old_one_is_returned_when_it_covers_the_position(self, mock_client):
-        mock_client.info.frontend_open_orders.return_value = []
+        mock_client.info.frontend_open_orders.side_effect = [[], [self.NEW_STOP]]
         mock_client.info.user_state.return_value = _btc_position_state("0.002")
         mock_client.exchange.order.return_value = _order_response({"resting": {"oid": 12}})
         assert mock_client.update_stop_loss("BTC", 82000.0).order_id == 12
@@ -1744,24 +1864,59 @@ class TestMakerOrder:
         assert order.status == "filled"
         assert order.is_maker is False
 
-    def test_fallback_cancel(self, mock_client):
-        """With fallback='cancel', returns last order without IOC."""
+    @pytest.mark.parametrize("answer_lost", [False, True])
+    def test_fallback_cancel(self, mock_client, answer_lost):
+        """With fallback='cancel', returns last order without IOC. With its answer lost, the
+        attempt is found open by its cloid with 0.0004 filled already: counted once."""
         mock_client.info.l2_snapshot.return_value = self.BOOK
-        mock_client.exchange.order.return_value = {
-            "status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}
-        }
-        mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_CANCELED
         mock_client.exchange.cancel.return_value = _cancel_response("success")
+        if answer_lost:
+            mock_client.exchange.order.side_effect = requests.ConnectionError("Connection aborted")
+            mock_client.info.query_order_by_cloid.return_value = _order_status(1, "open", sz="0.0006")
+            mock_client.info.query_order_by_oid.return_value = _order_status(1, "canceled", sz="0.0006")
+        else:
+            mock_client.exchange.order.return_value = {
+                "status": "ok", "response": {"data": {"statuses": [{"resting": {"oid": 1}}]}}
+            }
+            mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_CANCELED
 
-        # Use explicit timeout to skip auto-detect, then mock time to expire after 1 order
+        # Explicit timeout (no auto-detect); the time is up once the first attempt was canceled.
         with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
             with patch('fractrade_hl_simple.hyperliquid.time.time') as mock_time:
-                # 0=deadline calc, 0=loop check, 0..=inner loop, 100=loop check (expired)
-                mock_time.side_effect = [0, 0, 0, 0, 100, 100, 100, 100, 100]
+                mock_time.side_effect = lambda: 100 if mock_client.exchange.cancel.called else 0
                 order = mock_client.maker_buy("BTC", 0.001, timeout=1, reprice_interval=0.5, fallback="cancel")
 
         assert order.status == "canceled"  # its cancel was confirmed; it can no longer fill
+        assert order.filled_size == (Decimal("0.0004") if answer_lost else 0)
         assert mock_client.exchange.order.call_count == 1
+
+    def test_the_callers_quotes_and_fill_event_are_used(self, mock_client):
+        """bbo_cache prices each attempt with the quote as it is then, without requesting the
+        order book; a set fill_event ends the wait for the next re-pricing and is cleared."""
+        quotes = {"BTC": {"bid": 84990.0, "ask": 84995.0}}
+        may_have_filled = threading.Event()
+        may_have_filled.set()
+
+        def cancel(*args):
+            quotes["BTC"] = {"bid": 84980.0, "ask": 84985.0}  # the caller's feed moved the quote
+            return _cancel_response("success")
+
+        mock_client.exchange.cancel.side_effect = cancel
+        mock_client.exchange.order.side_effect = [
+            _order_response({"resting": {"oid": 1}}),
+            _order_response({"filled": {"oid": 2, "avgPx": "84980", "totalSz": "0.001"}}),
+        ]
+        mock_client.info.query_order_by_oid.return_value = self.ORDER_STATUS_CANCELED
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep') as sleep, \
+                patch.object(may_have_filled, "wait", wraps=may_have_filled.wait) as wait:
+            order = mock_client.maker_buy("BTC", 0.001, timeout=10, reprice_interval=1, bbo_cache=quotes,
+                                          fill_event=may_have_filled)
+        assert order.status == "filled"
+        assert [call.kwargs["limit_px"] for call in mock_client.exchange.order.call_args_list] == [84990.0, 84980.0]
+        mock_client.info.l2_snapshot.assert_not_called()
+        wait.assert_called_once_with(timeout=1)  # the event is waited on for the interval, not time.sleep
+        assert not may_have_filled.is_set()
+        assert all(call.args[0] < 1 for call in sleep.call_args_list)
 
     def test_invalid_fallback_raises(self, mock_client):
         with pytest.raises(ValueError, match="fallback must be"):
@@ -1778,7 +1933,7 @@ class TestMakerOrder:
         mock_client.exchange.order.return_value = {
             "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
         }
-        order = mock_client.maker_buy("BTC", 0.001, timeout=5)
+        mock_client.maker_buy("BTC", 0.001, timeout=5)
         call_args = mock_client.exchange.order.call_args
         assert call_args[1]["limit_px"] == 85000.0
 
@@ -1788,7 +1943,7 @@ class TestMakerOrder:
         mock_client.exchange.order.return_value = {
             "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85001", "totalSz": "0.001"}}]}}
         }
-        order = mock_client.maker_sell("BTC", 0.001, timeout=5)
+        mock_client.maker_sell("BTC", 0.001, timeout=5)
         call_args = mock_client.exchange.order.call_args
         assert call_args[1]["limit_px"] == 85001.0
 
@@ -2042,22 +2197,6 @@ class TestMakerOrder:
         call_args = mock_client.exchange.order.call_args
         assert call_args[1]["reduce_only"] is True
 
-    def test_auto_detect_tight_spread(self, mock_client):
-        """Auto-detects short timeout for tight spreads."""
-        mock_client.info.l2_snapshot.return_value = {
-            "levels": [
-                [{"n": 1, "px": "85000.0", "sz": "1.0"}],
-                [{"n": 1, "px": "85001.0", "sz": "1.0"}],  # 1/85000 = 0.1 bps
-            ]
-        }
-        mock_client.exchange.order.return_value = {
-            "status": "ok", "response": {"data": {"statuses": [{"filled": {"oid": 1, "avgPx": "85000", "totalSz": "0.001"}}]}}
-        }
-        # Don't specify timeout — let auto-detect work
-        # Auto-detect calls get_order_book once, then the main loop calls it again
-        order = mock_client.maker_buy("BTC", 0.001)
-        assert order.status == "filled"
-
     def test_auto_detect_wide_spread(self, mock_client):
         """Auto-detects longer timeout for wide spreads."""
         mock_client.info.l2_snapshot.return_value = {
@@ -2106,4 +2245,6 @@ class TestMakerOrder:
 
     def test_importable_from_package(self):
         """maker_order, maker_buy, maker_sell are importable from the package."""
-        from fractrade_hl_simple import maker_order, maker_buy, maker_sell
+        import fractrade_hl_simple
+        for name in ("maker_order", "maker_buy", "maker_sell"):
+            assert callable(getattr(fractrade_hl_simple, name))

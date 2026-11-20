@@ -20,13 +20,13 @@ def print_wallet_balances(address: str):
     # Total balance is perp + USDC
     total_balance = perp_state['state'].margin_summary.account_value + usdc_balance
     
-    print(f"=== Balance Overview ===")
+    print("=== Balance Overview ===")
     print(f"Perpetual Balance: ${perp_state['state'].margin_summary.account_value:,.2f}")
     print(f"USDC Balance: ${usdc_balance:,.2f}")
     print(f"Total Balance: ${total_balance:,.2f}")
     print()
     
-    print(f"=== Detailed Information ===")
+    print("=== Detailed Information ===")
     print("\nPerpetual Trading:")
     print(f"Margin Used: ${perp_state['state'].margin_summary.total_margin_used:,.2f}")
     

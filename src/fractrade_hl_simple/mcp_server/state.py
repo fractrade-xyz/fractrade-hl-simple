@@ -144,22 +144,26 @@ class SharedState:
 
     # ── orders that add risk ────────────────────────────────────────
 
-    def count_risk_order(self, key: Key) -> float:
-        """Count an order that adds risk, before it is sent (a crash after sending then cannot
-        leave it uncounted); returns its time, for release_risk_order."""
+    def count_risk_order(self, key: Key, count: int = 1) -> float:
+        """Count `count` orders that add risk (a batch: in one write), before they are sent (a
+        crash after sending then cannot leave them uncounted); returns their time, for
+        release_risk_order."""
         with self.account_lock(key):
             path = self.folder / f"{_name(key)}.orders"
             now = time.time()
-            _write(path, [*(str(t) for t in _recent(_times(path), now, ORDER_WINDOW)), str(now)])
+            _write(path, [*(str(t) for t in _recent(_times(path), now, ORDER_WINDOW)), *[str(now)] * count])
             return now
 
-    def release_risk_order(self, key: Key, at: float) -> None:
-        """Uncount the order counted at `at`: it provably was not sent."""
+    def release_risk_order(self, key: Key, at: float, count: int = 1) -> None:
+        """Uncount the `count` orders counted at `at`: they provably were not sent."""
         with self.account_lock(key):
             path = self.folder / f"{_name(key)}.orders"
             times = _times(path)
-            if at in times:
+            removed = 0
+            while removed < count and at in times:
                 times.remove(at)
+                removed += 1
+            if removed:
                 _write(path, [str(t) for t in times])
 
     def risk_orders_last_hour(self, key: Key) -> int:
@@ -171,17 +175,28 @@ class SharedState:
 
     def reserve_cloid(self, key: Key, cloid: Optional[str]) -> Optional[str]:
         """`cloid`, or a new one if None, now used; None if `cloid` was used already."""
+        reserved = self.reserve_cloids(key, [cloid])
+        return None if reserved is None else reserved[0]
+
+    def reserve_cloids(self, key: Key, cloids: list[Optional[str]]) -> Optional[list[str]]:
+        """Reserve the cloids of a batch together, in one write: each given one, a new one for
+        each None. None if any given one was used already, or one is given twice (in any case
+        of its hex digits): then none is reserved."""
         with self.account_lock(key):
             used = self._cloids(key)
-            if cloid is None:
-                cloid = "0x" + secrets.token_hex(16)
-                while cloid in used:  # pragma: no cover - 128 random bits
-                    cloid = "0x" + secrets.token_hex(16)
-            elif cloid.lower() in used:
+            given = [cloid.lower() for cloid in cloids if cloid is not None]
+            if len(set(given)) != len(given) or any(cloid in used for cloid in given):
                 return None
-            used[cloid.lower()] = time.time()
+            reserved = []
+            for cloid in cloids:
+                if cloid is None:
+                    cloid = "0x" + secrets.token_hex(16)
+                    while cloid in used:  # pragma: no cover - 128 random bits
+                        cloid = "0x" + secrets.token_hex(16)
+                used[cloid.lower()] = time.time()
+                reserved.append(cloid)
             self._save_cloids(key, used)
-            return cloid
+            return reserved
 
     def remember_cloids(self, key: Key, cloids: Iterable[str]) -> None:
         """Mark `cloids` as used, in one write."""
@@ -194,9 +209,14 @@ class SharedState:
                 self._save_cloids(key, used)
 
     def release_cloid(self, key: Key, cloid: str) -> None:
+        self.release_cloids(key, [cloid])
+
+    def release_cloids(self, key: Key, cloids: Iterable[str]) -> None:
+        """Free cloids whose orders provably were not sent, in one write."""
         with self.account_lock(key):
             used = self._cloids(key)
-            if used.pop(cloid.lower(), None) is not None:
+            freed = [used.pop(cloid.lower(), None) for cloid in cloids]
+            if any(at is not None for at in freed):
                 self._save_cloids(key, used)
 
     def _cloids(self, key: Key) -> dict[str, float]:

@@ -34,7 +34,7 @@ def main():
         print(f"  {i+1}. ${ask['price']:>10,.2f}  size={ask['size']:.3f}  orders={ask['num_orders']}")
 
     # Show how urgency factor affects pricing
-    print(f"\nOptimal buy prices at different urgency levels:")
+    print("\nOptimal buy prices at different urgency levels:")
     print(f"  {'Urgency':>8}  {'Price':>12}  {'Description'}")
     print(f"  {'-'*8}  {'-'*12}  {'-'*20}")
 
@@ -50,7 +50,7 @@ def main():
         price = client.get_optimal_limit_price(SYMBOL, "buy", urgency_factor=urgency)
         print(f"  {urgency:>8.2f}  ${price:>10,.2f}  {desc}")
 
-    print(f"\nOptimal sell prices:")
+    print("\nOptimal sell prices:")
     for urgency, desc in levels:
         price = client.get_optimal_limit_price(SYMBOL, "sell", urgency_factor=urgency)
         print(f"  {urgency:>8.2f}  ${price:>10,.2f}  {desc}")

@@ -65,6 +65,7 @@ your `PATH`:
    ```bash
    pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git"
    ```
+
 3. **Check it:** `fractrade-hl-mcp --help`. The Codex app and Claude Desktop need the
    command's full path: `which fractrade-hl-mcp` prints it (with pipx usually
    `~/.local/bin/fractrade-hl-mcp`).
@@ -123,7 +124,7 @@ codex mcp add fractrade -- fractrade-hl-mcp
 ```
 
 **Codex app:** it uses the same settings as Codex CLI, `~/.codex/config.toml`. Add (or let
-Codex add) these lines to it, with the command's full path (see below):
+Codex add) these lines to it, with the command's full path (step 2):
 
 ```toml
 [mcp_servers.fractrade]
@@ -131,7 +132,7 @@ command = "/full/path/to/fractrade-hl-mcp"
 ```
 
 **Claude Desktop:** in Settings → Developer → Edit Config, add (with the command's full
-path, which `which fractrade-hl-mcp` prints; on Windows `where.exe fractrade-hl-mcp`):
+path, step 2; on Windows `where.exe fractrade-hl-mcp` prints it):
 
 ```json
 {
@@ -192,22 +193,22 @@ wallet only for the MCP server, not for bots or other apps.
 
 ### 6.2 Set your limits
 
-`mcp.toml` comes with these limits. Change them to fit you:
+`mcp.toml` comes with these limits (`symbols` is one you can add). Change them to fit you:
 
 ```toml
 max_leverage = 10           # the highest leverage the assistant may set
-max_slippage = 0.01         # market orders: at most 1 % worse than the current price
-max_margin_pct = 5          # one new trade: at most 5 % of your account as margin
-max_total_margin_pct = 30   # your positions together: at most 30 % of your account as margin
+max_slippage = 0.01         # market orders and closes: at most 1 % from the mid, before rounding
+max_margin_pct = 5          # one new order: at most 5 % of your account as margin
+max_total_margin_pct = 30   # your positions plus the new order: at most 30 % as margin
 max_daily_loss_pct = 10     # lost 10 % in 24 hours: no new trades until it recovers
-max_orders_per_hour = 30    # stops an assistant that keeps placing orders
+max_orders_per_hour = 30    # at most 30 orders that add risk per hour
 # max_order_usd = 1000      # optional: the value of one order, at most, in USD
 # check_order_leverage = true   # optional: no trades on a market set above max_leverage
 # isolated_only = true      # optional: isolated margin only
 # max_risk_pct = 1          # optional: a trade is planned to lose at most 1 % at its stops,
-#                           # estimated at entry (open_position only: buy and sell that open
-#                           # a position are then refused)
-# symbols = ["BTC", "ETH"]  # optional: only these markets
+#                           # estimated at entry (open_position only: other orders that add
+#                           # risk are then refused)
+# symbols = ["BTC", "ETH"]  # optional: new risk and leverage changes on these markets only
 ```
 
 **What margin means here:** a trade's margin is its value divided by its leverage. With
@@ -215,11 +216,14 @@ $1000 in your account, 5 % is $50: a BTC trade of up to $500 at 10x, or $150 on 
 at 3x. The margin is not the most you can lose: with Hyperliquid's usual cross margin your
 account backs every position, so a position can lose more than its margin. A stop loss
 limits a loss; with `isolated_only` (isolated margin), a position can lose at most its
-margin.
+margin ([more](mcp.md#risk-guardrails)).
 
 Each guardrail is optional: delete a line to switch it off, but keep one of
 `max_margin_pct`, `max_total_margin_pct` and `max_order_usd`. Start small. The limits never
-block closing a position, cancelling an order or setting a stop loss.
+block cancelling an order or setting a stop loss, and a close is held only to
+`max_slippage`. Open orders are not part of `max_total_margin_pct`, and a market stop loss
+or take profit executes with Hyperliquid's own 10 % tolerance, not `max_slippage`
+([what the limits do not cover](mcp.md#risk-guardrails)).
 
 ### 6.3 Check everything
 
@@ -249,8 +253,8 @@ risking 1 % with stops at 60,000 and 59,000, then open it".
 
 **More than one account:** copy the `[accounts.main]` block in `mcp.toml`, give it another
 name, its own address and `key_file`, the full path of a new key file (e.g.
-`key_file = "~/.config/fractrade-hl/keys/bot"`; a relative path would depend on the folder
-the server starts in). Create an API wallet for that
+`key_file = "~/.config/fractrade-hl/keys/bot"`; a relative path is read from the folder
+of `mcp.toml`). Create an API wallet for that
 account (step 6.1) and paste its key into the new file. Each account gets its own API
 wallet. On macOS and Linux the file must be readable by you only: `--check` tells you if
 it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
@@ -258,10 +262,13 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
 ## 7. Staying safe
 
 - **Keep the approval prompt for trade tools.** Your assistant then asks you before each
-  order. Let it run the read tools without asking, but confirm every trade.
-- **Emergency stop:** ask "use the kill switch". It halts trading at once, in every chat;
-  closing positions and cancelling orders still work. Opening a new chat does not lift it:
-  quit the assistant (the Codex app: the whole app, every chat) and start it again.
+  order.
+- **Emergency stop:** ask "use the kill switch". It halts trading at once, in every chat,
+  and cancels the orders that would open or add to a position (stop losses and take
+  profits stay); closing positions and cancelling orders still work. Opening a new chat does not lift it:
+  quit the assistant (the Codex app: the whole app, every chat) and start it again. If the
+  answer is an error saying an account is halted in this chat only, quit the other chats
+  too.
 - **The API wallet expires** after the days you chose. Then the server refuses it
   (`SIGNER_NOT_AUTHORIZED`): create a new one (step 6.1) and replace the old key in
   `keys/main` with the new one. The file holds one key only. A server reads the key when it
@@ -270,17 +277,13 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
   once. Whoever has the key can trade your account directly, without this server and
   without your limits, and lose you money that way; they cannot withdraw or transfer your
   funds.
-- **The key file** is readable by you only (on macOS and Linux the server refuses it
-  otherwise). On Windows it is in your user folder, which other users of the computer
-  cannot open by default; the server cannot check that there. Full-disk encryption
-  (FileVault, BitLocker, LUKS) protects it if your computer is lost.
-- **Your assistant can read files as you can.** The setup never needs it to see the key,
-  and it is told never to read the key file (section 9). That is an instruction to the
-  assistant, not something this server can enforce. If it did read the file, the key
-  would be in the chat, and the previous point applies. Your assistant's approval
-  settings decide which commands and file reads it asks you about first (they differ
-  between Claude Code and Codex, and between their modes): keep them on, and refuse
-  anything that reads `~/.config/fractrade-hl/keys`.
+- **The key file** must stay readable by you only. Full-disk encryption (FileVault,
+  BitLocker, LUKS) protects it if your computer is lost
+  ([details](mcp.md#the-key-file)).
+- **Your assistant can read files as you can.** It is told never to read the key file
+  (section 9), but that is an instruction, not something this server can enforce. Keep your
+  assistant's approval settings on, and refuse anything that reads
+  `~/.config/fractrade-hl/keys`. If it did read the file, treat the key as leaked.
 
 ## 8. When something does not work
 
@@ -291,12 +294,13 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
 | `key file … does not exist` | Run `fractrade-hl-mcp --init`, or create the file, and paste the key into it (step 6.1). |
 | `key file … is empty` | Paste the API wallet's private key into it (step 6.1). |
 | `does not hold a private key` | The file holds something else: only the key belongs in it, 64 hex characters, with or without `0x`. |
+| `can be changed by other users` | `mcp.toml` is writable by others: `chmod 600 ~/.config/fractrade-hl/mcp.toml`. |
 | `must be readable by its owner only` | Your editor saved it readable by others: `chmod 600 ~/.config/fractrade-hl/keys/main` (your assistant can run it; it does not read the file). |
 | `is the account's own key` | That is your wallet's own key, not an API wallet's: create an API wallet (step 6.1) and paste its key instead. |
 | `Hyperliquid does not know it` | The API wallet is not authorized yet, or it expired: authorize it, or create a new one (step 6.1). |
 | `is an API wallet of another account` | The address in `mcp.toml` is not the account that authorized this API wallet. |
 | No trade tools | Start the server with `--enable-trading` (step 6.4) and restart the assistant. |
-| `GUARD_BLOCKED` | The order is over one of your limits; the message says which. |
+| `GUARD_BLOCKED` | The order is over one of your limits; the message says which. If it says a limit could not read the account, try again when the answer says `retryable: true`. |
 | `the market uses cross margin` | `isolated_only` is on: ask the assistant to set the market to isolated margin (`set_leverage` with `is_cross` false), or delete `isolated_only`. |
 | `the market's leverage … is above max_leverage` | `check_order_leverage` is on: ask the assistant to lower the market's leverage (`set_leverage`), or raise `max_leverage`. |
 | `KILL_SWITCH_ENGAGED` | The kill switch is on: quit the assistant (the Codex app: the whole app) and start it again to trade. |

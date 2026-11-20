@@ -44,8 +44,9 @@ max_daily_loss_pct = 10                         # down 10 % over 24 hours: no ne
 max_orders_per_hour = 30                        # orders that add risk, per hour
 # max_order_usd = 1000                          # the value of one order, at most (USD)
 # check_order_leverage = true                   # refuse orders on a market set above max_leverage
-# max_risk_pct = 1                              # open_position: at most 1 % lost at the stop losses, as
-#                                               # estimated at entry (buy and sell that add risk: refused)
+# max_risk_pct = 1                              # open_position: at most 1 % lost
+#                                               # at the stop losses, as estimated at entry (other
+#                                               # orders that add risk: refused)
 # isolated_only = true                          # isolated margin only: a position loses at most its margin
 # Closing, cancelling and stop losses are never limited.
 

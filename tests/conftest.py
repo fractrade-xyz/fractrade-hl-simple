@@ -2,7 +2,7 @@ import pytest
 import time
 import os
 from decimal import Decimal
-from fractrade_hl_simple.models import UserState, Position, Order, MarginSummary
+from fractrade_hl_simple.models import Order
 from dotenv import load_dotenv
 
 load_dotenv()

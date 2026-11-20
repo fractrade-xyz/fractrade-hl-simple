@@ -70,6 +70,14 @@ class FakeMarketClient:
         self.calls.append(("get_spot_order_book", token, kwargs))
         return self.book
 
+    def get_candles(self, symbol, interval, start_time=None, end_time=None, lookback=None):
+        self.calls.append(("get_candles", symbol, interval, start_time, end_time, lookback))
+        from fractrade_hl_simple.models import Candle
+        hour = 3_600_000
+        return [Candle(symbol=symbol, interval=interval, open_time=t * hour, close_time=(t + 1) * hour - 1,
+                       open=Decimal("99"), high=Decimal("101"), low=Decimal("98"), close=Decimal(100 + t),
+                       volume=Decimal("12.5"), trades=t) for t in range(3)]
+
 
 def run_tool(name, arguments, book=None, make_client=None):
     clients = {}
@@ -101,6 +109,9 @@ def test_market_tools_read_mainnet_unless_told_otherwise(tool, arguments):
     assert body["base_url"] == MAINNET and list(clients) == [MAINNET]
     _, body, clients = run_tool(tool, {**arguments, "base_url": TESTNET})
     assert body["base_url"] == TESTNET and list(clients) == [TESTNET]
+    # A local node answers over plain HTTP, so any local user could: only through the config.
+    is_error, body, clients = run_tool(tool, {**arguments, "base_url": "http://localhost:3001"})
+    assert is_error and body["error"]["code"] == "INVALID_ARGUMENT" and clients == {}
 
 
 class TestSpot:
@@ -353,3 +364,19 @@ def test_the_default_filter_is_hyperliquids_own_perps_not_a_hip3_dex_named_defau
             return json.loads(result.content[0].text)
 
     assert [m["symbol"] for m in anyio.run(call)["data"]] == ["BTC", "ETH"]
+
+
+class TestCandles:
+    def test_rows_oldest_first_and_the_newest_max_points(self):
+        is_error, body, clients = run_tool("get_candles", {"symbol": "xyz:SPCX", "interval": "1h", "lookback": 3,
+                                                           "max_points": 2})
+        assert not is_error and body["columns"] == ["open_time", "open", "high", "low", "close", "volume", "trades"]
+        assert body["data"] == [["1970-01-01T01:00:00.000Z", "99", "101", "98", "101", "12.5", 1],
+                                ["1970-01-01T02:00:00.000Z", "99", "101", "98", "102", "12.5", 2]]
+        assert (body["count"], body["truncated"], body["forming"]) == (2, True, False)
+        assert clients[MAINNET].calls == [("get_candles", "xyz:SPCX", "1h", None, None, 3)]
+
+    def test_start_and_end_are_iso_times(self):
+        _, _, clients = run_tool("get_candles", {"symbol": "BTC", "interval": "15m",
+                                                 "start": "2026-11-10T00:00:00Z", "end": "2026-11-11T00:00:00Z"})
+        assert clients[MAINNET].calls == [("get_candles", "BTC", "15m", 1794268800000, 1794355200000, None)]

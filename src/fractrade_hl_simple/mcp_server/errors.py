@@ -27,6 +27,7 @@ from ..exceptions import (
     ActionOutcomeUnknownException, ActionRejectedException, ClientErrorException, ClosePositionsIncompleteException,
     HyperliquidException, MakerOrderIncompleteException, OrderOutcomeUnknownException, OrdersNotCanceledException,
     PositionNotClosedException, ProtectionOrderException, ProtectionReplacementIncompleteException,
+    ProtectionSyncIncompleteException,
     ServerErrorException, UnsupportedAccountModeException,
 )
 from ..models import Order, Position
@@ -44,7 +45,10 @@ CODES = frozenset({
     "GUARD_BLOCKED",
     "SIGNER_NOT_AUTHORIZED",
     "INTERNAL",
+    "OUTCOME_UNKNOWN",        # the library's code, for a batch: with the cloids of its orders in details
+    "BUSY",                   # the same call is still running in this server: retry once it answered
 })
+RETRYABLE = frozenset({"BUSY"})
 
 MAX_TEXT = 500
 MAX_DEPTH = 8  # nesting of details: an error per symbol holds an order holds its fields
@@ -60,10 +64,12 @@ DETAILS: tuple[tuple[type[HyperliquidException], tuple[str, ...]], ...] = (
     (OrderOutcomeUnknownException, ("symbol", "cloid")),
     (ProtectionOrderException, ("leg", "orders", "missing")),
     (ProtectionReplacementIncompleteException, ("new_order", "old_order_ids", "position")),
+    (ProtectionSyncIncompleteException, ("placed", "kept", "canceled", "not_canceled", "retained", "missing",
+                                         "position")),
     (PositionNotClosedException, ("symbol", "order", "remaining", "reason")),
     (MakerOrderIncompleteException, ("symbol", "filled_size", "average_price", "remaining")),
     (ClosePositionsIncompleteException, ("closed", "failed")),
-    (OrdersNotCanceledException, ("failed",)),
+    (OrdersNotCanceledException, ("failed", "canceled", "not_open")),
     (UnsupportedAccountModeException, ("mode",)),
 )
 
@@ -76,11 +82,17 @@ HINTS: tuple[tuple[type[HyperliquidException], str], ...] = (
     (ActionOutcomeUnknownException,
      "do not repeat the call: it may have been executed; check get_order_status, get_open_orders and "
      "get_positions first"),
+    (ProtectionSyncIncompleteException,
+     "the position is not protected as asked: details say what was placed, kept, canceled and not_canceled (may "
+     "still be open), and the levels missing; one with outcome_unknown may still arrive: look it up with "
+     "get_order_status_by_cloid (its cloid) before placing it again; then call sync_protection again, or place "
+     "what is missing"),
     (ProtectionOrderException,
-     "the entry was placed: the position is open without the stop losses and take profits in details.missing "
-     "(price and size of each); place them with stop_loss / take_profit, or close the position. One with "
-     "outcome_unknown may still arrive: look it up with get_order_status_by_cloid (its cloid) before placing "
-     "it again"),
+     "the entry was placed without the stop losses and take profits in details.missing (price and size of "
+     "each). Check get_positions and the entry's filled_size: what filled is an open position without them "
+     "(place them with stop_loss / take_profit, or close it). An entry still open (a resting limit, waiting or "
+     "partly filled) can be canceled: that cancels its unfilled rest and the orders attached to it. One with outcome_unknown may still "
+     "arrive: look it up with get_order_status_by_cloid (its cloid) before placing it again"),
 )
 
 
@@ -147,6 +159,7 @@ class ToolError(HyperliquidException):
         if code not in CODES:
             raise ValueError(f"unknown tool error code {code!r}")
         self.code = code
+        self.retryable = code in RETRYABLE
         self.hint = None if hint is None else scrub(hint)
         self.details: dict[str, Any] = _scrub_value(details or {})
         super().__init__(scrub(message))

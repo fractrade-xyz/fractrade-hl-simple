@@ -1,8 +1,9 @@
 import pytest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from decimal import Decimal
 from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount, get_user_state
-from fractrade_hl_simple.models import UserState, Position, Order, MarginSummary
+from fractrade_hl_simple.models import UserState, Position
+from fractrade_hl_simple.exceptions import UnknownSymbolException
 import os
 from dotenv import load_dotenv
 
@@ -173,7 +174,7 @@ def test_get_funding_rates_integration():
     assert -0.01 <= btc_rate <= 0.01
     
     # Test getting non-existent symbol
-    with pytest.raises(ValueError, match="Symbol XYZ not found in funding rates"):
+    with pytest.raises(UnknownSymbolException, match="Unknown symbol 'XYZ'"):
         client.get_funding_rates("XYZ")
 
 

@@ -6,16 +6,17 @@ import threading
 
 from hyperliquid.utils.error import ClientError, ServerError
 from fractrade_hl_simple import exceptions
-from fractrade_hl_simple.hyperliquid import HyperliquidClient, _signer_state
+from fractrade_hl_simple._signing import signer_state
+from fractrade_hl_simple.hyperliquid import HyperliquidClient
 from fractrade_hl_simple.models import HyperliquidAccount
 from fractrade_hl_simple.exceptions import (
     ClientErrorException,
+    ConfigurationException,
     NetworkException,
     RateLimitException,
     ServerErrorException,
     TimeoutException,
     UnauthorizedException,
-    ConfigurationException,
 )
 
 # The SDK's Info, answering metaAndAssetCtxs as Hyperliquid does: a client is not created
@@ -35,32 +36,15 @@ def client_with_retry():
 
 
 class TestRetryLogic:
-    def test_succeeds_on_first_try(self, client_with_retry):
-        fn = MagicMock(return_value="ok")
-        result = client_with_retry._with_retry(fn, "arg1", key="val")
-        assert result == "ok"
-        fn.assert_called_once_with("arg1", key="val")
 
-    def test_retries_on_connection_error(self, client_with_retry):
-        fn = MagicMock(side_effect=[
-            requests.ConnectionError("conn failed"),
-            requests.ConnectionError("conn failed"),
-            "success",
-        ])
+    @pytest.mark.parametrize("error", [requests.ConnectionError("conn failed"), requests.Timeout("timeout"),
+                                       ServerError(502, "Bad Gateway")])
+    def test_retries_on_a_transient_error(self, client_with_retry, error):
+        fn = MagicMock(side_effect=[error, error, "success"])
         with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
             result = client_with_retry._with_retry(fn)
         assert result == "success"
         assert fn.call_count == 3
-
-    def test_retries_on_timeout(self, client_with_retry):
-        fn = MagicMock(side_effect=[
-            requests.Timeout("timeout"),
-            "success",
-        ])
-        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
-            result = client_with_retry._with_retry(fn)
-        assert result == "success"
-        assert fn.call_count == 2
 
     def test_retries_on_rate_limit(self, client_with_retry):
         fn = MagicMock(side_effect=[
@@ -72,14 +56,6 @@ class TestRetryLogic:
         assert result == "success"
 
     # The SDK raises its own ServerError for HTTP 5xx. Reads retry it.
-    def test_retries_on_sdk_server_error(self, client_with_retry):
-        fn = MagicMock(side_effect=[
-            ServerError(502, "Bad Gateway"),
-            "success",
-        ])
-        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
-            result = client_with_retry._with_retry(fn)
-        assert result == "success"
 
     def test_raises_after_max_retries(self, client_with_retry):
         fn = MagicMock(side_effect=requests.ConnectionError("conn failed"))
@@ -88,28 +64,13 @@ class TestRetryLogic:
                 client_with_retry._with_retry(fn)
         assert fn.call_count == 4  # 1 initial + 3 retries
 
-    def test_no_retry_on_value_error(self, client_with_retry):
-        fn = MagicMock(side_effect=ValueError("bad input"))
-        with pytest.raises(ValueError, match="bad input"):
+    @pytest.mark.parametrize("error", [UnauthorizedException(), ConfigurationException("bad config"),
+                                       RuntimeError("boom"), ValueError("bad input")])
+    def test_no_retry_on_an_error_that_is_not_transient(self, client_with_retry, error):
+        fn = MagicMock(side_effect=error)
+        with pytest.raises(type(error)) as raised:
             client_with_retry._with_retry(fn)
-        fn.assert_called_once()
-
-    def test_no_retry_on_unauthorized(self, client_with_retry):
-        fn = MagicMock(side_effect=UnauthorizedException())
-        with pytest.raises(UnauthorizedException):
-            client_with_retry._with_retry(fn)
-        fn.assert_called_once()
-
-    def test_no_retry_on_configuration_error(self, client_with_retry):
-        fn = MagicMock(side_effect=ConfigurationException("bad config"))
-        with pytest.raises(ConfigurationException):
-            client_with_retry._with_retry(fn)
-        fn.assert_called_once()
-
-    def test_no_retry_on_runtime_error(self, client_with_retry):
-        fn = MagicMock(side_effect=RuntimeError("not auth"))
-        with pytest.raises(RuntimeError):
-            client_with_retry._with_retry(fn)
+        assert raised.value is error
         fn.assert_called_once()
 
     def test_exponential_backoff(self, client_with_retry):
@@ -269,7 +230,7 @@ class TestSignedActions:
         # stop loss in the middle of a replacement.
         client = client_with_retry
         client.exchange_account = MagicMock(address="0x" + "12" * 20)
-        lock = _signer_state(client.exchange_account.address).operation_lock
+        lock = signer_state(client.exchange_account.address).operation_lock
         seen = []
 
         def free_for_another_thread():

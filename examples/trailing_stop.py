@@ -11,7 +11,7 @@ Requires authentication and an open position.
 import logging
 import time
 
-from fractrade_hl_simple import HyperliquidClient, HyperliquidAccount
+from fractrade_hl_simple import HyperliquidClient
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("trailing_stop")

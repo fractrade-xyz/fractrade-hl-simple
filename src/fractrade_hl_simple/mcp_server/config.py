@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import os
 import re
+import stat
+import sys
 import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -14,11 +16,14 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..hyperliquid import _NETWORK_URLS, _NETWORKS
 from . import keys
 
-BASE_URLS = tuple(_NETWORKS)  # the API URLs the library accepts
+BASE_URLS = tuple(_NETWORKS)  # the API URLs the library accepts: in the config
+# The API URLs a tool call may name: mainnet and testnet, never a local node over plain HTTP.
+TOOL_BASE_URLS = tuple(_NETWORK_URLS.values())
 DEFAULT_MAX_SLIPPAGE = Decimal("0.02")
 ENV_ACCOUNT = "default"  # name of the account configured from environment variables
 ENV_KEY_VAR = "HYPERLIQUID_PRIVATE_KEY"
@@ -26,14 +31,17 @@ ENV_KEY_VAR = "HYPERLIQUID_PRIVATE_KEY"
 _NAME = re.compile(r"[a-z0-9][a-z0-9_-]{0,31}")
 ADDRESS = re.compile(r"0x[0-9a-fA-F]{40}")
 _TOP_LEVEL_KEYS = {"default_account", "defaults", "accounts"}
-_DEFAULTS_KEYS = {"base_url", "max_slippage", "perp_dexs"}
+_DEFAULTS_KEYS = {"base_url", "max_slippage", "perp_dexs", "day_start", "tz"}
 _ACCOUNT_KEYS = {
     "address", "key_env", "key_file", "base_url", "vault", "trading", "max_order_usd",
     "max_leverage", "max_slippage", "symbols", "perp_dexs",
     # Risk guardrails, each optional: a check runs only when its key is set.
     "max_margin_pct", "max_total_margin_pct", "max_daily_loss_pct", "isolated_only", "max_orders_per_hour",
     "check_order_leverage", "max_risk_pct",
+    # Limits with a mode (off, warn: the order goes through with a warning, block): warn by default.
+    "day_start", "tz", "max_day_loss_pct", "max_day_loss_mode", "max_total_notional_x", "max_total_notional_mode",
 }
+MODES = ("off", "warn", "block")
 SIZE_LIMITS = ("max_order_usd", "max_margin_pct", "max_total_margin_pct")  # a trading account needs one
 
 
@@ -69,6 +77,14 @@ class AccountConfig:
     max_orders_per_hour: Optional[int] = None        # orders that add risk, per hour
     check_order_leverage: bool = False               # the market's leverage at most max_leverage, every order
     max_risk_pct: Optional[Decimal] = None           # a trade's loss at its stop losses (open_position)
+    # The trading day, for max_day_loss_pct: it starts at day_start ("HH:MM") in the IANA time zone tz.
+    day_start: str = "00:00"
+    tz: str = "UTC"
+    # Limits with a mode: off, warn (the order goes through, with a warning) or block.
+    max_day_loss_pct: Optional[Decimal] = None       # loss since the trading day started, % of the value then
+    max_day_loss_mode: str = "warn"
+    max_total_notional_x: Optional[Decimal] = None   # positions and open orders that add risk, x the account value
+    max_total_notional_mode: str = "warn"
 
     @property
     def has_key(self) -> bool:
@@ -98,21 +114,37 @@ def load_config(path: Optional[Path] = None, environ: Optional[Mapping[str, str]
         path = default_config_path(environ)
     if path is None:
         return config_from_environment(environ)
-    path = path.expanduser()
-    try:
-        data, problem = path.read_bytes(), None
-    except OSError as e:
-        data, problem = b"", e.strerror
-    if problem is not None:  # raised outside the except block: the OSError is not attached
-        raise ConfigError(f"cannot read config file {path}: {problem}")
-    text = _decode(data)
+    path = path.expanduser().absolute()
+    text = _decode(_read_config_file(path))
     if text is None:
         raise ConfigError(f"config file {path} is not valid UTF-8 text")
-    return parse_config(text, source=str(path))
+    return parse_config(text, source=str(path), folder=path.parent)
 
 
-def parse_config(text: str, source: str) -> Config:
-    """Validate the text of a TOML config file."""
+def _read_config_file(path: Path) -> bytes:
+    """The config file's bytes, after checking the opened file itself: a regular file of the
+    current user that no one else can write. Whoever can write it can point a key_file at
+    another key or lift a limit. The owner and permissions are not checked on Windows, which
+    has no such bits."""
+    try:
+        fd, problem = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)), None  # never block on a FIFO
+    except OSError as e:
+        fd, problem = -1, e.strerror
+    if problem is not None:  # raised outside the except block: the OSError is not attached
+        raise ConfigError(f"cannot read config file {path}: {problem}")
+    with os.fdopen(fd, "rb") as f:
+        info = os.fstat(f.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ConfigError(f"config file {path} is not a regular file")
+        if sys.platform != "win32" and (info.st_uid != os.getuid() or info.st_mode & 0o022):
+            raise ConfigError(f"config file {path} can be changed by other users: it must be your own file, "
+                              f"writable by you only (chmod 600 {path})")
+        return f.read()
+
+
+def parse_config(text: str, source: str, folder: Optional[Path] = None) -> Config:
+    """Validate the text of a TOML config file. A relative key_file is read from `folder`
+    (the config file's), not from the directory the server happens to start in."""
     # Checked on the raw text so that keys in comments are found too.
     if keys.contains_private_key(text):
         raise ConfigError(
@@ -142,7 +174,7 @@ def parse_config(text: str, source: str) -> Config:
     _check_table(tables, f"{source} [accounts]")
     if not tables:
         raise ConfigError(f"{source}: no accounts configured")
-    accounts = {name: _account(name, table, defaults, f"{source} [accounts.{name}]")
+    accounts = {name: _account(name, table, defaults, f"{source} [accounts.{name}]", folder)
                 for name, table in tables.items()}
 
     default_account = data.get("default_account")
@@ -237,7 +269,8 @@ def _holds_private_key(value: Any) -> bool:
     return False
 
 
-def _account(name: str, table: Any, defaults: Mapping[str, Any], where: str) -> AccountConfig:
+def _account(name: str, table: Any, defaults: Mapping[str, Any], where: str,
+             folder: Optional[Path] = None) -> AccountConfig:
     if not _NAME.fullmatch(name):
         raise ConfigError(f"{where}: account names use a-z, 0-9, '-' and '_' (at most 32 characters)")
     _check_table(table, where)
@@ -251,6 +284,8 @@ def _account(name: str, table: Any, defaults: Mapping[str, Any], where: str) -> 
     key_env = _optional(table, "key_env", str, where)
     key_file_text = _optional(table, "key_file", str, where)
     key_file = Path(key_file_text).expanduser() if key_file_text else None
+    if key_file is not None and folder is not None and not key_file.is_absolute():
+        key_file = folder / key_file
 
     base_url = table.get("base_url", defaults.get("base_url", _NETWORK_URLS["mainnet"]))
     if base_url not in BASE_URLS:
@@ -281,6 +316,12 @@ def _account(name: str, table: Any, defaults: Mapping[str, Any], where: str) -> 
         max_orders_per_hour=_whole(table, "max_orders_per_hour", where),
         check_order_leverage=_optional(table, "check_order_leverage", bool, where) or False,
         max_risk_pct=_percent(table, "max_risk_pct", where),
+        day_start=_day_start(table.get("day_start", defaults.get("day_start", "00:00")), where),
+        tz=_tz(table.get("tz", defaults.get("tz", "UTC")), where),
+        max_day_loss_pct=_percent(table, "max_day_loss_pct", where),
+        max_day_loss_mode=_mode(table, "max_day_loss_mode", "max_day_loss_pct", where),
+        max_total_notional_x=_positive(table, "max_total_notional_x", where),
+        max_total_notional_mode=_mode(table, "max_total_notional_mode", "max_total_notional_x", where),
     )
     if account.trading:
         missing = [field for field, value in (
@@ -338,6 +379,34 @@ def _percent(table: Mapping[str, Any], key: str, where: str) -> Optional[Decimal
     if not 0 < number <= 100:
         raise ConfigError(f"{where}: {key} must be a percentage above 0 and at most 100")
     return number
+
+
+def _day_start(value: Any, where: str) -> str:
+    """'HH:MM', 00:00 to 23:59."""
+    parts = value.split(":") if isinstance(value, str) else []
+    if len(parts) != 2 or not all(part.isdigit() and len(part) == 2 for part in parts) \
+            or int(parts[0]) > 23 or int(parts[1]) > 59:
+        raise ConfigError(f"{where}: day_start must be a time of day as HH:MM, e.g. \"06:00\"")
+    return str(value)
+
+
+def _tz(value: Any, where: str) -> str:
+    """An IANA time zone name, e.g. Europe/Athens."""
+    try:
+        ZoneInfo(value)
+    except (ZoneInfoNotFoundError, ValueError, TypeError):
+        raise ConfigError(f"{where}: tz must be an IANA time zone name, e.g. \"Europe/Athens\" or \"UTC\"") from None
+    return str(value)
+
+
+def _mode(table: Mapping[str, Any], key: str, limit: str, where: str) -> str:
+    if key not in table:
+        return "warn"
+    if limit not in table:
+        raise ConfigError(f"{where}: {key} needs {limit}")
+    if table[key] not in MODES:
+        raise ConfigError(f"{where}: {key} must be one of {', '.join(MODES)}")
+    return str(table[key])
 
 
 def _whole(table: Mapping[str, Any], key: str, where: str) -> Optional[int]:
