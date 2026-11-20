@@ -1,6 +1,10 @@
+<img src="https://raw.githubusercontent.com/fractrade-xyz/fractrade-hl-simple/main/docs/logo.svg" alt="fractrade logo" width="64" height="64">
+
 # fractrade-hl-simple
 
-A simple Python wrapper for the Hyperliquid DEX API, focused on perpetual futures trading. Built for reliability with automatic retries, configurable slippage, and proper error handling — because this is real money.
+A Python client for Hyperliquid perpetual futures, built on the official Hyperliquid Python SDK: prices, order books, candles and funding; balances, positions, orders and fills of any wallet; market and limit orders, stop losses and take profits, trigger entries and client order ids; spot and the HIP-3 dexes (`xyz:` stocks and commodities, and others). Requests that fail on the network, a rate limit or a server error are retried; every error is an exception with a fixed `code` and `retryable` ([Error Handling](#error-handling)).
+
+It includes **`fractrade-hl-mcp`, an MCP server** for Claude Code and Claude Desktop. It runs locally over stdio and reads your Hyperliquid accounts and the markets. Trading is off by default; switched on per account, every order that adds risk is checked against the limits you set for that account (symbols, order size, margin, daily loss, loss at the stop, order rate), and orders are signed only with an API wallet. See [MCP Server](#mcp-server-claude-code-claude-desktop).
 
 ## Installation & Updates
 
@@ -333,7 +337,7 @@ profit to a stop order: place them with `stop_loss()` / `take_profit()` once it 
 ### Maker Orders (Fee-Optimized)
 
 ```python
-# Simple maker buy/sell — auto-detects optimal timing from order book spread
+# Maker buy/sell: the timing comes from the order book spread
 order = client.maker_buy("BTC", 0.001)    # Tight spread → 30s timeout, 3s reprice
 order = client.maker_sell("kPEPE", 1500)  # Medium spread → 45s timeout, 5s reprice
 
@@ -401,7 +405,7 @@ client.cancel_order_by_cloid(cloid, "BTC")
 
 ## Spot Trading
 
-Trade spot tokens (e.g., PURR, HYPE, FRAC) using just the token name — the library handles the `/USDC` pair mapping internally.
+Trade spot tokens (e.g., PURR, HYPE, FRAC) using just the token name; the library maps it to the `/USDC` pair.
 
 ### Transfer Between Wallets
 ```python
@@ -581,7 +585,7 @@ client.bulk_cancel([
 
 ## Extended Universe (Stocks, Commodities, Forex)
 
-Hyperliquid's extended perp universe includes stocks, commodities, indices, and forex — all prefixed with `xyz:`. Enable it with `extended_universe=True`. Off by default to avoid extra API overhead for users who only trade crypto.
+Hyperliquid's extended perp universe includes stocks, commodities, indices, and forex, all prefixed with `xyz:`. Enable it with `extended_universe=True`. Off by default to avoid extra API overhead for users who only trade crypto.
 
 ```python
 client = HyperliquidClient(extended_universe=True)
@@ -591,7 +595,7 @@ tsla = client.get_price("xyz:TSLA")
 gold = client.get_price("xyz:GOLD")
 sp500 = client.get_price("xyz:SP500")
 
-# Trading — same API as crypto
+# Trading: the same API as crypto
 order = client.buy("xyz:TSLA", size=1.0)
 order = client.sell("xyz:GOLD", size=0.5, limit_price=4500.0)
 client.set_leverage("xyz:NVDA", 10)
@@ -822,7 +826,7 @@ for fill in fills[:5]:
 client.close("BTC")
 ```
 
-## MCP Server (Claude Code, Codex, Claude Desktop)
+## MCP Server (Claude Code, Claude Desktop)
 
 `fractrade-hl-mcp` lets an AI assistant read your Hyperliquid accounts and the markets:
 balances, positions, orders, fills, funding and prices, for several wallets and any public
@@ -836,7 +840,6 @@ it also trades perps, within limits you set per account.
 pipx install "fractrade-hl-simple[mcp]"                        # or pip, in a virtual environment
 fractrade-hl-mcp --init                                        # create your config file
 claude mcp add --scope user fractrade -- fractrade-hl-mcp     # Claude Code
-codex mcp add fractrade -- fractrade-hl-mcp                    # Codex CLI
 ```
 
 Configuration (example: [examples/mcp.example.toml](https://github.com/fractrade-xyz/fractrade-hl-simple/blob/main/examples/mcp.example.toml)), the tools, trading and its limits, errors and security: [docs/mcp.md](https://github.com/fractrade-xyz/fractrade-hl-simple/blob/main/docs/mcp.md).

@@ -1,5 +1,5 @@
 """
-Integration tests for extended universe (xyz:) symbols — real trades on Hyperliquid.
+Integration tests for extended universe (xyz:) symbols: real trades on Hyperliquid.
 
 Requires authentication (.env with HYPERLIQUID_PRIVATE_KEY and HYPERLIQUID_PUBLIC_ADDRESS).
 These tests place REAL orders with minimum position sizes (< $1 each).

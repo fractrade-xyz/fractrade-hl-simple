@@ -1072,7 +1072,7 @@ class TestMakerOrderIntegration:
         """With fallback='cancel' and short timeout, returns the resting order."""
         order = client.maker_buy("BTC", 0.001, timeout=8, reprice_interval=3, fallback="cancel")
         print(f"Cancel fallback: status={order.status}")
-        # With cancel fallback, we get whatever happened — maker fill or open order
+        # With cancel fallback, we get whatever happened: maker fill or open order
         assert order.status in ("filled", "open")
         # Clean up
         if order.status == "filled":

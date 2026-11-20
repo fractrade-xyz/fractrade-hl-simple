@@ -3,7 +3,7 @@ Example showing spot trading: check price, buy tokens, place limit order,
 cancel it, sell tokens.
 
 Requires authentication (.env file with credentials).
-Requires USDC in the spot wallet — transfer via the web UI or use
+Requires USDC in the spot wallet: transfer it via the web UI or use
 transfer_to_spot() with the main wallet key.
 """
 

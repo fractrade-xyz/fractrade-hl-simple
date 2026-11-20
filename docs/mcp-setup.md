@@ -1,10 +1,9 @@
 # Set up the MCP server, step by step
 
-This guide takes you from nothing to an AI assistant (Claude Code, Codex: the CLI or the
-app, or Claude Desktop) that reads your Hyperliquid account and, if you want, trades it within limits you
+This guide takes you from nothing to an AI assistant (Claude Code or Claude Desktop) that reads your Hyperliquid account and, if you want, trades it within limits you
 set. You do not need to program.
 
-**The easy way: let your assistant set it up.** In Claude Code or Codex, say:
+**The easy way: let your assistant set it up.** In Claude Code, say:
 
 > Set up the fractrade-hl-simple MCP server for me, following
 > https://github.com/fractrade-xyz/fractrade-hl-simple/blob/main/docs/mcp-setup.md
@@ -33,9 +32,9 @@ The full reference, with every tool and setting, is [mcp.md](mcp.md).
 
 - **Python 3.12 or newer.** Check with `python3 --version` (on Windows: `python --version`).
   If it is missing or older, install it from [python.org](https://www.python.org/downloads/).
-- **An AI assistant that speaks MCP:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code),
-  Codex (the CLI or the app) or Claude Desktop. Claude Desktop cannot run the setup
-  commands itself: do the setup with Claude Code or Codex once, or by hand in a terminal.
+- **An AI assistant that speaks MCP:** [Claude Code](https://docs.anthropic.com/en/docs/claude-code)
+  or Claude Desktop. Claude Desktop cannot run the setup commands itself: do the setup with
+  Claude Code once, or by hand in a terminal.
 - **Your Hyperliquid account's address:** the `0x…` address of the wallet you use on
   Hyperliquid (shown in the Hyperliquid app). It is public, not a secret.
 
@@ -66,7 +65,7 @@ your `PATH`:
    pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git"
    ```
 
-3. **Check it:** `fractrade-hl-mcp --help`. The Codex app and Claude Desktop need the
+3. **Check it:** `fractrade-hl-mcp --help`. Claude Desktop needs the
    command's full path: `which fractrade-hl-mcp` prints it (with pipx usually
    `~/.local/bin/fractrade-hl-mcp`).
 
@@ -117,20 +116,6 @@ The assistant starts the server itself; you never run it by hand.
 claude mcp add --scope user fractrade -- fractrade-hl-mcp
 ```
 
-**Codex CLI:**
-
-```bash
-codex mcp add fractrade -- fractrade-hl-mcp
-```
-
-**Codex app:** it uses the same settings as Codex CLI, `~/.codex/config.toml`. Add (or let
-Codex add) these lines to it, with the command's full path (step 2):
-
-```toml
-[mcp_servers.fractrade]
-command = "/full/path/to/fractrade-hl-mcp"
-```
-
 **Claude Desktop:** in Settings → Developer → Edit Config, add (with the command's full
 path, step 2; on Windows `where.exe fractrade-hl-mcp` prints it):
 
@@ -143,8 +128,7 @@ path, step 2; on Windows `where.exe fractrade-hl-mcp` prints it):
 ```
 
 Restart the assistant afterwards: the server starts with it and reads `mcp.toml` then, so
-restart it after every change too. The Codex app starts a server for every new chat: a new
-chat picks a change up; chats already open keep the server they started with.
+restart it after every change too.
 
 ## 5. Try it
 
@@ -243,9 +227,7 @@ claude mcp remove fractrade
 claude mcp add --scope user fractrade -- fractrade-hl-mcp --enable-trading
 ```
 
-(Codex CLI: the same with `codex mcp remove` and `codex mcp add`; the Codex app: add
-`args = ["--enable-trading"]` under `command` in `~/.codex/config.toml`; Claude Desktop: add
-`"args": ["--enable-trading"]` next to `"command"`.) Restart the assistant.
+(Claude Desktop: add `"args": ["--enable-trading"]` next to `"command"`.) Restart the assistant.
 
 Now you can ask, for example, "buy 0.001 BTC at market", "set a stop loss at 80000 for my
 BTC position", "close my ETH position", or with the protection in one step: "plan a BTC long
@@ -266,7 +248,7 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
 - **Emergency stop:** ask "use the kill switch". It halts trading at once, in every chat,
   and cancels the orders that would open or add to a position (stop losses and take
   profits stay); closing positions and cancelling orders still work. Opening a new chat does not lift it:
-  quit the assistant (the Codex app: the whole app, every chat) and start it again. If the
+  quit the assistant and start it again. If the
   answer is an error saying an account is halted in this chat only, quit the other chats
   too.
 - **The API wallet expires** after the days you chose. Then the server refuses it
@@ -303,7 +285,7 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
 | `GUARD_BLOCKED` | The order is over one of your limits; the message says which. If it says a limit could not read the account, try again when the answer says `retryable: true`. |
 | `the market uses cross margin` | `isolated_only` is on: ask the assistant to set the market to isolated margin (`set_leverage` with `is_cross` false), or delete `isolated_only`. |
 | `the market's leverage … is above max_leverage` | `check_order_leverage` is on: ask the assistant to lower the market's leverage (`set_leverage`), or raise `max_leverage`. |
-| `KILL_SWITCH_ENGAGED` | The kill switch is on: quit the assistant (the Codex app: the whole app) and start it again to trade. |
+| `KILL_SWITCH_ENGAGED` | The kill switch is on: quit the assistant and start it again to trade. |
 
 Still stuck? Run `fractrade-hl-mcp --check --log-level DEBUG` and read the messages, or
 see the [reference](mcp.md#troubleshooting).

@@ -1,7 +1,7 @@
 [tool.poetry]
 name = "fractrade-hl-simple"
-version = "0.3.4"
-description = "A simple API wrapper for automated trading on Hyperliquid DEX with Python"
+version = "0.4.0rc1"
+description = "Python client for Hyperliquid perpetual futures, with an MCP server for Claude Code and Claude Desktop"
 authors = ["crjameson <93468664+crjameson@users.noreply.github.com>"]
 license = "MIT"
 readme = "README.md"
@@ -9,7 +9,7 @@ packages = [{include = "fractrade_hl_simple", from = "src"}]
 homepage = "https://fractrade.xyz"
 repository = "https://github.com/fractrade-xyz/fractrade-hl-simple"
 documentation = "https://github.com/fractrade-xyz/fractrade-hl-simple"
-keywords = ["hyperliquid", "trading", "crypto", "api", "defi"]
+keywords = ["hyperliquid", "trading", "perpetual-futures", "crypto", "defi", "api", "mcp", "mcp-server", "claude"]
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",

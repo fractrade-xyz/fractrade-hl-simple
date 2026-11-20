@@ -350,7 +350,7 @@ class StdioServer:
                 return message
 
 
-@pytest.mark.parametrize("version", ["2025-06-18", "2025-11-25"])  # 2025-06-18: what Codex CLI 0.167 sends
+@pytest.mark.parametrize("version", ["2025-06-18", "2025-11-25"])  # 2025-06-18: the previous protocol version, still sent by some clients
 def test_a_real_stdio_connection_in_the_handshake_era(tmp_path, version):
     with StdioServer(tmp_path) as server:
         init = server.request(1, "initialize", {

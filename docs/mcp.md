@@ -1,4 +1,4 @@
-# MCP server: Hyperliquid in Claude Code, Codex and Claude Desktop
+# MCP server: Hyperliquid in Claude Code and Claude Desktop
 
 `fractrade-hl-mcp` is a local [MCP](https://modelcontextprotocol.io) server. It lets an AI
 assistant read your Hyperliquid accounts and the markets: balances, positions, orders,
@@ -100,7 +100,7 @@ of `perp_dexs` exists is checked at the first call that reads its network.
 ### Without a config file
 
 One account named `default` then comes from the environment of the server process (pass the
-variables with the client: `claude mcp add -e`, `codex mcp add --env`):
+variables with the client: `claude mcp add -e`):
 `HYPERLIQUID_PUBLIC_ADDRESS` (required), `HYPERLIQUID_ENV` (`mainnet`, the default, or
 `testnet`), `HYPERLIQUID_IS_VAULT` (`true` for a vault or sub-account) and
 `FRACTRADE_MCP_PERP_DEXS` (`xyz,para`). With `HYPERLIQUID_PRIVATE_KEY`,
@@ -705,7 +705,7 @@ open it can refuse (`ACTION_REJECTED`). Refused while halted.
 
 ### Several chats, one account
 
-An assistant may start a server per chat (the Codex app does), and each one trades the same
+Each Claude Code session starts a server of its own, and each one trades the same
 accounts. Servers whose config file is in the same folder share, through files in the
 folder `state` next to it: the account lock (a trade call holds it for its whole run, so
 two calls for one account never run at once), the kill switch, the count of

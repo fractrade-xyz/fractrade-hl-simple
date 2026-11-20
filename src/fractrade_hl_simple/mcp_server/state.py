@@ -1,5 +1,5 @@
-"""Run-time state shared by every server of one config: each chat of the Codex app, and each
-assistant session, starts a server of its own, and they trade the same accounts.
+"""Run-time state shared by every server of one config: each assistant session starts a
+server of its own, and they trade the same accounts.
 
 In the folder ``state`` next to the config file, for the user only:
 

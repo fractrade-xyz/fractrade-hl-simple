@@ -1,5 +1,5 @@
 """
-Example showing how to trade extended universe (xyz:) symbols —
+Example showing how to trade extended universe (xyz:) symbols:
 stocks, commodities, indices, and forex on Hyperliquid.
 
 Works with or without authentication. Price queries are public;
@@ -22,7 +22,7 @@ def main():
     print(f"GOLD:  ${gold:,.2f}")
     print(f"SP500: ${sp500:,.2f}")
 
-    # Get all prices — includes both crypto and xyz symbols
+    # Get all prices, including both crypto and xyz symbols
     all_prices = client.get_price()
     xyz_prices = {k: v for k, v in all_prices.items() if k.startswith("xyz:")}
     print(f"\nTotal symbols: {len(all_prices)} ({len(xyz_prices)} extended universe)")
@@ -49,7 +49,7 @@ def main():
     # ── Trading (requires auth) ───────────────────────────────────────
 
     if not client.is_authenticated():
-        print("\nSkipping trades — no credentials found.")
+        print("\nSkipping trades: no credentials found.")
         print("Add HYPERLIQUID_PRIVATE_KEY and HYPERLIQUID_PUBLIC_ADDRESS to .env to trade.")
         return
 

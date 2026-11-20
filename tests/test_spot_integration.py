@@ -1,5 +1,5 @@
 """
-Integration tests for spot trading — real trades on Hyperliquid.
+Integration tests for spot trading: real trades on Hyperliquid.
 
 Requires authentication (.env with HYPERLIQUID_PRIVATE_KEY and HYPERLIQUID_PUBLIC_ADDRESS).
 Uses FRAC token for testing with minimal position sizes.
@@ -68,7 +68,7 @@ class TestTransfers:
             print(f"Transferred ${amount} back to spot")
         except ValueError as e:
             if "Must deposit before" in str(e) or "API wallet" in str(e).lower():
-                pytest.skip("Transfer not supported with API wallets — requires main wallet key")
+                pytest.skip("Transfer not supported with API wallets: requires main wallet key")
             raise
 
     def test_transfer_invalid_amount(self, client):
@@ -147,7 +147,7 @@ class TestSpotLimitOrders:
 
         try:
             price = client.get_spot_price(token)
-            limit_price = round(price * 0.80, 6)  # 20% below market — won't fill
+            limit_price = round(price * 0.80, 6)  # 20% below market: won't fill
 
             order = client.spot_buy(token, size, limit_price=limit_price)
             assert order.symbol == token
@@ -185,7 +185,7 @@ class TestSpotLimitOrders:
         token, size = self.TOKEN, self.SIZE
 
         try:
-            # Need to own FRAC first — buy some
+            # Need to own FRAC first: buy some
             buy_order = client.spot_buy(token, size)
             time.sleep(2)
 
@@ -193,7 +193,7 @@ class TestSpotLimitOrders:
             sell_size = float(buy_order.filled_size) if buy_order.filled_size else size
 
             price = client.get_spot_price(token)
-            limit_price = round(price * 2.0, 6)  # 2x above market — won't fill
+            limit_price = round(price * 2.0, 6)  # 2x above market: won't fill
 
             order = client.spot_sell(token, sell_size, limit_price=limit_price)
             assert order.status == "open"

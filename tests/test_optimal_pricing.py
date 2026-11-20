@@ -7,7 +7,7 @@ from fractrade_hl_simple.exceptions import ServerErrorException, UnknownSymbolEx
 
 @pytest.fixture
 def mock_client():
-    """Create a fully mocked client — no API calls."""
+    """Create a fully mocked client: no API calls."""
     # Save and restore class-level cache so integration tests still work
     saved = (HyperliquidClient._cached_key, HyperliquidClient._cached_market_specs,
              HyperliquidClient._cached_market_specs_at, HyperliquidClient._cached_meta,
@@ -239,7 +239,7 @@ class TestOptimalLimitPrice:
         assert price <= 50000.0
 
 
-# ── Integration tests — real API ─────────────────────────────────────
+# ── Integration tests: real API ─────────────────────────────────────
 
 @pytest.fixture(scope="module")
 def live_client():
@@ -289,14 +289,14 @@ class TestOptimalPricingIntegration:
             assert buy_patient >= best_bid * 0.999, \
                 f"Patient buy {buy_patient} too far below best bid {best_bid}"
             assert buy_patient <= best_ask, \
-                f"Patient buy {buy_patient} crosses ask {best_ask} — would be taker"
+                f"Patient buy {buy_patient} crosses ask {best_ask}: would be taker"
 
             # Patient sell (urgency=0.0) should be at or near best ask
             sell_patient = live_client.get_optimal_limit_price(symbol, "sell", urgency_factor=0.0)
             assert sell_patient <= best_ask * 1.001, \
                 f"Patient sell {sell_patient} too far above best ask {best_ask}"
             assert sell_patient >= best_bid, \
-                f"Patient sell {sell_patient} crosses bid {best_bid} — would be taker"
+                f"Patient sell {sell_patient} crosses bid {best_bid}: would be taker"
 
             print(f"{symbol}: patient buy={buy_patient:.2f} (bid={best_bid:.2f}), "
                   f"patient sell={sell_patient:.2f} (ask={best_ask:.2f})")

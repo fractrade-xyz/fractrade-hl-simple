@@ -183,7 +183,3 @@ cython_debug/
 *.swp
 *.swo
 
-# Planning documents stay outside the repository.
-SPEC.md
-PLAN.md
-docs/mcp/
