@@ -53,24 +53,23 @@ your `PATH`:
    - elsewhere: `python3 -m pip install --user pipx`, then `python3 -m pipx ensurepath`
 
    Then open a new terminal (or restart the assistant), so the `PATH` change applies.
-2. **Install the server:**
+2. **Install the server.** It is new in 0.4.0; until that is on PyPI, install its release
+   candidate from the tag on GitHub, which pins the version:
 
    ```bash
-   pipx install "fractrade-hl-simple[mcp]"
+   pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
    ```
 
-   Until a release with the MCP server is on PyPI, from GitHub instead:
-
-   ```bash
-   pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git"
-   ```
+   Once 0.4.0 is on PyPI: `pipx install "fractrade-hl-simple[mcp]"`.
 
 3. **Check it:** `fractrade-hl-mcp --help`. Claude Desktop needs the
    command's full path: `which fractrade-hl-mcp` prints it (with pipx usually
    `~/.local/bin/fractrade-hl-mcp`).
 
-To update later: `pipx upgrade fractrade-hl-simple` (or the same `pipx install` command
-with `--force` for the GitHub version).
+To update later, run the same `pipx install` command with `--force` and the new tag (a
+later release candidate, such as `@v0.4.0rc2`); once 0.4.0 is on PyPI,
+`pipx install --force "fractrade-hl-simple[mcp]"` and after that `pipx upgrade
+fractrade-hl-simple`.
 
 ## 3. Create your config file
 
@@ -110,10 +109,14 @@ address = "0x…"
 
 The assistant starts the server itself; you never run it by hand.
 
+`hyperliquid` below is the name your assistant knows the server by. Any name works, as long as
+it differs from your other servers' (fractrade's market data server is connected as
+`fractrade`).
+
 **Claude Code:**
 
 ```bash
-claude mcp add --scope user fractrade -- fractrade-hl-mcp
+claude mcp add --scope user hyperliquid -- fractrade-hl-mcp
 ```
 
 **Claude Desktop:** in Settings → Developer → Edit Config, add (with the command's full
@@ -122,7 +125,7 @@ path, step 2; on Windows `where.exe fractrade-hl-mcp` prints it):
 ```json
 {
   "mcpServers": {
-    "fractrade": { "command": "/full/path/to/fractrade-hl-mcp" }
+    "hyperliquid": { "command": "/full/path/to/fractrade-hl-mcp" }
   }
 }
 ```
@@ -223,8 +226,8 @@ is wrong ([section 8](#8-when-something-does-not-work)).
 Start the server with `--enable-trading`. For Claude Code, replace the server:
 
 ```bash
-claude mcp remove fractrade
-claude mcp add --scope user fractrade -- fractrade-hl-mcp --enable-trading
+claude mcp remove hyperliquid
+claude mcp add --scope user hyperliquid -- fractrade-hl-mcp --enable-trading
 ```
 
 (Claude Desktop: add `"args": ["--enable-trading"]` next to `"command"`.) Restart the assistant.

@@ -27,20 +27,26 @@ The server runs on your computer, over stdio; nothing is hosted.
 
 ## Install
 
-Python 3.12 or newer. The server is an optional extra of the library; a plain
-`pip install fractrade-hl-simple` stays without it.
+Python 3.12 or newer. The server is an optional extra of the library (a plain
+`pip install fractrade-hl-simple` stays without it) and new in 0.4.0. Until 0.4.0 is on PyPI,
+install the release candidate from its tag on GitHub; the [setup guide](mcp-setup.md#2-install)
+explains pipx:
 
 ```bash
-pipx install "fractrade-hl-simple[mcp]"     # or pip install, in a virtual environment
+pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
 ```
 
-This adds the `fractrade-hl-mcp` command (also `python -m fractrade_hl_simple.mcp_server`);
-the [setup guide](mcp-setup.md#2-install) explains pipx.
-Until a release with the server is on PyPI, install from a checkout of this repository:
+Or from a checkout of the repository, at the same tag:
 
 ```bash
-pip install -e ".[mcp]"        # or: poetry install --extras mcp
+git clone https://github.com/fractrade-xyz/fractrade-hl-simple.git
+cd fractrade-hl-simple
+git checkout v0.4.0rc1
+pipx install ".[mcp]"          # or in a virtual environment: pip install -e ".[mcp]"
 ```
+
+Once 0.4.0 is on PyPI: `pipx install "fractrade-hl-simple[mcp]"`. Each of these adds the
+`fractrade-hl-mcp` command (also `python -m fractrade_hl_simple.mcp_server`).
 
 ## Connect a client
 
@@ -853,8 +859,9 @@ For an error code, see [Errors](#errors); for no tools, no trade tools, the mess
 the setup and the debug log, the [setup guide](mcp-setup.md#8-when-something-does-not-work).
 
 - **`needs the mcp extra`:** install it again with the extra:
-  `pipx install --force "fractrade-hl-simple[mcp]"`, or without pipx
-  `pip install "fractrade-hl-simple[mcp]"` in the Python the command runs with.
+  `pipx install --force "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"` (once 0.4.0 is on
+  PyPI: `pipx install --force "fractrade-hl-simple[mcp]"`), or without pipx the same with
+  `pip install` in the Python the command runs with.
 - **Signed actions are refused, or `get_changes` skips events:** the computer's clock must
   be right (synchronized, as by NTP): a signed action carries the time as its nonce, and
   `get_changes` ends its interval at the local time minus 5 seconds.

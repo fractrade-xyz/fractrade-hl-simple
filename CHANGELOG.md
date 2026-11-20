@@ -4,6 +4,11 @@ All notable changes to fractrade-hl-simple will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0rc1] - 2026-11-20
+
+The release candidate of 0.4.0. It is not on PyPI: install it from the tag `v0.4.0rc1` on GitHub
+([README](README.md#installation--updates)).
+
 Orders you can rely on: no order is sent twice, the exchange's answer to every signed action is checked, and the library's errors are documented exceptions. Many fixes change what a call returns or raises, so read "Behaviour changes to check in your code" before you upgrade. The methods are described in the [README](README.md), the MCP server in [docs/mcp.md](docs/mcp.md).
 
 ### Bug Fixes
