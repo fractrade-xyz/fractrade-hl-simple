@@ -328,9 +328,10 @@ class Network:
 
     def __init__(self, listed=("xyz", "para", "io"), slow=None):
         self.listed, self.slow, self.made = listed, slow, []
+        self.cache_options = []
         self.started, self.gate = threading.Event(), threading.Event()
 
-    def __call__(self, base_url, account, default_slippage, perp_dexs):
+    def __call__(self, base_url, account, default_slippage, perp_dexs, *, cache_market_specs=True):
         if self.slow in perp_dexs:
             self.started.set()
             self.gate.wait(5)
@@ -338,7 +339,9 @@ class Network:
         if unknown:
             raise InvalidArgumentException(f"{unknown[0]!r} is not a perp dex on mainnet; get_perp_dexs() lists them")
         self.made.append((account is not None, perp_dexs))
-        client = SimpleNamespace(perp_dexs=perp_dexs)
+        self.cache_options.append(cache_market_specs)
+        client = SimpleNamespace(perp_dexs=perp_dexs,
+                                 market_specs={"BTC": {}, **{f"{dex}:MARKET": {} for dex in perp_dexs}})
         client.get_perp_dexs = lambda: [{"name": dex, "full_name": dex.upper()} for dex in self.listed]
         return client
 
@@ -419,6 +422,55 @@ class TestPerpDexs:
         first.join(5), second.join(5)
         assert results["para"][1] == ("para",) and results["io"][1] == ("io",)
         assert reg.perp_dexs(MAINNET) == ("xyz", "para", "io")
+
+
+class TestRefreshMarketSpecs:
+    def test_all_existing_traders_keep_their_own_dex_scope_and_other_networks_stay_untouched(self):
+        network = Network()
+        reg = registry(dex_config(), make_client=network)
+        main, copy = reg.resolve_trade("main"), reg.resolve_trade("copy")
+        reg.enable_perp_dexs(MAINNET, ["io"])
+        old_main, old_copy, other = reg.trade_client(main), reg.trade_client(copy), reg.market_client(TESTNET)
+        result = reg.refresh_market_specs(MAINNET)
+        assert result == {"dexes_read": ["default", "xyz", "para", "io"], "perp_markets": 4,
+                          "trading_clients": [
+                              {"account": "main", "dexes_traded": ["default", "xyz", "io"], "perp_markets": 3},
+                              {"account": "copy", "dexes_traded": ["default", "para", "io"], "perp_markets": 3}]}
+        assert reg.trade_client(main) is not old_main and reg.trade_client(copy) is not old_copy
+        assert reg.market_client(TESTNET) is other
+        assert reg.perp_dexs(MAINNET) == ("xyz", "para", "io")
+        assert network.cache_options[-3:] == [False, False, False]
+
+    def test_refresh_publishes_together_without_blocking_the_immediate_halt(self):
+        network = Network()
+        started, release = threading.Event(), threading.Event()
+
+        def factory(base_url, account, slippage, dexes, *, cache_market_specs=True):
+            client = network(base_url, account, slippage, dexes, cache_market_specs=cache_market_specs)
+            if not cache_market_specs and account is not None:
+                started.set()
+                assert release.wait(5)
+            return client
+
+        reg = registry(make_client=factory)
+        main = reg.resolve_trade("main")
+        reader, trader = reg.read_client(main), reg.trade_client(main)
+        results = []
+        refresh = threading.Thread(target=lambda: results.append(reg.refresh_market_specs(MAINNET)), daemon=True)
+        refresh.start()
+        try:
+            assert started.wait(5)
+            assert reg.read_client(main) is reader and reg.trade_client(main) is trader
+            halt = threading.Thread(target=reg.halt, args=(main,), daemon=True)
+            halt.start()
+            halt.join(1)
+            assert not halt.is_alive() and reg.is_halted(main)
+        finally:
+            release.set()
+            refresh.join(5)
+        assert not refresh.is_alive() and len(results) == 1
+        assert reg.read_client(main) is not reader and reg.trade_client(main) is not trader
+        assert reg.is_halted(main)
 
 
 class TestSignerCheck:
@@ -545,3 +597,31 @@ def shared_state():
     import shutil
     weakref.finalize(state, shutil.rmtree, folder, True)
     return state
+
+
+class TestPlanningClients:
+    def test_the_preview_uses_only_the_selected_accounts_traded_dexes_without_keys(self):
+        conf = parse_config(f'''
+[accounts.main]
+address = "{MAIN}"
+trading = true
+key_env = "MAIN_KEY"
+max_order_usd = 100
+max_leverage = 5
+[accounts.whale]
+address = "{WHALE}"
+perp_dexs = ["xyz"]
+''', "test.toml")
+        clients = FakeClients()
+        accounts = AccountRegistry(conf, {}, clients)
+        target = accounts.resolve_read("main")
+        reader = accounts.read_client(target)
+        planner = accounts.planning_client(target)
+        assert planner is not reader
+        assert clients.dexes == [("xyz",), ()]
+        assert all(account is None for _, account in clients.made)
+        # Session-enabled dexes are also traded. Once scopes match, the reader is reused.
+        accounts.enable_perp_dexs(MAINNET, ["xyz"])
+        assert accounts.planning_client(target) is reader
+        assert accounts.account_perp_dexs(target.account) == ("xyz",)
+        assert accounts._traders == {}

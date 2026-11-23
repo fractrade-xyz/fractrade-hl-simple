@@ -29,13 +29,19 @@ def test_the_body_has_every_field_as_compact_json():
 @pytest.mark.parametrize("error", [
     RateLimitException("Rate limited after 3 retries"),
     NetworkException("Hyperliquid could not be reached: connection refused"),
-    UnknownSymbolException("Unknown symbol 'BTCC'"),
     AddressRequiredException(),
 ], ids=lambda e: type(e).__name__)
 def test_a_library_exception_is_returned_with_its_own_fields(error):
     body = error_body(error)["error"]
     assert (body["code"], body["message"], body["retryable"]) == (error.code, str(error), error.retryable)
     assert body["hint"] is None and body["details"] == {}
+
+
+def test_an_unknown_symbol_names_the_mcp_recovery_tools():
+    body = error_body(UnknownSymbolException("Unknown symbol 'NEW'"))["error"]
+    assert (body["code"], body["retryable"]) == ("UNKNOWN_SYMBOL", False)
+    assert "refresh_market_specs" in body["hint"] and "same base_url" in body["hint"]
+    assert "does not enable a dex; use enable_perp_dexs" in body["hint"]
 
 
 class TestDetailsOfLibraryExceptions:

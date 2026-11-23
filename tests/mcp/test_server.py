@@ -241,6 +241,14 @@ class TestClientFactory:
         assert [options["perp_dexs"] for options in made] == [[], ["xyz", "para"]]
         assert all(options["trust_env"] is False and "extended_universe" not in options for options in made)
 
+    def test_metadata_refresh_can_bypass_the_library_cache(self, monkeypatch):
+        from fractrade_hl_simple.mcp_server import server
+        made = []
+        monkeypatch.setattr(server, "HyperliquidClient", lambda **options: made.append(options))
+        server.make_client("https://api.hyperliquid.xyz", None, None, (), cache_market_specs=False)
+        server.make_client("https://api.hyperliquid.xyz", "account", 0.01, ("xyz",), cache_market_specs=False)
+        assert all(options["cache_market_specs"] is False and options["trust_env"] is False for options in made)
+
 
 def no_clients(base_url, account, default_slippage, perp_dexs):
     raise AssertionError("list_accounts must not create a client")
@@ -270,7 +278,7 @@ class TestListAccounts:
             ],
         }
 
-TOOL_NAMES = ["list_accounts", "enable_perp_dexs", "get_account", "get_positions", "get_open_orders", "get_fills", "get_changes", "get_order_status",
+TOOL_NAMES = ["list_accounts", "enable_perp_dexs", "refresh_market_specs", "get_account", "get_positions", "get_open_orders", "get_fills", "get_changes", "get_order_status",
               "get_order_status_by_cloid", "get_portfolio",
               "get_funding_payments", "get_pnl", "get_prices", "list_markets", "get_market_info", "get_order_book", "get_candles", "get_funding_rates",
               "get_position_risk", "get_account_risk", "plan_trade"]

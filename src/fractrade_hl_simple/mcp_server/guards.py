@@ -144,6 +144,7 @@ class RiskState:
     leverage: Optional[Any] = None              # models.Leverage of the market: type and value
     account_value: Optional[Decimal] = None     # None: not established for the account mode
     margin_used: Optional[Decimal] = None       # margin in use now, every position
+    pending_margin: Optional[Decimal] = None    # remaining non-reduce-only perp entries, at current leverage
     day_loss: Optional[Decimal] = None          # loss over the last 24 h (0 for a gain)
     day_capital: Optional[Decimal] = None       # account value without that PnL: 24 h ago plus transfers
     orders_last_hour: int = 0                   # orders that added risk, by this server
@@ -202,20 +203,20 @@ def margin_per_trade(margin: Decimal, account_value: Optional[Decimal], max_pct:
                                           f"value ({_money(limit)})")
 
 
-def total_margin(margin_used: Optional[Decimal], margin: Decimal, account_value: Optional[Decimal],
-                 max_pct: Decimal, what: str = "this order") -> Check:
-    """Margin in use with the new order's (a batch: all its orders', as if every one fills),
-    at most `max_pct` % of the account value."""
+def total_margin(margin_used: Optional[Decimal], pending: Optional[Decimal], margin: Decimal,
+                 account_value: Optional[Decimal], max_pct: Decimal, what: str = "this order") -> Check:
+    """Used position margin plus pending entries and the proposed order (or batch),
+    at most `max_pct` % of the account value. Opposing entries are not netted."""
     if (not _finite(account_value) or account_value <= 0 or not _finite(margin_used) or margin_used < 0
-            or not _finite(margin) or margin < 0):
-        return Check("max_total_margin_pct", False, "the account value or the margin in use is not established, "
-                                                    "so max_total_margin_pct cannot be checked")
-    limit, total = account_value * max_pct / 100, margin_used + margin
-    if total <= limit:
-        return Check("max_total_margin_pct", True, f"margin in use with {what} {_money(total)} is within "
-                                                   f"{_text(max_pct)} % of the account value ({_money(limit)})")
-    return Check("max_total_margin_pct", False, f"margin in use with {what} {_money(total)} is above "
-                                                f"{_text(max_pct)} % of the account value ({_money(limit)})")
+            or not _finite(pending) or pending < 0 or not _finite(margin) or margin < 0):
+        return Check("max_total_margin_pct", False, "the account value, used margin, pending entry margin or "
+                                                    "proposed margin is not established, so "
+                                                    "max_total_margin_pct cannot be checked")
+    limit, total = account_value * max_pct / 100, margin_used + pending + margin
+    passed = total <= limit
+    return Check("max_total_margin_pct", passed, f"projected margin with {what} {_money(total)} is "
+                 f"{'within' if passed else 'above'} {_text(max_pct)} % of the account value ({_money(limit)}); "
+                 f"used {_money(margin_used)}, pending entries {_money(pending)}, proposed {_money(margin)}")
 
 
 def daily_loss(loss: Optional[Decimal], capital: Optional[Decimal], max_pct: Decimal) -> Check:
@@ -341,6 +342,24 @@ def open_notional(summary: Any, orders: Iterable[Any], mids: Mapping[str, Decima
                        if not o.reduce_only and o.market in PERP_MARKETS), Decimal(0))
 
 
+def pending_margin(orders: Iterable[Any], leverages: Mapping[str, Any], mids: Mapping[str, Decimal]) -> Decimal:
+    """Margin for every remaining perp entry, including ones placed outside this server.
+    Reduce-only protection reserves none. Unknown leverage or value makes the total unknown.
+    """
+    total = Decimal(0)
+    for order in orders:
+        if order.reduce_only or order.market not in PERP_MARKETS:
+            continue
+        leverage = leverages.get(order.symbol)
+        if leverage is None or not _finite(leverage.value) or leverage.value <= 0:
+            return Decimal("NaN")
+        value = entry_value(order, mids.get(order.symbol))
+        if not value.is_finite():
+            return Decimal("NaN")
+        total += value / leverage.value
+    return total
+
+
 def _utc(ms: int) -> str:
     """A time for a message: UTC, to the minute."""
     return datetime.fromtimestamp(ms / 1000, timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -368,14 +387,18 @@ def entry_value(order: Any, mid: Optional[Decimal]) -> Decimal:
     """The notional of an open order that adds risk, valued as a new one is (valued_price):
     its open size at its limit price, a trigger order's at the higher of its trigger and
     limit price (a buy stop's limit is the most it fills at), and a sell's at the current
-    `mid` when that is higher. NaN for a sell without a finite mid, as valued_price: the
-    total cannot be checked then."""
-    prices = [price for price in (order.trigger_price, order.limit_price) if price is not None]
+    `mid` when that is higher. NaN for an unknown price/size or a sell without a finite mid:
+    the total cannot be checked then."""
+    prices: list[Decimal] = [price for price in (order.trigger_price, order.limit_price) if price is not None]
+    size = order.remaining_size
+    if (not prices or any(not _finite(price) or price <= 0 for price in prices)
+            or not _finite(size) or size < 0):
+        return Decimal("NaN")
     if not order.is_buy:
-        if mid is None or not _finite(mid):
+        if not _finite(mid) or mid <= 0:
             return Decimal("NaN")
         prices.append(mid)
-    return order.remaining_size * max(prices) if prices else Decimal(0)
+    return size * max(prices)
 
 
 def total_notional(risk: "RiskState", adding: Decimal, max_x: Decimal, mode: str,
@@ -435,8 +458,8 @@ def _reads(account: AccountConfig) -> dict[str, list[tuple[str, str]]]:
     """Each read an order that adds risk needs for `account`'s rules, with those rules and
     their modes: "leverage" (the market's, for check_order_leverage, isolated_only and the
     margins), "account" (value and margin in use), "day" (the last 24 hours), "today" (the
-    portfolio, for max_day_loss_pct), "notional" (the open orders, for max_total_notional_x,
-    which needs "account" too). A sell's mid is read besides (valued_price)."""
+    portfolio, for max_day_loss_pct), "orders" (open orders and their sell mids, for total
+    margin and total notional). A proposed sell's mid is read besides (valued_price)."""
     reads: dict[str, list[tuple[str, str]]] = {}
 
     def need(read: str, rule: str, mode: str = "block") -> None:
@@ -448,6 +471,8 @@ def _reads(account: AccountConfig) -> dict[str, list[tuple[str, str]]]:
         if getattr(account, rule) is not None:
             need("leverage", rule)
             need("account", rule)
+    if account.max_total_margin_pct is not None:
+        need("orders", "max_total_margin_pct")
     if account.max_risk_pct is not None:
         need("account", "max_risk_pct")
     if account.max_daily_loss_pct is not None:
@@ -455,7 +480,7 @@ def _reads(account: AccountConfig) -> dict[str, list[tuple[str, str]]]:
     if _active(account.max_day_loss_pct, account.max_day_loss_mode):
         need("today", "max_day_loss_pct", account.max_day_loss_mode)
     if _active(account.max_total_notional_x, account.max_total_notional_mode):
-        need("notional", "max_total_notional_x", account.max_total_notional_mode)
+        need("orders", "max_total_notional_x", account.max_total_notional_mode)
         need("account", "max_total_notional_x", account.max_total_notional_mode)
     return reads
 
@@ -547,7 +572,8 @@ def _account_guardrails(account: AccountConfig, margin: Decimal, risk: RiskState
     order rate, today's loss and the total notional."""
     checks: list[Check] = []
     if account.max_total_margin_pct is not None:
-        checks.append(total_margin(risk.margin_used, margin, risk.account_value, account.max_total_margin_pct, what))
+        checks.append(total_margin(risk.margin_used, risk.pending_margin, margin, risk.account_value,
+                                   account.max_total_margin_pct, what))
     if account.max_daily_loss_pct is not None:
         checks.append(daily_loss(risk.day_loss, risk.day_capital, account.max_daily_loss_pct))
     if account.max_orders_per_hour is not None:

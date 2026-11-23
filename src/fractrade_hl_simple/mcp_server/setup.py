@@ -39,7 +39,7 @@ max_slippage = 0.01                             # market orders and closes: at m
 # Risk guardrails, in % of the account value. Each is optional: delete a line to switch it
 # off, but keep one of max_margin_pct, max_total_margin_pct and max_order_usd.
 max_margin_pct = 5                              # one new order: its margin at most 5 % of the account
-max_total_margin_pct = 30                       # margin in use with the new order: at most 30 %
+max_total_margin_pct = 30                       # positions, pending entries and new orders: at most 30 % as margin
 max_daily_loss_pct = 10                         # down 10 % over 24 hours: no new risk until it recovers
 max_orders_per_hour = 30                        # orders that add risk, per hour
 # max_order_usd = 1000                          # the value of one order, at most (USD)

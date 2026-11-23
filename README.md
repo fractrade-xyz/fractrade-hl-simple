@@ -10,32 +10,43 @@ It includes **`fractrade-hl-mcp`, an MCP server** for Claude Code and Claude Des
 
 Python 3.12 or newer.
 
-**0.4.0rc1**, the release candidate of 0.4.0, with the MCP server and the fixes in the
-[changelog](CHANGELOG.md), is installed from GitHub until 0.4.0 is on PyPI. The tag pins the
-version, so you get exactly this one:
+**0.4.0** includes the library fixes and MCP improvements in the [changelog](CHANGELOG.md).
+Install the pinned release from PyPI:
 
 ```bash
-pip install "fractrade-hl-simple @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
+# Python library (inside your virtual environment):
+pip install "fractrade-hl-simple==0.4.0"
 
+# MCP server in an isolated environment:
+pipx install "fractrade-hl-simple[mcp]==0.4.0"
+```
+
+To install the connector with pip instead, use `pip install "fractrade-hl-simple[mcp]==0.4.0"`.
+For an existing pipx installation, repeat its install command with `--force`. Restart/reconnect the MCP
+server after updating so the running process uses the new version.
+
+Other package managers:
+
+```bash
 # with uv
-uv add "fractrade-hl-simple @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
+uv add "fractrade-hl-simple==0.4.0"
 
 # with poetry
-poetry add "git+https://github.com/fractrade-xyz/fractrade-hl-simple.git#v0.4.0rc1"
+poetry add "fractrade-hl-simple==0.4.0"
+```
+
+To install a downloaded or locally built wheel, use its path instead:
+
+```bash
+pip install "/path/to/fractrade_hl_simple-0.4.0-py3-none-any.whl"
+pipx install "/path/to/fractrade_hl_simple-0.4.0-py3-none-any.whl[mcp]"
 ```
 
 Coming from 0.3, read "Behaviour changes to check in your code" in the [changelog](CHANGELOG.md)
 first: several calls return or raise something else now.
 
-**0.3.4**, the release on PyPI, without the MCP server:
-
-```bash
-pip install fractrade-hl-simple        # or: poetry add fractrade-hl-simple
-```
-
-Once 0.4.0 is on PyPI, `pip install --upgrade fractrade-hl-simple` (or `poetry update
-fractrade-hl-simple`) installs it and the GitHub lines are no longer needed. A later release
-candidate is installed the same way, with its tag.
+For later published releases, use `pip install --upgrade fractrade-hl-simple` or
+`pipx upgrade fractrade-hl-simple`, then restart/reconnect the MCP server if used.
 
 ## Setup
 
@@ -849,23 +860,28 @@ it also trades perps, within limits you set per account.
 
 **New to this? Follow the step-by-step guide: [docs/mcp-setup.md](https://github.com/fractrade-xyz/fractrade-hl-simple/blob/main/docs/mcp-setup.md).**
 
+Install the MCP extra as described in [Installation](#installation--updates):
+
 ```bash
-pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
+pipx install "fractrade-hl-simple[mcp]==0.4.0"
 fractrade-hl-mcp --init                                          # create your config file
 claude mcp add --scope user hyperliquid -- fractrade-hl-mcp     # Claude Code
 ```
 
-The server is new in 0.4.0, so until that is on PyPI it is installed from the release
-candidate's tag on GitHub ([Installation](#installation--updates)); afterwards with
-`pipx install "fractrade-hl-simple[mcp]"`. `hyperliquid` is the name your assistant knows it
+`hyperliquid` is the name your assistant knows it
 by: any name works, as long as it differs from your other servers' (fractrade's market data
 server is connected as `fractrade`).
 
 Configuration (example: [examples/mcp.example.toml](https://github.com/fractrade-xyz/fractrade-hl-simple/blob/main/examples/mcp.example.toml)), the tools, trading and its limits, errors and security: [docs/mcp.md](https://github.com/fractrade-xyz/fractrade-hl-simple/blob/main/docs/mcp.md).
 
+For research with Fractrade followed by account checks, planning, execution and recovery,
+follow the [two-connector trading workflow](docs/agentic-trading.md). It explains which
+server to ask, how to handle partial fills and how to verify actual stop coverage.
+
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+See [CONTRIBUTING.md](CONTRIBUTING.md) for development setup, the explicit offline test
+selection, separately authorized live checks, linting, type checks and package builds.
 
 ## License
 

@@ -2,6 +2,7 @@
 
 import json
 from decimal import Decimal
+from types import SimpleNamespace
 
 import pytest
 
@@ -111,6 +112,28 @@ def test_market_tools_read_mainnet_unless_told_otherwise(tool, arguments):
     assert body["base_url"] == TESTNET and list(clients) == [TESTNET]
     # A local node answers over plain HTTP, so any local user could: only through the config.
     is_error, body, clients = run_tool(tool, {**arguments, "base_url": "http://localhost:3001"})
+    assert is_error and body["error"]["code"] == "INVALID_ARGUMENT" and clients == {}
+
+
+@pytest.mark.parametrize("base_url,dexes", [(MAINNET, ("xyz",)), (TESTNET, ())])
+def test_metadata_refresh_is_available_without_keys_and_uses_the_selected_network(base_url, dexes):
+    made = []
+
+    def factory(url, account, slippage, perp_dexs, *, cache_market_specs=True):
+        made.append((url, account, perp_dexs, cache_market_specs))
+        return SimpleNamespace(market_specs={"BTC": {}, "ETH": {}})
+
+    arguments = {} if base_url == MAINNET else {"base_url": base_url}
+    is_error, body, _ = run_tool("refresh_market_specs", arguments, make_client=factory)
+    assert not is_error and body["base_url"] == base_url
+    assert body["dexes_read"] == ["default", *dexes] and body["perp_markets"] == 2
+    assert body["trading_clients"] == [] and body["observed_at"].endswith("Z")
+    assert made == [(base_url, None, dexes, False)]
+
+
+@pytest.mark.parametrize("arguments", [{"base_url": "http://localhost:3001"}, {"account": "main"}, {"dexes": ["io"]}])
+def test_metadata_refresh_rejects_arguments_before_creating_clients(arguments):
+    is_error, body, clients = run_tool("refresh_market_specs", arguments)
     assert is_error and body["error"]["code"] == "INVALID_ARGUMENT" and clients == {}
 
 
@@ -315,8 +338,9 @@ class TestEnablePerpDexs:
 
     def test_it_changes_what_is_read_not_anything_on_hyperliquid(self):
         tools, _, _ = self.run()
-        hints = tools["enable_perp_dexs"].annotations
-        assert (hints.read_only_hint, hints.destructive_hint, hints.idempotent_hint) == (False, False, True)
+        for name in ("enable_perp_dexs", "refresh_market_specs"):
+            hints = tools[name].annotations
+            assert (hints.read_only_hint, hints.destructive_hint, hints.idempotent_hint) == (False, False, True)
 
     def test_a_dex_the_network_does_not_have_is_refused_naming_the_dexes_it_has(self):
         # The library's message points to its get_perp_dexs(), which the agent cannot call.

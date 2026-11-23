@@ -13,6 +13,9 @@ private key and has no tool that trades. With the switch and an account with
 **This page is the reference, for looking things up. To set the server up, follow the
 [step-by-step guide](mcp-setup.md).**
 
+For using Fractrade market intelligence and this connector together, follow the
+[two-connector workflow](agentic-trading.md): research, plan, submit once and verify protection.
+
 The server runs on your computer, over stdio; nothing is hosted.
 
 ## Contents
@@ -27,26 +30,24 @@ The server runs on your computer, over stdio; nothing is hosted.
 
 ## Install
 
-Python 3.12 or newer. The server is an optional extra of the library (a plain
-`pip install fractrade-hl-simple` stays without it) and new in 0.4.0. Until 0.4.0 is on PyPI,
-install the release candidate from its tag on GitHub; the [setup guide](mcp-setup.md#2-install)
-explains pipx:
+Python 3.12 or newer. The server is an optional extra of the library; install
+**0.4.0** with `[mcp]`. The
+[setup guide](mcp-setup.md#2-install) explains pipx:
 
 ```bash
-pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
+pipx install "fractrade-hl-simple[mcp]==0.4.0"
 ```
 
-Or from a checkout of the repository, at the same tag:
+Inside an existing Python virtual environment, use pip instead:
 
 ```bash
-git clone https://github.com/fractrade-xyz/fractrade-hl-simple.git
-cd fractrade-hl-simple
-git checkout v0.4.0rc1
-pipx install ".[mcp]"          # or in a virtual environment: pip install -e ".[mcp]"
+pip install "fractrade-hl-simple[mcp]==0.4.0"
 ```
 
-Once 0.4.0 is on PyPI: `pipx install "fractrade-hl-simple[mcp]"`. Each of these adds the
-`fractrade-hl-mcp` command (also `python -m fractrade_hl_simple.mcp_server`).
+Each adds the `fractrade-hl-mcp` command (also `python -m fractrade_hl_simple.mcp_server`).
+For an existing pipx installation, add `--force` to the install command.
+Restart/reconnect the server after updating. See the
+[README](../README.md#installation--updates) for library-only installation, local wheels and updates.
 
 ## Connect a client
 
@@ -55,7 +56,8 @@ for each client; the client starts the server itself. For a config file somewher
 `--config /path/to/mcp.toml` to the command.
 
 **Approvals.** The read tools are marked read-only for the client: you can let it run them
-without asking (not `enable_perp_dexs`, which changes what the server reads and trades).
+without asking. `enable_perp_dexs` and `refresh_market_specs` are marked as local-state
+mutations: one changes the dex scope, the other reloads metadata; neither sends a signed action.
 Keep the client's approval prompt for the trade tools, so you confirm every order before it
 is sent. Without it, the agent trades within the account's limits on its own.
 
@@ -142,9 +144,47 @@ one. The market tools take only `base_url`. Trade tools
 [choose their account differently](#which-account-a-trade-acts-on). Reading needs no key:
 a wallet you only watch can never be traded through the server.
 
-Reads cover the HIP-3 dexes of every configured account on that network. A trade and its
-limits cover the dexes of the account that trades. Both include the dexes enabled with
-`enable_perp_dexs`. So a read can show a position that the account's limits do not count.
+Most account reads cover the HIP-3 dexes of every configured account on that network. A
+trade, its limits and `plan_trade` cover the dexes of the selected account. Both include
+the dexes enabled with `enable_perp_dexs`. So an account report can show a position that
+the account's trading limits do not count.
+
+### Observation time and read scope
+
+`get_account`, `get_positions`, `get_open_orders`, `get_position_risk`, `get_account_risk`,
+`plan_trade` and `get_changes` include top-level observation metadata alongside the existing
+account/address/network envelope and result fields:
+
+| Field | Meaning |
+|---|---|
+| `observed_at` | UTC time when the connector finished the report's reads |
+| `scope.perp_dexs` | Perp account context actually read: `""` means native Hyperliquid perps, other names identify HIP-3 dexes |
+| `scope.symbol` | The result's symbol filter, or null for no symbol filter |
+| `scope.market` | On `get_open_orders`, `perp` or `spot`; spot-only results have `perp_dexs: []` |
+| `scope.history_all_perp_dexs` | On `get_changes`, true: fill/order history is queried across all perp dexes, independently of the current position/protection context, still subject to the symbol filter |
+
+Scope comes from the client that performed the reads. If another call enables a dex
+while this call is running, the earlier response retains its earlier scope. `plan_trade`
+reports its narrower account client; ordinary account reports can include the union of
+configured readers. The existing `data.execution.observed_at` and `perp_dexs` preview
+fields remain available.
+
+`get_open_orders` with a symbol reads only that symbol's dex. `get_positions` and
+`get_position_risk` still read the broader account context, then select the symbol; their
+scope reports that context and the filter separately. Perp scope does not describe every
+auxiliary source, such as collateral balances, wallet fee rates or portfolio history.
+`get_account.data.sources` continues to explain account-value calculations and exclusions.
+
+The timestamp is the completion of several separate reads, not an atomic exchange
+snapshot or a guarantee about the exchange's data freshness. Fill/order/candle timestamps
+and history cursors retain their own meanings. Unknown figures remain null, warnings and
+history gaps remain visible, and failed reads keep their existing errors. An empty list
+means nothing matched **within the reported scope and filter**, not that the account has
+no exposure anywhere. No extra requests or automatic refresh are introduced.
+
+When `get_changes` has an empty interval and skips the underlying reads, `observed_at`
+and `scope` are null. Its empty result is not a fresh account snapshot; use its unchanged
+cursor on a later call.
 
 ## Tools
 
@@ -152,6 +192,7 @@ limits cover the dexes of the account that trades. Both include the dexes enable
 |---|---|
 | `list_accounts` | the configured accounts, their limits and dexes; `mode` is `watch` (read only) or `trade` |
 | [`enable_perp_dexs`](#enable_perp_dexs) | nothing: it enables HIP-3 dexes until the server restarts |
+| [`refresh_market_specs`](#refresh_market_specs) | fresh market metadata for this server's reader and existing trading clients |
 | [`get_account`](#balances-and-account-modes) | a wallet's balances by its account mode, with its positions |
 | `get_positions` | open perp positions on the dexes read |
 | [`get_open_orders`](#get_open_orders) | open orders, stop losses and take profits included |
@@ -178,14 +219,35 @@ From then on they are read, and every account of that network that can trade tra
 within its limits. So `perp_dexs` does not limit what is traded: to keep an account to
 certain markets, set `symbols`. To keep a dex, add it to `perp_dexs` in the config.
 
+### `refresh_market_specs`
+
+Reloads market metadata and SDK symbol tables for `base_url` (mainnet by default), bypassing
+the metadata cache. Use it when a newly listed market appears in `list_markets` but an order
+reports `UNKNOWN_SYMBOL`. Check the exact symbol and network first, then refresh and retry
+the order that was refused before submission.
+
+The reader and all existing trading clients at that network are replaced together, only
+after every replacement is ready. A failed refresh keeps the previous clients usable;
+calls already running may finish with them. Trading clients created later use fresh metadata
+too. No signed action is sent, and the tool is available when trading is disabled.
+
+The response contains `base_url`, `observed_at` (UTC completion time), `dexes_read` (including
+`default`), `perp_markets` (count), and `trading_clients`: each refreshed account's name,
+`dexes_traded` and `perp_markets` count. An empty `trading_clients` means no trading client
+had been created at that network. Spot metadata is reloaded too; the counts describe perps.
+
+Refresh does not enable a dex, change limits, lift a halt, reset order counts or free used
+client order IDs. For another dex, use `enable_perp_dexs`. It affects this server process;
+another chat may need its own refresh.
+
 ### `get_open_orders`
 
 Open orders on every dex read, or with `market: "spot"` the spot orders. `type` is `limit`,
 `stop_loss`, `take_profit`, or `trigger_entry` for a trigger order without `reduce_only`, such
 as a [`place_trigger_entry`](#place_trigger_entry). The label says only that: one on the side
 that closes a position (a stop placed in the app without reduce-only) can still close or
-reverse it, and the stop replacement and the kill switch treat it as protection. Check its
-side and the position before canceling one.
+reverse it. Stop replacement treats it as protection, but the kill switch cancels it because
+it is not reduce-only. Check its side and the position before canceling one.
 
 **Filled or shrunk.** Hyperliquid shrinks a resting reduce-only order (a stop, a take profit
 limit) to the position when the position gets smaller, and reports only the size placed and
@@ -229,6 +291,43 @@ reported once. Without `since`, the interval starts where this server's last cal
   so it can hold more): call again with `cursor`.
 - `positions.now`, `protection.reduced` and `protection.coverage` are read during the call:
   they show now, not the end of the interval.
+- `observed_at` marks completion of those reads; `interval` and `cursor` remain history
+  boundaries. `scope.perp_dexs` describes current account context, while
+  `scope.history_all_perp_dexs` identifies the broader history source. With an empty
+  interval, no fresh snapshot is read and `observed_at`/`scope` are null.
+
+Each `protection.coverage` row keeps `size`, `stop_size`, `take_profit_size` and
+`unprotected_size`, and adds `warnings` (an empty list when none apply):
+
+| Warning code | Severity | Meaning |
+|---|---|---|
+| `STOP_COVERAGE_GAP` | `warning` | The counted stops cover less than the live position; `unprotected_size` gives the gap |
+| `STOP_SIZE_EXCEEDS_POSITION` | `info` | Remaining fixed-size stops total more than the position; review their quantities and allocation |
+| `TAKE_PROFIT_SIZE_EXCEEDS_POSITION` | `info` | Remaining fixed-size targets total more than the position; review their quantities and allocation |
+
+Each warning includes `symbol`, `position_size`, `order_size`, the relevant `order_ids`,
+a `message` and a review `hint`. Excess notices include `excess_size`; a gap includes
+`unprotected_size`. `order_size` is the total of the orders relevant to that warning:
+counted stops for a gap, fixed-size exits of that kind for an excess. An unprotected
+position with no counted stops has an empty `order_ids` list.
+
+For example, after reducing a position from 1 BTC to 0.6 BTC, fixed stops or targets
+still totaling 1 BTC produce a notice with `excess_size: "0.4"`. This can need review
+even when `unprotected_size` is zero. The report describes the observed mismatch; it
+does not assume a manual reduction caused it or that overlapping exits are a mistake.
+
+Multiple levels remain supported. A native zero-size whole-position TP/SL counts as
+covering the live position, but is excluded from fixed-size excess checks. A native
+TP/SL with its own positive remaining size stays fixed. Whole-position stops can coexist
+with partial exits without a false excess notice. Missing targets or targets covering
+only part of the position are valid and produce no shortfall warning. Coverage totals
+remain unclamped, so intentional overlaps can make them larger than the position.
+
+These checks compare quantities, not execution prices or strategy intent. Review the
+intended levels before using [`sync_protection`](#sync_protection) to resize supported
+exits; that tool leaves native position TP/SL and orders with attached children untouched.
+`get_changes` only reports: it places, resizes and cancels nothing, and these warnings add
+no network requests. Positions and orders are separate observations, not an atomic snapshot.
 
 **What it cannot see:** an event Hyperliquid records more than 5 seconds late; an order
 status change Hyperliquid did not keep (it lists at most 2000 recent orders, not a complete
@@ -298,23 +397,64 @@ margin is low below 10 % of the account value in a unified account; in a standar
 below 10 % of a dex's own value, for each dex with margin in use. The guardrails themselves
 act only on this server's trade calls.
 
+`margin` includes `pending_margin` (the remaining non-reduce-only perp entries),
+`total_margin` (`margin_used` + `pending_margin`), `max_total_margin_pct`, `margin_limit`
+and `remaining_margin_budget` (`margin_limit` - `total_margin`, negative when over the cap).
+Pending orders use the same calculation as submission: each market's current leverage,
+remaining size, and the conservative entry value; opposing entries are not netted.
+Reduce-only protection and spot orders add no pending margin. This requires one leverage
+read per pending market and mid prices for pending sells. An unavailable estimate is
+`null` with a warning, never zero. Without a configured cap, the limit and remaining budget
+are `null`; the used/pending total can still be estimated.
+
+The budget describes the configured policy, separately from `free_margin`, which reports
+exchange balances. It covers the dexes read by this report; submission uses the account's
+traded dexes. Orders are read before the account summary, so a fill between those reads can
+be counted twice rather than disappear from both. These figures are estimates from separate
+reads, not reserved capacity or a complete preview of a new order's submission checks.
+
 ### `plan_trade`
 
 What `get_position_risk` shows, for a trade before it is entered, and its size from a risk.
 It places nothing.
 Give exactly one of `size`, `risk_usd` (a loss in USD) and `risk_pct` (a loss in % of the
 account value); to size by risk, the stop losses' fractions add up to 1. With `entry_price`
-the entry is a limit order, without it a market order.
+the entry is a limit order, without it a market order. A limit defaults to `time_in_force:
+"Gtc"`; choose `"Ioc"` explicitly for an immediate limit entry with multiple stops/targets.
+`time_in_force` requires `entry_price`. Optional `slippage` sets the market-entry price
+tolerance, as in `open_position`; it defaults to the account's cap.
 
 With a risk, the size is one whose loss at the stops (the move, the entry and stop fees,
 the estimated slippage of both) is at most the risk, under today's book and fee rates. It
 is limited to what the visible book lets estimate; a warning then says so.
 
 The result adds the `notional`, and the `margin` at the leverage the account has on the
-market; its totals also deduct the entry fee, for the share the levels close. Place a
-market-entry plan with [`open_position`](#open_position), with the size it returns. A plan
-with `entry_price` needs a limit order, and its stop losses once that has filled:
-`open_position` enters at market, where the planned loss no longer holds.
+market; its totals also deduct the entry fee, for the share the levels close. IOC limit
+estimates use the limit price and taker fees for the requested size. They do not predict
+how much will fill: an IOC can fill partly or not at all, and protection uses the actual
+filled size. Stops/targets for immediate entries are checked against the current mid.
+
+`data.execution` previews [`open_position`](#open_position) using its preparation and guard
+calculations. Fixed sizes over a cap are reported, never silently reduced.
+
+| Field | Meaning |
+|---|---|
+| `arguments` | Numeric arguments for `open_position`, including the rounded size and protection prices; a planned `entry_price` becomes `limit_price` |
+| `prepared_entry` | Rounded size, signed limit price, time in force, and protection placed `after_fill` or `attached`; null if preparation failed |
+| `checks` | Local preparation, halt and configured guard results; failed `mode: "warn"` checks do not block |
+| `margin` | Used, pending, proposed and projected total margin, plus `max_total_margin_pct`; unknown figures are null |
+| `eligible` | `true`: local checks pass; `false`: a known blocker; `null`: eligibility is not established, including watch-only targets without a trading policy |
+| `trading_enabled` | Whether this server has execution enabled for the account; a server without signing keys can still preview configured policy |
+| `perp_dexs` | The account's traded dex scope, including `""` for native perps and session-enabled dexes; null for a public address |
+| `observed_at` | When the preview's reads finished, in UTC; these are separate reads, not an atomic snapshot |
+
+A preview reserves no funds, client order IDs or order-rate slots, writes no shared state,
+and checks neither signer authorization nor exchange acceptance. Submission checks again:
+account state, prices or a halt may change after the preview. For a supported plan, use
+`execution.arguments` with `open_position`, after reviewing the checks and the host's
+existing approval requirements. A Gtc plan with split levels still returns its estimates,
+but reports that entry/protection combination as ineligible; it is never changed to IOC
+or collapsed into a single level automatically.
 
 ## Trading
 
@@ -443,7 +583,7 @@ their own baselines (below).
 | Key | Refuses an order that adds risk when |
 |---|---|
 | `max_margin_pct` | its margin is above this % of the account value |
-| `max_total_margin_pct` | the margin in use plus its margin is above this % |
+| `max_total_margin_pct` | used position margin plus pending entry margin plus the proposed order's margin is above this % |
 | `max_daily_loss_pct` | the account lost this % or more over the last 24 hours, until it recovers |
 | `max_orders_per_hour` | this many orders that add risk went out in the last hour (one counts once it may have been sent, also when rejected or with an unknown outcome; not when it provably was not sent) |
 | `check_order_leverage` | the leverage the account has on the market, set anywhere (app, bots), is above `max_leverage` |
@@ -461,10 +601,22 @@ goes through, and the answer's `warnings` name the limit) or `block` (`GUARD_BLO
 | `max_day_loss_pct` | `max_day_loss_mode` | the account lost this % or more since the trading day started (`day_start` in the time zone `tz`) |
 | `max_total_notional_x` | `max_total_notional_mode` | the notional of the open positions, plus the open orders that add risk, plus this order (a batch: all of them) is more than this many times the account value |
 
-For the total notional, a `modify_order` replaces the old order's share, and an open order
-counts as a new one is valued: at its limit price, a trigger order at the higher of its
-trigger and limit price, a sell at the current mid when that is higher. The orders are read before the positions, so
-an order that fills in between counts twice, never not at all.
+For total margin and total notional, a `modify_order` replaces the old order's share. Every
+non-reduce-only perp entry on the account's traded dexes counts, including orders placed
+in the app or by bots. Only its remaining size counts: at its limit price, a trigger order
+at the higher of its trigger and limit price, a sell at the current mid when that is higher.
+Opposing entries are added without netting; each can create exposure. Reduce-only orders,
+including attached protection, add none. The orders are read before the positions, so a
+fill between the reads can temporarily count twice rather than disappear from both.
+
+**Total-margin budget.** `max_total_margin_pct` checks:
+
+`used position margin + sum(remaining entry value / its market's leverage) + proposed margin`
+
+The proposed margin is summed across a batch. Equality with the cap is allowed. Required
+open orders, prices, leverage and account figures must be available; otherwise new risk
+is refused with `GUARD_BLOCKED`. The check explains the used, pending, proposed and
+projected margin, and the allowed amount. Reduce-only actions remain exempt.
 
 **When a limit cannot be checked** (a read that fails, a missing figure, an account value
 the account mode does not define: portfolio margin, unknown modes), one of these two warns
@@ -490,10 +642,10 @@ in a fast market.
 - `max_margin_pct` limits each order, not a position: orders that add to one position add
   up, and so can their loss. Without it, one order can use the whole of
   `max_total_margin_pct`.
-- `max_total_margin_pct` counts the margin of positions on the account's dexes, not of
-  open orders: several resting orders, each within it, can fill beyond it.
+- `max_total_margin_pct` is a submission-time estimate. Later price or leverage changes
+  can change margin needs; it does not continuously reserve funds or monitor the account.
 - `max_orders_per_hour` counts this config's servers, not the app or bots; and
-  `max_total_notional_x` cannot see orders placed elsewhere at the same moment.
+  the total-margin and total-notional checks cannot see orders placed elsewhere at the same moment.
 - `max_risk_pct` is checked at entry: moving or cancelling a stop later is not limited.
 
 ### Client order ids (`cloid`)
@@ -579,7 +731,7 @@ risk). `stop_losses` are required: up to 10 `{price, fraction}` whose fractions 
 1, so the whole entry is protected. `take_profits` are optional, the same way, adding up to
 at most 1.
 
-**With `limit_price`** the entry rests as a limit order, with one stop loss and at most one
+**With `limit_price` and `time_in_force: "Gtc"` (the default)** the entry rests as a limit order, with one stop loss and at most one
 take profit (fraction 1 each) attached, as Hyperliquid's own app attaches them: Hyperliquid
 places them once the entry has filled completely, or when the rest of a partly filled entry
 is canceled for lack of margin; until then they show in the entry's
@@ -589,7 +741,11 @@ the attached ones are then placed at once. The answer has the `entry` and the `a
 orders (kind, trigger price, size). `max_risk_pct` measures the loss from the limit price,
 with the taker fee.
 
-**At market** the entry can fill partly. Once it fills, each stop loss and take profit is placed for its
+**With `limit_price` and `time_in_force: "Ioc"`** the entry fills immediately up to that
+price cap and cancels the unfilled remainder. It supports multiple stops and targets,
+just like a market entry. It never waits on the book for a later fill.
+
+**At market or with an IOC limit** the entry can fill partly. Once it fills, each stop loss and take profit is placed for its
 share of the **filled** size
 ([how the shares are rounded](../README.md#open-position-with-tpsl)). They cover this
 entry only: a position you already had in the market needs its own stop.
@@ -600,7 +756,7 @@ already crossed it, the answer is `PROTECTION_NOT_PLACED`, with those levels in
 place them with `stop_loss` or `take_profit`, or close the position. A missing level with
 `outcome_unknown` may still arrive: look it up by its cloid first. `warnings` name a level
 not placed because its share of a small partial fill rounds to 0. On `OUTCOME_UNKNOWN`,
-check `get_positions`: a market entry that filled has no stop loss yet, while a limit entry
+check `get_positions`: an immediate entry may have filled without protection, while a Gtc limit entry
 may be placed with its stop loss and take profit attached (check `get_open_orders` and the
 entry's `children` before placing anything).
 
@@ -622,8 +778,7 @@ touch, not on a candle close. `size`, or `notional_usd` at the entry price.
 - **Limits** are checked now, as for an order that adds risk, at the most it can enter at:
   a long stop market at its trigger plus the 10 %, a short at the higher of its trigger and
   the mid, a stop limit at its limit. Nothing is checked again when it fires. The
-  [kill switch](#kill-switch) cancels it, unless it is on the side that closes a position the
-  account holds.
+  [kill switch](#kill-switch) cancels it regardless of the position's side.
 
 #### `modify_order`
 
@@ -727,12 +882,12 @@ bots, and servers whose config file is in another folder. Not tested on Windows.
 1. **Halts** the account at once, the moment the call arrives. A trade call already running
    finishes; every later one is refused with `KILL_SWITCH_ENGAGED`, except the
    [risk-reducing ones](#limits-guards).
-2. **Cancels the entries**: the account's open perp orders that would open or add to a
-   position (limit and trigger entries, not reduce-only and not on the side that closes the
-   position in their market). It waits for a trade call still running, so that call's
-   order is seen. Orders that are reduce-only or on the closing side at the position read
-   then stay: stop losses and take profits, except those attached to a canceled entry, which
-   go with it. If the orders cannot be read, nothing is
+2. **Cancels the entries**: every open perp order without `reduce_only` on the account's
+   traded dexes, including limit and trigger orders opposing a position. Those orders can
+   reverse a position, even if they would currently close it. No position read is required.
+   It waits for a trade call still running, so that call's order is seen. Reduce-only orders
+   stay, including stop losses and take profits, except those attached to a canceled entry,
+   which go with it. Spot orders are left alone. If the orders cannot be read, nothing is
    canceled; `entries` says what was canceled, what was no longer open and what was not
    canceled.
 3. **Reports**, per account, the positions and open orders still live, read after that. If
@@ -771,7 +926,7 @@ Compact JSON:
 A failed call returns an error result (`isError: true`) with:
 
 ```json
-{"error":{"code":"UNKNOWN_SYMBOL","message":"Unknown symbol 'NVDA'; did you mean 'xyz:NVDA'?","retryable":false,"hint":null,"details":{}}}
+{"error":{"code":"UNKNOWN_SYMBOL","message":"Unknown symbol 'NVDA'; did you mean 'xyz:NVDA'?","retryable":false,"hint":"check the exact symbol with list_markets; for a newly listed market, call refresh_market_specs with the same base_url. Refresh affects this server only and does not enable a dex; use enable_perp_dexs for that","details":{}}}
 ```
 
 Repeat an unchanged call automatically only when `retryable` is true; the library has
@@ -783,7 +938,8 @@ retryable) and the server's own. The ones to know here:
 
 | Code | When |
 |---|---|
-| `INVALID_ARGUMENT`, `UNKNOWN_SYMBOL`, `ACCOUNT_NOT_FOUND` | an argument is wrong, or names no market or no configured account (for a symbol, the message may suggest a market of that name on another dex) |
+| `INVALID_ARGUMENT`, `ACCOUNT_NOT_FOUND` | an argument is wrong or names no configured account |
+| `UNKNOWN_SYMBOL` | check the exact name and network with `list_markets`; for a new listing on an enabled dex, use `refresh_market_specs`. For a disabled dex use `enable_perp_dexs`; the message may suggest a matching market |
 | `AMBIGUOUS_ACCOUNT` | no `account` given and no default; for a trade tool, several trading accounts |
 | `TRADING_DISABLED` | a trade tool for a configured account that cannot trade |
 | `KILL_SWITCH_ENGAGED` | the account is halted; only risk-reducing calls run ([Kill switch](#kill-switch)) |
@@ -859,9 +1015,9 @@ For an error code, see [Errors](#errors); for no tools, no trade tools, the mess
 the setup and the debug log, the [setup guide](mcp-setup.md#8-when-something-does-not-work).
 
 - **`needs the mcp extra`:** install it again with the extra:
-  `pipx install --force "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"` (once 0.4.0 is on
-  PyPI: `pipx install --force "fractrade-hl-simple[mcp]"`), or without pipx the same with
-  `pip install` in the Python the command runs with.
+  `pipx install --force "fractrade-hl-simple[mcp]==0.4.0"`.
+  Without pipx, use `pip install` with the same wheel or version and extra in the Python
+  environment the command runs with. Restart/reconnect the server afterward.
 - **Signed actions are refused, or `get_changes` skips events:** the computer's clock must
   be right (synchronized, as by NTP): a signed action carries the time as its nonce, and
   `get_changes` ends its interval at the local time minus 5 seconds.

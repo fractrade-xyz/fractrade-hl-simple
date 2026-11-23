@@ -557,3 +557,89 @@ def test_every_tool_refuses_unknown_parameters():
     conf = parse_config(CONFIG, "test.toml")
     for spec in read_tools(conf, AccountRegistry(conf, {}, lambda *a: None)):
         assert spec.input_schema["additionalProperties"] is False, spec.name
+
+
+class TestObservationMetadata:
+    @pytest.mark.parametrize("name, arguments, given, dexes", [
+        ("get_account", {}, {"get_account_summary": summary(), "get_open_orders": []}, ["", "xyz"]),
+        ("get_positions", {}, {"get_positions": []}, ["", "xyz"]),
+        ("get_positions", {"symbol": "BTC"}, {"get_positions": []}, ["", "xyz"]),
+        ("get_open_orders", {}, {"get_open_orders": []}, ["", "xyz"]),
+        ("get_open_orders", {"symbol": "BTC"}, {"get_open_orders": []}, [""]),
+        ("get_open_orders", {"symbol": "xyz:NVDA"}, {"get_open_orders": []}, ["xyz"]),
+        ("get_open_orders", {"market": "spot"}, {"get_spot_open_orders": []}, []),
+        ("get_open_orders", {"market": "spot", "symbol": "HYPE"}, {"get_spot_open_orders": []}, []),
+    ])
+    def test_completion_time_and_scope_even_for_empty_results(self, monkeypatch, name, arguments, given, dexes):
+        from fractrade_hl_simple.mcp_server.tools import read
+        from fractrade_hl_simple.mcp_server.convert import iso
+        clock = [T0 / 1000]
+        original = FakeClient.__getattr__
+
+        def delayed(self, method):
+            call = original(self, method)
+
+            def finish(*args, **kwargs):
+                result = call(*args, **kwargs)
+                clock[0] += 2
+                return result
+            return finish
+
+        monkeypatch.setattr(FakeClient, "__getattr__", delayed)
+        monkeypatch.setattr(read.time, "time", lambda: clock[0])
+        error, body, clients = run_tool(name, arguments, given)
+        assert not error, body
+        assert body["observed_at"] == iso(int(clock[0] * 1000)) != iso(T0)
+        assert body["scope"]["perp_dexs"] == dexes
+        assert body["scope"]["symbol"] == arguments.get("symbol")
+        if name == "get_open_orders":
+            assert body["scope"]["market"] == arguments.get("market", "perp")
+        assert len(clients[MAINNET].calls) == len(given)  # metadata adds no requests
+
+    def test_exchange_order_time_stays_distinct_from_observation_time(self):
+        from fractrade_hl_simple.mcp_server.convert import iso
+        error, body, _ = run_tool("get_open_orders", {}, {"get_open_orders": [order(7)]})
+        assert not error, body
+        assert body["data"][0]["created_at"] == iso(T0)
+        assert body["observed_at"] != body["data"][0]["created_at"]
+
+    def test_unknown_account_figures_keep_their_sources_and_null_values(self):
+        value = summary("portfolio_margin")
+        value.account_value = value.margin_used = value.available_to_trade = None
+        value.sources = {"account_value": "not established for portfolio margin"}
+        error, body, _ = run_tool("get_account", {}, {"get_account_summary": value, "get_open_orders": []})
+        assert not error and body["observed_at"]
+        assert body["data"]["account_value"] is body["data"]["margin_used"] is None
+        assert body["data"]["sources"] == value.sources
+
+    def test_a_failed_read_remains_an_error_without_a_successful_observation(self):
+        error, body, _ = run_tool("get_positions", {}, {"get_positions": NetworkException("offline")})
+        assert error and body["error"]["code"] == "NETWORK_ERROR"
+        assert "scope" not in body and "observed_at" not in body
+
+    def test_inflight_response_keeps_its_client_scope_and_the_next_call_uses_the_new_scope(self):
+        conf = parse_config(CONFIG, "test.toml")
+        clients = []
+
+        def factory(base_url, account, default_slippage, perp_dexs):
+            assert account is None
+            client = FakeClient({"get_positions": []})
+            client.perp_dexs = ["", *perp_dexs]
+            clients.append(client)
+            return client
+
+        registry = AccountRegistry(conf, {}, factory)
+        target = registry.resolve_read()
+        old = registry.read_client(target)
+
+        def read_and_enable(*args, **kwargs):
+            registry.enable_perp_dexs(MAINNET, ["xyz"])
+            return []
+
+        old.get_positions = read_and_enable
+        tool = next(t for t in read_tools(conf, registry) if t.name == "get_positions")
+        first = tool.run({})
+        second = tool.run({})
+        assert first["scope"]["perp_dexs"] == [""]
+        assert second["scope"]["perp_dexs"] == ["", "xyz"]
+        assert len(clients) == 2 and registry._traders == {}

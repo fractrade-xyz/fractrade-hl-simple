@@ -128,40 +128,19 @@ def open_position(
     return _open_with_levels(client, symbol, size, is_long, legs, limit_price, slippage, time_in_force)
 
 
-def _open_with_levels(
-    client: HyperliquidClient,
-    symbol: str,
-    size: float,
-    is_long: bool,
-    legs: List[Level],
-    limit_price: Optional[float],
-    slippage: Optional[float],
-    time_in_force: Optional[TimeInForce] = None,
-) -> Dict[str, Order]:
-    """Body of open_position. `legs`: (name, kind, price, fraction) per stop loss and
-    take profit."""
-    # Everything is checked before anything is placed, at the prices that will be sent:
-    # the stop loss and take profit against the mid price when the entry executes at once
-    # (market, or a limit with Ioc; its own limit includes the slippage allowance, which is
-    # no price it fills at), against its limit price when it rests. A resting entry takes one
-    # stop loss and one take profit, attached to it for its whole size: Hyperliquid places
-    # them once it fills (its normalTpsl grouping, as the SDK's example sends it).
-    resting = limit_price is not None and time_in_force != "Ioc"
+def prepare_levels(client: HyperliquidClient, symbol: str, size: float, is_long: bool,
+                   legs: List[Level], reference: float, resting: bool) -> Tuple[List[Level], List[Decimal]]:
+    """Validate and round protection before an entry: shared by execution and MCP preview.
+
+    Immediate entries use the mid as reference; resting entries use their limit. This
+    prepares no client ids and sends no orders.
+    """
     if resting and legs:
         kinds = [kind for _, kind, _, _ in legs]
         if len(set(kinds)) != len(kinds) or any(fraction != 1 for _, _, _, fraction in legs):
             raise InvalidArgumentException(
                 "a resting limit entry takes one stop loss and one take profit, each for its whole size "
                 "(stop_loss_price, take_profit_price); several levels need an entry that executes at once")
-    entry_price: float
-    if limit_price is not None and resting:
-        entry_price = limit_price
-        time_in_force = time_in_force or "Gtc"
-        reference = limit_price
-    else:
-        reference = client._mid_price(symbol)
-        entry_price = limit_price if limit_price is not None else client._with_slippage(reference, is_long, slippage)
-        time_in_force = "Ioc"
     entry_px = client._format_price(symbol, reference)
     decimals = client.market_specs[symbol].get("size_decimals", 0)
     # The levels at their prices as sent (rounding can make two equal: the remainder then
@@ -186,6 +165,40 @@ def _open_with_levels(
                 f"{label} would be {_inputs.plain(leg_size)} at {_inputs.plain(px)}, worth less than Hyperliquid's "
                 f"minimum order of "
                 f"{_inputs.MIN_ORDER_USD} USD")
+
+    return sent, planned
+
+
+def _open_with_levels(
+    client: HyperliquidClient,
+    symbol: str,
+    size: float,
+    is_long: bool,
+    legs: List[Level],
+    limit_price: Optional[float],
+    slippage: Optional[float],
+    time_in_force: Optional[TimeInForce] = None,
+) -> Dict[str, Order]:
+    """Body of open_position. `legs`: (name, kind, price, fraction) per stop loss and
+    take profit."""
+    # Everything is checked before anything is placed, at the prices that will be sent:
+    # the stop loss and take profit against the mid price when the entry executes at once
+    # (market, or a limit with Ioc; its own limit includes the slippage allowance, which is
+    # no price it fills at), against its limit price when it rests. A resting entry takes one
+    # stop loss and one take profit, attached to it for its whole size: Hyperliquid places
+    # them once it fills (its normalTpsl grouping, as the SDK's example sends it).
+    resting = limit_price is not None and time_in_force != "Ioc"
+    entry_price: float
+    if limit_price is not None and resting:
+        entry_price = limit_price
+        time_in_force = time_in_force or "Gtc"
+        reference = limit_price
+    else:
+        reference = client._mid_price(symbol)
+        entry_price = limit_price if limit_price is not None else client._with_slippage(reference, is_long, slippage)
+        time_in_force = "Ioc"
+    sent, planned = prepare_levels(client, symbol, size, is_long, legs, reference, resting)
+    decimals = client.market_specs[symbol].get("size_decimals", 0)
 
     if resting and legs:
         return _with_attached(client, symbol, is_long, size, entry_price, time_in_force, sent)

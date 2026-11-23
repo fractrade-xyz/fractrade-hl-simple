@@ -16,7 +16,7 @@ key_file = "~/.config/fractrade-hl/keys/main"            # its API wallet's key 
 trading = true
 max_leverage = 5                   # the highest leverage set_leverage may set
 max_margin_pct = 5                 # optional: one order's margin (value / leverage), at most 5 % of the account
-max_total_margin_pct = 30          # optional: the margin of the positions with the new order, at most 30 %
+max_total_margin_pct = 30          # optional: positions, pending entries and new orders, at most 30 % as margin
 max_daily_loss_pct = 10            # optional: lost 10 % over 24 hours, then no new risk until it recovers
 # Limits with a mode: off, warn (default: the order goes through with a warning) or block.
 # max_day_loss_pct = 4             # lost 4 % since the trading day started (day_start in tz)

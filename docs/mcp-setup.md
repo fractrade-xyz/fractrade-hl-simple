@@ -15,6 +15,8 @@ paste it into a file. **Never paste a private key into the chat**: this guide ne
 one there.
 
 The full reference, with every tool and setting, is [mcp.md](mcp.md).
+Once connected, follow the [two-connector workflow](agentic-trading.md) to combine Fractrade
+research with account checks, planning and execution.
 
 **Contents**
 
@@ -43,6 +45,9 @@ on Windows *PowerShell*, on Linux your usual one.
 
 ## 2. Install
 
+Install **0.4.0** from PyPI. The [README](../README.md#installation--updates) also covers
+library installation and local wheels. Restart/reconnect the server after an update.
+
 Install it with [pipx](https://pipx.pypa.io/), which keeps it apart from your system's
 Python (many Linux and macOS Pythons refuse a plain `pip install`) and puts the command on
 your `PATH`:
@@ -53,23 +58,19 @@ your `PATH`:
    - elsewhere: `python3 -m pip install --user pipx`, then `python3 -m pipx ensurepath`
 
    Then open a new terminal (or restart the assistant), so the `PATH` change applies.
-2. **Install the server.** It is new in 0.4.0; until that is on PyPI, install its release
-   candidate from the tag on GitHub, which pins the version:
+2. **Install the server** with the MCP extra:
 
    ```bash
-   pipx install "fractrade-hl-simple[mcp] @ git+https://github.com/fractrade-xyz/fractrade-hl-simple.git@v0.4.0rc1"
+   pipx install "fractrade-hl-simple[mcp]==0.4.0"
    ```
-
-   Once 0.4.0 is on PyPI: `pipx install "fractrade-hl-simple[mcp]"`.
 
 3. **Check it:** `fractrade-hl-mcp --help`. Claude Desktop needs the
    command's full path: `which fractrade-hl-mcp` prints it (with pipx usually
    `~/.local/bin/fractrade-hl-mcp`).
 
-To update later, run the same `pipx install` command with `--force` and the new tag (a
-later release candidate, such as `@v0.4.0rc2`); once 0.4.0 is on PyPI,
-`pipx install --force "fractrade-hl-simple[mcp]"` and after that `pipx upgrade
-fractrade-hl-simple`.
+For an existing pipx installation, repeat the chosen install command with `--force`.
+For later published versions, use `pipx upgrade fractrade-hl-simple`.
+Restart/reconnect the MCP server after installing an update.
 
 ## 3. Create your config file
 
@@ -186,7 +187,7 @@ wallet only for the MCP server, not for bots or other apps.
 max_leverage = 10           # the highest leverage the assistant may set
 max_slippage = 0.01         # market orders and closes: at most 1 % from the mid, before rounding
 max_margin_pct = 5          # one new order: at most 5 % of your account as margin
-max_total_margin_pct = 30   # your positions plus the new order: at most 30 % as margin
+max_total_margin_pct = 30   # positions, pending entries and new orders: at most 30 % as margin
 max_daily_loss_pct = 10     # lost 10 % in 24 hours: no new trades until it recovers
 max_orders_per_hour = 30    # at most 30 orders that add risk per hour
 # max_order_usd = 1000      # optional: the value of one order, at most, in USD
@@ -205,11 +206,17 @@ account backs every position, so a position can lose more than its margin. A sto
 limits a loss; with `isolated_only` (isolated margin), a position can lose at most its
 margin ([more](mcp.md#risk-guardrails)).
 
+The total-margin limit includes pending entries. For example, with a $1000 account and
+`max_total_margin_pct = 3`, the budget is $30. A resting $100 order at 5x uses $20 of that
+budget; another $100 order at 5x is refused because together they need $40. A batch is
+checked together too. Only the unfilled part of an entry counts as pending, and reduce-only
+stops and targets add no entry margin. Modifying an order replaces its previous contribution.
+
 Each guardrail is optional: delete a line to switch it off, but keep one of
 `max_margin_pct`, `max_total_margin_pct` and `max_order_usd`. Start small. The limits never
 block cancelling an order or setting a stop loss, and a close is held only to
-`max_slippage`. Open orders are not part of `max_total_margin_pct`, and a market stop loss
-or take profit executes with Hyperliquid's own 10 % tolerance, not `max_slippage`
+`max_slippage`. A market stop loss or take profit executes with Hyperliquid's own 10 %
+tolerance, not `max_slippage`
 ([what the limits do not cover](mcp.md#risk-guardrails)).
 
 ### 6.3 Check everything
@@ -249,8 +256,9 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
 - **Keep the approval prompt for trade tools.** Your assistant then asks you before each
   order.
 - **Emergency stop:** ask "use the kill switch". It halts trading at once, in every chat,
-  and cancels the orders that would open or add to a position (stop losses and take
-  profits stay); closing positions and cancelling orders still work. Opening a new chat does not lift it:
+  and cancels every perp order without `reduce_only`, including orders opposing a position.
+  Reduce-only protection stays, except protection attached to a canceled entry; closing
+  positions and cancelling orders still work. Opening a new chat does not lift it:
   quit the assistant and start it again. If the
   answer is an error saying an account is halted in this chat only, quit the other chats
   too.
@@ -285,6 +293,7 @@ it is not, and `chmod 600 ~/.config/fractrade-hl/keys/bot` fixes it.
 | `Hyperliquid does not know it` | The API wallet is not authorized yet, or it expired: authorize it, or create a new one (step 6.1). |
 | `is an API wallet of another account` | The address in `mcp.toml` is not the account that authorized this API wallet. |
 | No trade tools | Start the server with `--enable-trading` (step 6.4) and restart the assistant. |
+| A newly listed market is visible but an order says `UNKNOWN_SYMBOL` | Check the exact symbol and network, then call `refresh_market_specs` with that `base_url` (default mainnet). It updates this chat's server without changing your limits or halt. It does not enable another dex: use `enable_perp_dexs` for that. |
 | `GUARD_BLOCKED` | The order is over one of your limits; the message says which. If it says a limit could not read the account, try again when the answer says `retryable: true`. |
 | `the market uses cross margin` | `isolated_only` is on: ask the assistant to set the market to isolated margin (`set_leverage` with `is_cross` false), or delete `isolated_only`. |
 | `the market's leverage … is above max_leverage` | `check_order_leverage` is on: ask the assistant to lower the market's leverage (`set_leverage`), or raise `max_leverage`. |

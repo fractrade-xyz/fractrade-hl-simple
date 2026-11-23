@@ -11,6 +11,7 @@ Trading behaviour is the library's: a tool never re-implements it.
 from __future__ import annotations
 
 import logging
+import time
 from functools import partial
 from collections.abc import Callable, Mapping
 from dataclasses import replace
@@ -20,6 +21,8 @@ from typing import Any, Optional
 from hyperliquid.utils.types import Cloid
 
 from ... import _answers
+from ..._inputs import MIN_ORDER_USD
+from ..._protection import prepare_levels, protection_legs
 from ...exceptions import (
     ActionOutcomeUnknownException, ActionRejectedException, AuthenticationRequiredException, HyperliquidException,
     InvalidArgumentException, OrdersNotCanceledException, PositionNotFoundException, UnknownSymbolException,
@@ -534,31 +537,117 @@ def _levels(what: str, adds_up: str, of: str = "the filled size", price: Optiona
         "description": f"The {what}s, each closing a share of {of}; the shares add up to {adds_up}."}
 
 
+ENTRY_TIF = {"type": "string", "enum": ["Gtc", "Ioc"],
+             "description": "With a limit price only. Gtc (default) rests with one full-size stop and at most "
+                            "one full-size target attached. Ioc fills immediately up to the price cap and "
+                            "cancels the remainder; supports multiple stops and targets for the filled size."}
+
+
+def _prepare_open_position(client: Any, target: Target, arguments: dict[str, Any]) -> tuple[float, float, str]:
+    """The same rounded entry and protection validation for preview and submission. No writes."""
+    symbol, is_long = arguments["symbol"], arguments["side"] == "long"
+    limit, tif = arguments.get("limit_price"), arguments.get("time_in_force")
+    if tif is not None and limit is None:
+        raise InvalidArgumentException("time_in_force requires limit_price (entry_price in plan_trade)")
+    tif = tif or ("Ioc" if limit is None else "Gtc")
+    stops, profits = arguments["stop_losses"], arguments.get("take_profits", [])
+    if sum((convert.decimal(level["fraction"]) for level in stops), Decimal(0)) != 1:
+        raise ToolError("INVALID_ARGUMENT", "stop_losses: the fractions must add up to 1, so the whole position "
+                                            "is protected", hint="for a position without a full stop, use buy or sell")
+    legs = protection_legs("stop_loss", None, [(v["price"], v["fraction"]) for v in stops])
+    legs += protection_legs("take_profit", None, [(v["price"], v["fraction"]) for v in profits] or None)
+    slippage = arguments.get("slippage")
+    if slippage is None and target.account is not None:
+        slippage = float(target.account.max_slippage)
+    size, price = client.prepare_order(symbol, arguments["size"], is_long, limit, slippage)
+    if convert.decimal(size) * convert.decimal(price) < MIN_ORDER_USD:
+        raise InvalidArgumentException(f"the entry is worth less than Hyperliquid's minimum order of {MIN_ORDER_USD} USD")
+    prepare_levels(client, symbol, size, is_long, legs,
+                   price if tif != "Ioc" else client._mid_price(symbol), tif != "Ioc")
+    return size, price, tif
+
+
+def _open_position_checks(registry: AccountRegistry, client: Any, target: Target, arguments: dict[str, Any],
+                          size: float, price: float, *, preview: bool = False) -> tuple[guards.GuardReport, guards.RiskState]:
+    """Read and evaluate the submission guards; preview uses unsigned, explicitly addressed reads."""
+    symbol, is_long = arguments["symbol"], arguments["side"] == "long"
+    limit = arguments.get("limit_price")
+    state = _risk_states(registry, client, target, [(symbol, is_long)], preview=preview)[0]
+    if _config(target).max_risk_pct is not None:
+        state = replace(state, loss_at_stops=_before_sending_read("the loss at the stop losses", lambda: _loss_at_stops(
+            client, target, symbol, is_long, convert.decimal(size), arguments["stop_losses"],
+            None if limit is None else convert.decimal(price))))
+    return guards.check_order(_config(target), symbol, size, price, is_buy=is_long, reduce_only=False,
+                              market=limit is None, slippage_value=arguments.get("slippage"), risk=state), state
+
+
+def preview_open_position(registry: AccountRegistry, client: Any, target: Target,
+                          arguments: dict[str, Any]) -> dict[str, Any]:
+    """Local submission eligibility from current reads, never a reservation or a signer check."""
+    account = target.account
+    checks: list[guards.Check] = []
+    result: dict[str, Any] = {"eligible": None, "arguments": arguments, "prepared_entry": None,
+                              "trading_enabled": account is not None and registry.can_trade(account.name),
+                              "margin": None, "checks": [],
+                              "perp_dexs": ["", *registry.account_perp_dexs(account)] if account else None,
+                              "note": "Snapshot of local checks only; signer authorization and exchange acceptance "
+                                      "are not checked. Submission reads and checks again; this reserves nothing."}
+    try:
+        if account is not None:
+            require_enabled_dexes(registry.account_perp_dexs(account), [arguments["symbol"]])
+        size, price, tif = _prepare_open_position(client, target, arguments)
+        result["arguments"] = {**arguments, "size": size}
+        for kind in ("stop_losses", "take_profits"):
+            if kind in arguments:
+                result["arguments"][kind] = [
+                    {"price": client._format_price(arguments["symbol"], v["price"]), "fraction": v["fraction"]}
+                    for v in arguments[kind]]
+        if "limit_price" in arguments:
+            result["arguments"]["limit_price"] = price
+        result["prepared_entry"] = {"size": size, "limit_price": price, "time_in_force": tif,
+                                    "protection": "after_fill" if tif == "Ioc" else "attached"}
+        checks.append(guards.Check("entry_and_protection", True, "entry and protection meet local submission requirements"))
+        if account is not None and account.trading:
+            halted = _before_sending_read("the shared halt", lambda: registry.preview_halted(target))
+            checks.append(guards.Check("kill_switch", not halted,
+                                       "account is halted" if halted else "account is not halted"))
+            report, state = _open_position_checks(registry, client, target, arguments, size, price, preview=True)
+            checks.extend(report.checks)
+            value = convert.decimal(size) * guards.valued_price(price, arguments["side"] == "long", state.mid)
+            proposed = value / state.leverage.value if state.leverage is not None else Decimal("NaN")
+            used, pending = state.margin_used, state.pending_margin
+            total = used + pending + proposed if used is not None and pending is not None else None
+            result["margin"] = {key: value if value is not None and value.is_finite() else None
+                                for key, value in {"used": used, "pending": pending, "proposed": proposed,
+                                                   "total": total, "max_total_margin_pct": account.max_total_margin_pct}.items()}
+            result["eligible"] = all(c.passed or c.mode == "warn" for c in checks)
+        else:
+            result["note"] += " No configured trading policy applies to this watch-only target."
+    except HyperliquidException as error:
+        blocked = any(not c.passed and c.mode == "block" for c in checks)
+        checks.append(guards.Check(error.code or "preparation", False, str(error)))
+        result["error"] = error_body(error)["error"]
+        # An unavailable read leaves eligibility unestablished; a known rejection is false.
+        result["eligible"] = False if blocked or error.code in {"INVALID_ARGUMENT", "UNKNOWN_SYMBOL"} else None
+    result["checks"] = [c.as_dict() for c in checks]
+    result["observed_at"] = convert.iso(int(time.time() * 1000))
+    return result
+
+
 def _open_position(registry: AccountRegistry) -> ToolSpec:
     def act(client: Any, target: Target, arguments: dict[str, Any]) -> tuple[Any, str]:
         symbol, is_long = arguments["symbol"], arguments["side"] == "long"
         stops, profits = arguments["stop_losses"], arguments.get("take_profits", [])
-        if sum((convert.decimal(level["fraction"]) for level in stops), Decimal(0)) != 1:
-            raise ToolError("INVALID_ARGUMENT", "stop_losses: the fractions must add up to 1, so the whole position "
-                                                "is protected", hint="for a position without a full stop, use buy or sell")
-        slippage, limit = arguments.get("slippage"), arguments.get("limit_price")
-        # The entry as it will be signed: immediate or cancel at the mid plus or minus slippage,
-        # or with limit_price a limit order that rests.
-        size, price = client.prepare_order(symbol, arguments["size"], is_long, limit, slippage)
-        risk = _risk_state(registry, client, target, symbol, is_long)
-        if _config(target).max_risk_pct is not None:  # what the trade loses if every stop fills
-            risk = replace(risk, loss_at_stops=_before_sending_read("the loss at the stop losses", lambda: _loss_at_stops(
-                client, target, symbol, is_long, convert.decimal(size), stops,
-                None if limit is None else convert.decimal(price))))
-        guards.check_order(_config(target), symbol, size, price, is_buy=is_long, reduce_only=False,
-                           market=limit is None, slippage_value=slippage, risk=risk).enforce()
+        size, price, tif = _prepare_open_position(client, target, arguments)
+        report, _ = _open_position_checks(registry, client, target, arguments, size, price)
+        report.enforce()
         opening = client.open_long_position if is_long else client.open_short_position
         orders = _remembering(registry, target, lambda: _counted(registry, target, True, lambda: opening(
-            symbol, size, limit_price=price, time_in_force="Ioc" if limit is None else "Gtc",
+            symbol, size, limit_price=price, time_in_force=tif,
             stop_losses=[(level["price"], level["fraction"]) for level in stops],
             take_profits=[(level["price"], level["fraction"]) for level in profits] or None)))
         entry = orders["entry"]
-        if limit is not None:  # resting: Hyperliquid places its stop loss and take profit once it fills
+        if tif != "Ioc":  # resting: Hyperliquid places its stop loss and take profit once it fills
             from . import risk as risk_tools  # the prices as sent
             attached = [{"kind": kind, "trigger_price": price, "size": entry.size}
                         for kind, levels in (("stop_loss", stops), ("take_profit", profits))
@@ -585,8 +674,10 @@ def _open_position(registry: AccountRegistry) -> ToolSpec:
         "Open a perp position with its stop losses (required: together the whole position) and take profits, in "
         "one call. At market: the entry is immediate or cancel at the mid price plus or minus slippage (default "
         "and maximum: the account's max_slippage), so it can fill partly; once it fills, each stop loss and take "
-        "profit is placed for its share of the filled size. With limit_price the entry is a limit order (it "
-        "rests, or fills at once if the price is already there), with one stop loss and at most one take profit "
+        "profit is placed for its share of the filled size. With limit_price and time_in_force=Ioc the same "
+        "multi-level workflow fills immediately up to that price cap and cancels any remainder; stops and "
+        "targets are checked against the current mid. With limit_price and time_in_force=Gtc (default) it "
+        "rests, or fills at once if the price is already there, with one stop loss and at most one take profit "
         "(each fraction 1) attached: Hyperliquid places them once the entry has filled completely (or its rest "
         "is canceled for lack of margin); until then get_open_orders shows them under the entry's children, and "
         "a partly filled entry's filled part has none; canceling the entry cancels them. Plan the size with "
@@ -598,14 +689,14 @@ def _open_position(registry: AccountRegistry) -> ToolSpec:
         "each): place them with stop_loss / take_profit, or close. Returns the entry, the stop losses and the "
         "take profits, and data.warnings (a list of texts, when there are any) for a level not placed because its "
         "share rounds to 0 for a small fill. "
-        "With limit_price it returns the entry and attached (kind, trigger_price, size). On OUTCOME_UNKNOWN never "
-        "call again: check get_positions; a filled market entry has no stop loss yet, while a limit entry may be "
+        "With a Gtc limit it returns the entry and attached (kind, trigger_price, size). On OUTCOME_UNKNOWN never "
+        "call again: check get_positions; an immediate entry may have filled without protection, while a Gtc entry may be "
         "placed with its stop loss and take profit attached (check get_open_orders and its children before "
         "placing anything).",
         {"symbol": SYMBOL, "side": {"type": "string", "enum": ["long", "short"]}, "size": SIZE,
-         "limit_price": {**PRICE, "description": "Makes the entry a limit order at this price (it rests, or fills "
-                                                 "at once if the price is already there), with one stop loss and at "
-                                                 "most one take profit attached."},
+         "limit_price": {**PRICE, "description": "The entry's price cap. Gtc (default) rests with a single bracket; "
+                                                 "Ioc fills immediately, cancels the remainder and supports multiple levels."},
+         "time_in_force": ENTRY_TIF,
          "stop_losses": _levels("stop loss", "1"), "take_profits": _levels("take profit", "at most 1"),
          "slippage": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.5,
                       "description": "The entry's worst price as a fraction from the mid (0.01 = 1 %), at most the "
@@ -649,8 +740,8 @@ def _place_trigger_entry(registry: AccountRegistry) -> ToolSpec:
         "until then the position has none (get_changes shows the fill and the position's unprotected_size). "
         "get_open_orders shows it as type trigger_entry. Refused when the account has max_risk_pct (no stop limits its loss). The "
         "account's limits are checked now, as for an order that adds risk, valued at the most it can enter at "
-        "(GUARD_BLOCKED); not again when it fires. kill_switch cancels it, unless it is on the side that closes "
-        "a position held. Returns the order: open while it waits (and once triggered while a stop limit is "
+        "(GUARD_BLOCKED); not again when it fires. kill_switch cancels it regardless of the position's side. "
+        "Returns the order: open while it waits (and once triggered while a stop limit is "
         "partly filled: see filled_size). On OUTCOME_UNKNOWN never call again: look it up with "
         "get_order_status_by_cloid.",
         {"symbol": SYMBOL, "side": {"type": "string", "enum": ["long", "short"]}, "size": SIZE,
@@ -1059,9 +1150,8 @@ def _kill_switch(registry: AccountRegistry) -> ToolSpec:
             "Emergency stop: halts trading at once for the account (or every account with all_accounts), before "
             "anything else; a call already running finishes. From then on only risk-reducing calls run: close, "
             "close_all_positions, stop_loss, take_profit, update_stop_loss, update_take_profit, sync_protection, "
-            "orders with reduce_only, cancels. Then it cancels the account's open perp orders that would open or "
-            "add to a position (limit and trigger entries: not reduce-only, and not on the side that closes the "
-            "position in their market), and keeps the others, so stop losses and take profits stay (the stop loss "
+            "orders with reduce_only, cancels. Then it cancels every open perp order without reduce_only, "
+            "including orders opposing a position: these can reverse it. Reduce-only orders stay (the stop loss "
             "and take profit attached to a canceled entry go with it); it closes "
             "nothing. To flatten, call cancel_all_orders and close_all_positions next; they act on the account's "
             "dexes (dexes_traded), so a position reported on another dex needs enable_perp_dexs first. Returns, "
@@ -1095,19 +1185,16 @@ def _halt_every(registry: AccountRegistry, targets: list[Target]) -> list[str]:
 
 
 def _cancel_entries(registry: AccountRegistry, target: Target) -> dict[str, Any]:
-    """After the halt: cancel `target`'s open perp orders that would open or add to a position
-    (not reduce-only, and not on the side that closes its position in their market), with its
-    own client, on the dexes it trades. Holding the account's lock, so a trade call still
-    running finishes first and its order is seen. An order is kept when its position cannot
-    be classified: a failed read cancels nothing."""
+    """After the halt, cancel every non-reduce-only perp order on the dexes `target` trades.
+    An opposing order can reverse a position, so no position read is needed to select orders.
+    Hold the account's lock so a trade call still running finishes first and its order is seen.
+    """
     result: dict[str, Any] = {"canceled": [], "not_open": [], "not_canceled": [], "error": None}
     try:
         with registry.lock(target):
             registry.check_signer(target, reduces_risk=True)
             client = registry.trade_client(target)
-            closing = {p.symbol: p.is_short for p in client.get_positions() if p.size != 0}
-            entries = [o for o in client.get_open_orders() if o.market in PERP_MARKETS and not o.reduce_only
-                       and not (o.symbol in closing and o.is_buy == closing[o.symbol])]
+            entries = [o for o in client.get_open_orders() if o.market in PERP_MARKETS and not o.reduce_only]
             known = [o for o in entries if o.symbol in client.market_specs]
             result["not_canceled"] = [{"symbol": o.symbol, "order_id": o.order_id, "reason": "market unknown to "
                                        "the client: call refresh_market_specs()"} for o in entries if o not in known]
@@ -1169,13 +1256,19 @@ def _risk_state(registry: AccountRegistry, client: Any, target: Target, symbol: 
 
 
 def _risk_states(registry: AccountRegistry, client: Any, target: Target,
-                 orders: list[tuple[str, bool]], replacing: Optional[int] = None) -> list[guards.RiskState]:
+                 orders: list[tuple[str, bool]], replacing: Optional[int] = None, *,
+                 preview: bool = False) -> list[guards.RiskState]:
     """_risk_state for each (symbol, is_buy) of a batch: the account and the portfolio read
-    once, the leverage once per market, the mid once per market with a sell. A read only
+    once, the leverage once per proposed or pending market that needs it. A read only
     rules in warn mode need (guards.soft) that fails makes them "cannot be checked" instead.
     `replacing`: an order a modify replaces, left out of the open orders."""
     account = _config(target)
     wanted, soft = guards.needs(account), guards.soft(account)
+    if preview:
+        wanted |= {"orders", "account", "leverage"}  # also report used/pending/proposed margin
+
+    def account_read(method: str, *args: Any) -> Any:
+        return getattr(client, method)(*args, **({"address": target.address} if preview else {}))
     markets = list(dict.fromkeys(symbol for symbol, _ in orders))
     one = len(markets) == 1
     unread: dict[str, str] = {}
@@ -1191,34 +1284,43 @@ def _risk_states(registry: AccountRegistry, client: Any, target: Target,
             unread.update((rule, f"{what} could not be read: {cause}") for rule in soft[read])
             return None
 
-    shared: dict[str, Any] = {"orders_last_hour": _before_sending(lambda: registry.risk_orders_last_hour(target))}
-    leverages = {symbol: attempt("the market's leverage" if one else f"the leverage of {symbol}", "leverage",
-                                 partial(client.get_leverage, symbol))
-                 for symbol in markets} if "leverage" in wanted else {}
+    count = (_before_sending_read("the shared order count", lambda: registry.peek_risk_orders_last_hour(target))
+             if account.max_orders_per_hour is not None else 0) \
+        if preview else _before_sending(lambda: registry.risk_orders_last_hour(target))
+    shared: dict[str, Any] = {"orders_last_hour": count}
+    # Read open orders before the positions (in the summary): a fill between the two
+    # can count twice, but cannot disappear from both reads.
+    open_orders = attempt("the open orders", "orders", partial(account_read, "get_open_orders")) if "orders" in wanted else None
+    pending = [o for o in open_orders if o.order_id != replacing and not o.reduce_only and o.market in PERP_MARKETS] \
+        if open_orders is not None else []
+    leverage_markets = list(dict.fromkeys([*markets, *(o.symbol for o in pending)])) \
+        if account.max_total_margin_pct is not None or preview else markets
+    leverages = {symbol: attempt("the market's leverage" if len(leverage_markets) == 1 else f"the leverage of {symbol}", "leverage",
+                                 partial(account_read, "get_leverage", symbol))
+                 for symbol in leverage_markets} if "leverage" in wanted else {}
     mids = {symbol: convert.decimal(attempt("the market's mid price" if one else f"the mid price of {symbol}", "mid",
                                             partial(client.get_price, symbol)))
             for symbol in dict.fromkeys(symbol for symbol, is_buy in orders if not is_buy)}
-    # The open orders before the positions (in the summary): an order that fills in between
-    # counts twice, never not at all.
-    open_orders = attempt("the open orders", "notional", client.get_open_orders) if "notional" in wanted else None
-    summary = attempt("the account's value and margin", "account", client.get_account_summary) \
+    summary = attempt("the account's value and margin", "account", partial(account_read, "get_account_summary")) \
         if "account" in wanted else None
     if summary is not None:
         shared.update(_margins(summary))
     if "day" in wanted or "today" in wanted:
-        portfolio = attempt("the account's portfolio", "portfolio", client.get_portfolio)
+        portfolio = attempt("the account's portfolio", "portfolio", partial(account_read, "get_portfolio"))
         if portfolio is not None and "day" in wanted:
             shared.update(zip(("day_loss", "day_capital"), guards.portfolio_day_loss(portfolio)))
         if portfolio is not None and "today" in wanted:
             shared.update(guards.today(portfolio, account.day_start, account.tz))
     if open_orders is not None and summary is not None:
-        pending = [o for o in open_orders if o.order_id != replacing]
         # A pending sell is valued at the mid when that is higher, as a new one is.
-        selling = any(not o.is_buy and not o.reduce_only and o.market in PERP_MARKETS for o in pending)
-        prices = attempt("the mid prices", "notional", client.get_price) if selling else {}
+        selling = any(not o.is_buy for o in pending)
+        prices = attempt("the mid prices", "orders", client.get_price) if selling else {}
         if prices is not None:
-            shared["open_notional"] = guards.open_notional(
-                summary, pending, {symbol: convert.decimal(price) for symbol, price in prices.items()})
+            pending_mids = {symbol: convert.decimal(price) for symbol, price in prices.items()}
+            if account.max_total_margin_pct is not None or preview:
+                shared["pending_margin"] = guards.pending_margin(pending, leverages, pending_mids)
+            if account.max_total_notional_x is not None and account.max_total_notional_mode != "off":
+                shared["open_notional"] = guards.open_notional(summary, pending, pending_mids)
     shared["unread"] = tuple(unread.items())
     return [guards.RiskState(**shared, leverage=leverages.get(symbol), mid=None if is_buy else mids[symbol])
             for symbol, is_buy in orders]

@@ -1,8 +1,8 @@
 """The trade tools: what is signed, the guards, the cloid, the halt and the
 signer, through the server and the real library client with the SDK mocked."""
 
-import json
 from contextlib import nullcontext
+from copy import deepcopy
 from decimal import Decimal
 import logging
 import threading
@@ -24,45 +24,15 @@ from fractrade_hl_simple.hyperliquid import HyperliquidClient  # noqa: E402
 from fractrade_hl_simple.mcp_server import guards  # noqa: E402
 from fractrade_hl_simple.mcp_server.accounts import AccountRegistry  # noqa: E402
 from fractrade_hl_simple.mcp_server.config import parse_config  # noqa: E402
-from fractrade_hl_simple.mcp_server.server import build_server  # noqa: E402
-from fractrade_hl_simple.mcp_server.tools.read import read_tools  # noqa: E402
 from fractrade_hl_simple.mcp_server.tools.trade import trade_tools  # noqa: E402
 
-KEY = "0x" + "ab" * 32
-OWN = "0x" + "1" * 40  # main's address; KEY is an API wallet of it (see Session)
-OTHER = "0x" + "4" * 40
+from trade_helpers import (  # noqa: E402
+    ANSWERS, KEY, META, OTHER, OWN, RESTING, Session, config, market, shared_state, state,
+)
+
 CLOID = "0x" + "c" * 32
-META = [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50},
-                      {"name": "ETH", "szDecimals": 4, "maxLeverage": 50},
-                      {"name": "HYPE", "szDecimals": 2, "maxLeverage": 3, "marginMode": "noCross"}]},
-        [{"funding": "0.0001", "openInterest": "1000", "markPx": "85000"},
-         {"funding": "0.00005", "openInterest": "5000", "markPx": "3200"},
-         {"funding": "0.00001", "openInterest": "100", "markPx": "40"}]]
-# What the mocked Info answers to post(): the market data, and the account's state the risk
-# guardrails read (activeAssetData: the market's leverage; portfolio: the last 24 hours).
-ANSWERS = {"metaAndAssetCtxs": META, "activeAssetData": {"leverage": {"type": "cross", "value": 5}},
-           "portfolio": [["day", {"accountValueHistory": [[0, "1000"]], "pnlHistory": [[0, "0"], [1, "0"]]}]]}
 FILLED = {"status": "ok", "response": {"type": "order", "data": {"statuses": [
     {"filled": {"oid": 3, "totalSz": "0.001", "avgPx": "85010.0"}}]}}}
-RESTING = {"status": "ok", "response": {"type": "order", "data": {"statuses": [{"resting": {"oid": 4}}]}}}
-
-
-def config(address=OWN, extra=""):
-    return parse_config(f'''
-[accounts.main]
-address = "{address}"
-key_env = "HL_KEY_MAIN"
-trading = true
-max_order_usd = 100
-max_leverage = 5
-max_slippage = 0.01
-{extra}
-
-[accounts.whale]
-address = "{OTHER}"
-''', "test.toml")
-
-
 CONFIG_CAP = f'''
 [accounts.main]
 address = "{OWN}"
@@ -77,72 +47,125 @@ def cancel_answer(status):
     return {"status": "ok", "response": {"type": "cancel", "data": {"statuses": [status]}}}
 
 
-def market(base_url, account, default_slippage, perp_dexs):
-    """The client factory: the real library client, with the SDK's Info and Exchange mocked,
-    so what a tool would sign is what the mocked Exchange is called with."""
-    with patch("fractrade_hl_simple.hyperliquid.Info") as info_cls, \
-         patch("fractrade_hl_simple.hyperliquid.Exchange"):
-        info = info_cls.return_value
-        info.post.side_effect = lambda path, payload: ANSWERS[payload["type"]]
-        info.name_to_coin = {"BTC": "BTC", "ETH": "ETH", "HYPE": "HYPE"}
-        info.all_mids.return_value = {"BTC": "85000.0", "ETH": "3000.0"}
-        options = {} if default_slippage is None else {"default_slippage": default_slippage}
-        client = HyperliquidClient(account=account, base_url=base_url, trust_env=False, max_retries=0,
-                                   cache_market_specs=False, perp_dexs=list(perp_dexs), **options)
-    HyperliquidClient._cached_key = HyperliquidClient._cached_market_specs = None  # mock data stays here
-    return client
-
-
-class Session:
-    """A server with the read and trade tools, and the trading client of account main."""
-
-    def __init__(self, conf=None, keys=None, make_client=market, state=None):
-        conf = conf or config()
-        self.registry = AccountRegistry(conf, {"main": KEY} if keys is None else keys, make_client,
-                                        state or shared_state())
-        self.server = build_server([*read_tools(conf, self.registry), *trade_tools(self.registry)])
-        self.target = self.registry.resolve_trade("main")
-        # The key is an API wallet of main (the signer check asks Hyperliquid's userRole).
-        try:
-            reader = self.registry.read_client(self.target)
-        except Exception:  # a test whose network is down: no signer check gets that far
-            return
-        if hasattr(reader, "info"):
-            reader.info.user_role.return_value = {"role": "agent", "data": {"user": self.target.address}}
-
-    @property
-    def trader(self):
-        return self.registry.trade_client(self.target)
-
-    def call(self, *calls):
-        """(is_error, body) of each call, in order, on one connection."""
-        async def run():
-            async with Client(self.server, mode="2026-07-28") as client:
-                results = []
-                for name, arguments in calls:
-                    result = await client.call_tool(name, arguments)
-                    results.append((result.is_error, json.loads(result.content[0].text)))
-                return results
-        return anyio.run(run)
-
-    def one(self, name, arguments):
-        return self.call((name, arguments))[0]
-
-    def code(self, name, arguments):
-        is_error, body = self.one(name, arguments)
-        assert is_error, body
-        return body["error"]["code"]
-
-    def tools(self):
-        async def run():
-            async with Client(self.server, mode="2026-07-28") as client:
-                return {tool.name: tool for tool in (await client.list_tools()).tools}
-        return anyio.run(run)
-
-
 def sent(client):
     """The arguments of the last SDK order call, without the client order id."""
     return {k: v for k, v in client.exchange.order.call_args.kwargs.items() if k != "cloid"}
+
+
+class ListingNetwork:
+    """Real library clients and cache, with SDK metadata that can gain a listing."""
+
+    def __init__(self):
+        self.meta = deepcopy(META)
+        self.made, self.metadata_reads = [], 0
+        self.fresh_attempts, self.fail_fresh_at = 0, None
+
+    def list_new(self):
+        self.meta[0]["universe"].append({"name": "NEW", "szDecimals": 2, "maxLeverage": 5})
+        self.meta[1].append({"funding": "0", "openInterest": "100", "markPx": "20"})
+
+    def answer(self, path, payload):
+        if payload["type"] == "metaAndAssetCtxs":
+            self.metadata_reads += 1
+            return deepcopy(self.meta)
+        if payload["type"] == "perpsAtOpenInterestCap":
+            return []
+        return ANSWERS[payload["type"]]
+
+    def info(self, *args, meta=None, spot_meta=None, **kwargs):
+        # The SDK's symbol table is frozen at creation even though market reads stay current.
+        meta = deepcopy(self.meta[0] if meta is None else meta)
+        info = MagicMock()
+        info.startup_metadata = {"meta": meta, "spotMeta": spot_meta or {"tokens": [], "universe": []}}
+        info.name_to_coin = {m["name"]: m["name"] for m in meta["universe"]}
+        info.post.side_effect = self.answer
+        info.user_role.return_value = {"role": "agent", "data": {"user": OWN}}
+        return info
+
+    def __call__(self, base_url, account, default_slippage, perp_dexs, *, cache_market_specs=True):
+        if not cache_market_specs:
+            self.fresh_attempts += 1
+            if self.fresh_attempts == self.fail_fresh_at:
+                raise NetworkException("metadata unavailable")
+        with patch("fractrade_hl_simple.hyperliquid.Info", side_effect=self.info), \
+             patch("fractrade_hl_simple.hyperliquid.Exchange"):
+            client = HyperliquidClient(account=account, base_url=base_url, trust_env=False, max_retries=0,
+                                       cache_market_specs=cache_market_specs, perp_dexs=list(perp_dexs),
+                                       default_slippage=0.05 if default_slippage is None else default_slippage)
+        if account is not None:
+            client.exchange.order.return_value = RESTING
+        self.made.append((client, cache_market_specs))
+        return client
+
+
+class TestMetadataRefresh:
+    @pytest.fixture
+    def network(self):
+        HyperliquidClient._cached_key = HyperliquidClient._cached_market_specs = None
+        yield ListingNetwork()
+        HyperliquidClient._cached_key = HyperliquidClient._cached_market_specs = None
+
+    def test_a_visible_new_listing_can_be_traded_after_refreshing_both_clients(self, network):
+        session = Session(make_client=network)
+        trader, reader = session.trader, session.registry.read_client(session.target)
+        network.list_new()
+        is_error, listed = session.one("list_markets", {})
+        assert not is_error and any(m["symbol"] == "NEW" for m in listed["data"])
+        order = {"symbol": "NEW", "size": 1.239, "limit_price": 20}
+        assert session.code("buy", order) == "UNKNOWN_SYMBOL"
+
+        is_error, refreshed = session.one("refresh_market_specs", {})
+
+        assert not is_error, refreshed
+        assert refreshed["base_url"] == session.target.base_url and refreshed["observed_at"].endswith("Z")
+        assert refreshed["dexes_read"] == ["default"] and refreshed["perp_markets"] == 4
+        assert refreshed["trading_clients"] == [{"account": "main", "dexes_traded": ["default"], "perp_markets": 4}]
+        assert session.trader is not trader and session.registry.read_client(session.target) is not reader
+        assert "NEW" not in trader.market_specs and "NEW" not in reader.info.name_to_coin
+        assert "NEW" in session.trader.exchange.info.name_to_coin
+        assert not session.one("buy", order)[0]
+        assert (sent(session.trader)["name"], sent(session.trader)["sz"]) == ("NEW", 1.23)
+        trader.exchange.order.assert_not_called()
+        assert [cached for _, cached in network.made] == [True, True, False, False]
+
+    def test_a_lazy_trader_uses_the_refreshed_cache(self, network):
+        session = Session(make_client=network)  # only the reader exists
+        network.list_new()
+        is_error, refreshed = session.one("refresh_market_specs", {})
+        assert not is_error and refreshed["trading_clients"] == []
+        reads = network.metadata_reads
+        assert not session.one("buy", {"symbol": "NEW", "size": 1, "limit_price": 20})[0]
+        assert network.metadata_reads == reads  # fresh reader metadata was reusable
+        assert [cached for _, cached in network.made] == [True, False, True]
+
+    @pytest.mark.parametrize("fails_at", [1, 2], ids=["reader", "trader-after-reader"])
+    def test_a_failed_refresh_keeps_every_existing_client_usable(self, network, fails_at):
+        session = Session(make_client=network)
+        trader, reader = session.trader, session.registry.read_client(session.target)
+        network.list_new()
+        network.fail_fresh_at = fails_at
+        is_error, body = session.one("refresh_market_specs", {})
+        assert is_error and (body["error"]["code"], body["error"]["retryable"]) == ("NETWORK_ERROR", True)
+        assert session.trader is trader and session.registry.read_client(session.target) is reader
+        assert "NEW" not in trader.market_specs and "NEW" not in reader.market_specs
+        trader.exchange.order.assert_not_called()
+        assert not session.one("buy", {"symbol": "BTC", "size": 0.001, "limit_price": 50000})[0]
+
+    def test_refresh_keeps_cloids_order_counts_limits_and_halts(self, network):
+        session = Session(config(extra="max_orders_per_hour = 2"), make_client=network)
+        order = {"symbol": "BTC", "size": 0.001, "limit_price": 50000}
+        assert not session.one("buy", {**order, "cloid": CLOID})[0]
+        before = session.one("list_accounts", {})[1]
+        assert not session.one("refresh_market_specs", {})[0]
+        assert session.one("list_accounts", {})[1] == before
+        assert session.registry.risk_orders_last_hour(session.target) == 1
+        assert session.code("buy", {**order, "cloid": CLOID}) == "INVALID_ARGUMENT"
+        assert not session.one("buy", order)[0]
+        assert session.code("buy", order) == "GUARD_BLOCKED"  # the previous client's order still counts
+        session.registry.halt(session.target)
+        assert not session.one("refresh_market_specs", {})[0]
+        assert session.code("buy", order) == "KILL_SWITCH_ENGAGED"
+        assert session.registry.risk_orders_last_hour(session.target) == 2
 
 
 @pytest.fixture
@@ -707,16 +730,6 @@ class TestAccountState:
         assert hints == {name: (False, name not in not_destructive, name in idempotent) for name in trade}
 
 
-def state(*positions):
-    """clearinghouseState with these (coin, size) positions."""
-    summary = {"accountValue": "1000", "totalMarginUsed": "100", "totalNtlPos": "500", "totalRawUsd": "1000"}
-    return {"marginSummary": summary, "crossMarginSummary": summary, "withdrawable": "800", "assetPositions": [
-        {"type": "oneWay", "position": {
-            "coin": coin, "entryPx": "85000", "szi": size, "leverage": {"type": "cross", "value": "10"},
-            "liquidationPx": None, "marginUsed": "8.5", "positionValue": "85", "returnOnEquity": "0.01",
-            "unrealizedPnl": "1.0"}} for coin, size in positions]}
-
-
 def filled(oid, size):
     return {"status": "ok", "response": {"type": "order", "data": {"statuses": [
         {"filled": {"oid": oid, "totalSz": size, "avgPx": "84990.0"}}]}}}
@@ -1041,31 +1054,55 @@ class TestKillSwitch:
                 "reduceOnly": True, "tif": None, "cloid": None}
         spot = {"coin": "@107", "side": "B", "limitPx": "1.0", "sz": "1", "oid": 7, "timestamp": 1_700_000_000_000,
                 "origSz": "1", "orderType": "Limit", "reduceOnly": False, "tif": "Gtc", "cloid": None}
-        # Of the short's orders: a buy limit without reduce_only still closes it (kept); a sell
-        # stop below adds to it, and an ETH buy opens a position (both canceled).
+        # Every non-reduce-only entry is canceled, including the buy opposing the short:
+        # it can reverse the position if other orders close or shrink it first.
         closing = dict(stop, oid=8, orderType="Limit", isTrigger=False, triggerPx="0.0", reduceOnly=False, tif="Gtc")
         adding = dict(stop, oid=9, side="A", triggerPx="80000.0", limitPx="72000.0", reduceOnly=False)
         opening = dict(closing, oid=10, coin="ETH", side="B", limitPx="3000.0")
         session.trader.info.user_state.return_value = short
         session.trader.info.frontend_open_orders.return_value = [stop, spot, closing, adding, opening]
         session.trader.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
-            "statuses": ["success", {"error": "Order was never placed, already canceled, or filled. asset=1"}]}}}
+            "statuses": ["success", "success", {"error": "Order was never placed, already canceled, or filled. asset=1"}]}}}
         reader = self.reader(session)
         reader.info.user_state.return_value = short
-        reader.info.frontend_open_orders.return_value = [stop, spot, closing]
+        reader.info.frontend_open_orders.return_value = [stop, spot]
         is_error, body = session.one("kill_switch", {})
         assert not is_error and body["halted"] == ["main"]
         [cancels] = session.trader.exchange.bulk_cancel.call_args.args
-        assert cancels == [{"coin": "BTC", "oid": 9}, {"coin": "ETH", "oid": 10}]
+        assert cancels == [{"coin": "BTC", "oid": 8}, {"coin": "BTC", "oid": 9}, {"coin": "ETH", "oid": 10}]
         account = body["accounts"][0]
-        assert account["entries"] == {"canceled": [9], "not_open": [10], "not_canceled": [], "error": None}
+        assert account["entries"] == {"canceled": [8, 9], "not_open": [10], "not_canceled": [], "error": None}
         assert (account["halted"], account["positions"], account["open_orders"], account["error"]) == (
             True, [{"symbol": "BTC", "dex": None, "side": "short", "size": "0.002", "unprotected_size": "0"}],
-            {"count": 2, "stop_losses": 1, "take_profits": 0}, None)  # the spot order is not counted
+            {"count": 1, "stop_losses": 1, "take_profits": 0}, None)  # the spot order is not counted
         assert session.code("buy", {"symbol": "BTC", "size": 0.001}) == "KILL_SWITCH_ENGAGED"
         session.trader.info.user_state.return_value = state(("BTC", "-0.002"))
         session.trader.exchange.order.return_value = filled(5, "0.002")
         assert not session.one("close", {"symbol": "BTC"})[0]  # risk-reducing calls still run
+
+    @pytest.mark.parametrize("position,side", [("0.002", "A"), ("-0.002", "B"), ("0", "B")])
+    def test_opposing_entries_are_canceled_without_reading_positions(self, session, position, side):
+        # One oversized entry and two smaller entries can all open exposure after the position closes.
+        entries = [{"coin": "BTC", "side": side, "limitPx": "90000", "sz": size, "origSz": size,
+                    "oid": oid, "timestamp": 1_700_000_000_000, "orderType": "Limit",
+                    "reduceOnly": False, "tif": "Gtc"} for oid, size in [(81, "0.005"), (82, "0.002"), (83, "0.002")]]
+        protection = dict(entries[0], oid=84, reduceOnly=True)
+        session.trader.get_positions = MagicMock(side_effect=NetworkException("positions unavailable"))
+        session.trader.info.frontend_open_orders.return_value = [*entries, protection]
+        session.trader.exchange.bulk_cancel.return_value = {"status": "ok", "response": {"type": "cancel", "data": {
+            "statuses": ["success"] * 3}}}
+        reader = self.reader(session)
+        reader.info.user_state.return_value = state(("BTC", position))
+        reader.info.frontend_open_orders.return_value = [protection]
+
+        is_error, body = session.one("kill_switch", {})
+
+        assert not is_error and session.registry.is_halted(session.target)
+        assert body["accounts"][0]["entries"] == {
+            "canceled": [81, 82, 83], "not_open": [], "not_canceled": [], "error": None}
+        session.trader.get_positions.assert_not_called()
+        assert session.trader.exchange.bulk_cancel.call_args.args[0] == [
+            {"coin": "BTC", "oid": oid} for oid in (81, 82, 83)]
 
     def test_the_halt_stands_when_nothing_can_be_read(self):
         def factory(base_url, account, default_slippage, perp_dexs):
@@ -1391,7 +1428,7 @@ class TestRiskGuardrailsThroughTheTools:
         # At 5x: $50 of value is $10 of margin, 90 + 10 = 100 = 10 % of $1000; $55 is $11 and above.
         assert not session.one("buy", {"symbol": "BTC", "size": 0.001, "limit_price": 50000})[0]
         is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.0011, "limit_price": 50000})
-        assert is_error and "margin in use with this order 101 USD is above 10 % of the account value (100 USD)" \
+        assert is_error and "projected margin with this order 101 USD is above 10 % of the account value (100 USD)" \
             in body["error"]["message"]
 
     def test_after_the_daily_loss_new_risk_is_refused_and_closing_still_works(self):
@@ -1452,6 +1489,130 @@ class TestDayLoss:
     def test_an_answer_in_no_documented_format_is_not_established(self, portfolio):
         from fractrade_hl_simple.mcp_server.guards import portfolio_day_loss as _day_loss
         assert _day_loss(portfolio) == (None, None)
+
+
+class TestPendingEntryMargin:
+    """Total margin includes resting entries, whichever client placed them."""
+
+    def session(self, extra=""):
+        session = Session(config(extra="max_total_margin_pct = 3\n" + extra))
+        session.trader.get_account_summary = MagicMock(return_value=SimpleNamespace(
+            account_value=Decimal(1000), margin_used=Decimal(0), dexes=[]))
+        session.trader.exchange.order.return_value = RESTING
+        return session
+
+    @staticmethod
+    def entry(oid=4, **raw):
+        return open_order(oid, "B", 50000, coin="BTC", sz="0.002", origSz="0.002", **raw)
+
+    def test_a_second_resting_entry_cannot_reuse_the_first_ones_budget(self):
+        session = self.session()
+        session.trader.info.frontend_open_orders.return_value = []
+        order = {"symbol": "BTC", "size": 0.002, "limit_price": 50000}
+        assert not session.one("buy", order)[0]  # $20 of a $30 cap
+        session.trader.info.frontend_open_orders.return_value = [self.entry()]
+
+        is_error, body = session.one("buy", order)
+
+        assert is_error and body["error"]["code"] == "GUARD_BLOCKED"
+        assert "projected margin with this order 40 USD is above 3 %" in body["error"]["message"]
+        assert "used 0 USD, pending entries 20 USD, proposed 20 USD" in body["error"]["message"]
+        assert session.trader.exchange.order.call_count == 1
+
+    def test_a_batch_adds_its_margin_once_to_the_pending_entries(self):
+        session = self.session()
+        session.trader.info.frontend_open_orders.return_value = [self.entry()]
+        order = {"symbol": "BTC", "is_buy": True, "size": 0.001, "limit_price": 50000}
+        assert session.code("place_orders", {"orders": [order, order]}) == "GUARD_BLOCKED"  # 20 + 10 + 10 > 30
+        session.trader.exchange.bulk_orders.assert_not_called()
+        session.trader.exchange.bulk_orders.return_value = bulk({"resting": {"oid": 5}}, {"resting": {"oid": 6}})
+        assert not session.one("place_orders", {"orders": [order, {**order, "reduce_only": True}]})[0]  # 20 + 10 = 30
+
+    def test_remaining_sizes_use_each_markets_leverage_and_share_reads_with_notional(self):
+        session = self.session('max_total_notional_x = 3\nmax_total_notional_mode = "block"')
+        events = []
+        entries = [dict(self.entry(), sz="0.001"),  # partially filled: only $50 / 5 = $10 pending
+                   open_order(5, "B", 3000, sz="0.005"), open_order(6, "B", 3000, sz="0.005")]
+        session.trader.get_open_orders = MagicMock(side_effect=lambda: events.append("orders") or [
+            _answers.parse_open_order(o, o["coin"]) for o in entries])
+        session.trader.get_account_summary.side_effect = lambda: events.append("summary") or SimpleNamespace(
+            account_value=Decimal(1000), margin_used=Decimal(2), dexes=[])
+        session.trader.get_leverage = MagicMock(side_effect=lambda symbol: SimpleNamespace(
+            type="cross", value=Decimal(5 if symbol == "BTC" else 2)))  # ETH: $30 / 2 = $15
+
+        assert not session.one("buy", {"symbol": "BTC", "size": 0.0003, "limit_price": 50000})[0]  # 2 + 10 + 15 + 3 = 30
+        assert events == ["orders", "summary"]
+        assert [call.args for call in session.trader.get_leverage.call_args_list] == [("BTC",), ("ETH",)]
+
+    @pytest.mark.parametrize("size,blocked", [(0.0005, False), (0.001, False), (0.0011, True)])
+    def test_a_modify_replaces_the_old_orders_margin(self, size, blocked):
+        session = self.session()
+        session.trader.info.frontend_open_orders.return_value = [dict(self.entry(), sz="0.001"), self.entry(5)]
+        session.trader.exchange.modify_order.return_value = RESTING
+        is_error, body = session.one("modify_order", {"order_id": 4, "symbol": "BTC", "is_buy": True,
+                                                       "size": size, "price": 50000,
+                                                       "order_type": {"limit": {"tif": "Gtc"}}})
+        assert is_error is blocked, body
+        if blocked:
+            assert body["error"]["code"] == "GUARD_BLOCKED"
+            check = next(c for c in body["error"]["details"]["checks"] if c["rule"] == "max_total_margin_pct")
+            assert not check["passed"] and "pending entries 20 USD, proposed 11 USD" in check["detail"]
+            session.trader.exchange.modify_order.assert_not_called()
+        else:
+            session.trader.exchange.modify_order.assert_called_once()
+
+    def test_protection_and_spot_orders_add_no_pending_margin(self):
+        session = self.session()
+        stop = dict(self.entry(6), side="A", reduceOnly=True, isTrigger=True, triggerPx="40000", orderType="Stop Market")
+        target = dict(stop, oid=7, triggerPx="60000", orderType="Take Profit Market")
+        spot = dict(self.entry(8), coin="@107")
+        session.trader.info.frontend_open_orders.return_value = [self.entry(children=[stop, target]), stop, target, spot]
+        assert not session.one("buy", {"symbol": "BTC", "size": 0.001, "limit_price": 50000})[0]  # 20 + 10 = 30
+
+    @pytest.mark.parametrize("method", ["get_open_orders", "get_leverage", "get_account_summary", "get_price"])
+    def test_failed_required_reads_block_even_when_the_notional_rule_only_warns(self, method):
+        session = self.session('max_total_notional_x = 3\nmax_total_notional_mode = "warn"')
+        session.trader.info.frontend_open_orders.return_value = [open_order(5, "A", 3000)]
+        setattr(session.trader, method, MagicMock(side_effect=NetworkException("connection reset")))
+        if method == "get_leverage":
+            # The proposed market is readable, but a market with an earlier entry is not.
+            session.trader.get_leverage.side_effect = [SimpleNamespace(value=Decimal(5)), NetworkException("reset")]
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001, "limit_price": 50000})
+        assert is_error and (body["error"]["code"], body["error"]["retryable"]) == ("GUARD_BLOCKED", True)
+        session.trader.exchange.order.assert_not_called()
+        # Reducing exposure does not depend on these reads.
+        assert not session.one("buy", {"symbol": "BTC", "size": 0.001, "limit_price": 50000, "reduce_only": True})[0]
+
+    @pytest.mark.parametrize("kind,side,price,trigger,mid,expected", [
+        ("Stop Market", "B", "99000", "90000", "85000", "19.8"),  # signed buy tolerance price
+        ("Stop Limit", "B", "91000", "90000", "85000", "18.2"),
+        ("Stop Market", "A", "72900", "81000", "85000", "17"),    # sell below the mid
+        ("Stop Market", "A", "81000", "90000", "85000", "18"),    # otherwise the higher trigger
+    ])
+    def test_pending_triggers_use_the_existing_conservative_valuation(self, kind, side, price, trigger, mid, expected):
+        session = self.session()
+        entry = dict(self.entry(), side=side, sz="0.001", limitPx=price, triggerPx=trigger,
+                     isTrigger=True, orderType=kind)
+        session.trader.info.frontend_open_orders.return_value = [entry]
+        session.trader.info.all_mids.return_value = {"BTC": mid}
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.002, "limit_price": 50000})
+        assert is_error and body["error"]["code"] == "GUARD_BLOCKED"
+        assert f"pending entries {expected} USD" in body["error"]["message"]
+
+    @pytest.mark.parametrize("missing", ["price", "mid", "pending leverage"])
+    def test_missing_pending_data_never_counts_as_zero(self, missing):
+        session = self.session()
+        entry = open_order(5, "A" if missing == "mid" else "B", 3000)
+        if missing == "price":
+            entry.pop("limitPx")
+        elif missing == "mid":
+            session.trader.info.all_mids.return_value = {}
+        else:
+            session.trader.get_leverage = lambda symbol: None if symbol == "ETH" else SimpleNamespace(value=Decimal(5))
+        session.trader.info.frontend_open_orders.return_value = [entry]
+        is_error, body = session.one("buy", {"symbol": "BTC", "size": 0.001, "limit_price": 50000})
+        assert is_error and body["error"]["code"] == "GUARD_BLOCKED"
+        session.trader.exchange.order.assert_not_called()
 
 
 class TestRiskReadsThatFail:
@@ -1604,20 +1765,6 @@ class TestWhatTheOrderRateCounts:
 from fractrade_hl_simple.mcp_server.state import SharedState  # noqa: E402
 
 
-def shared_state():
-    """A started shared state in a folder of its own, removed with it (the trade tools need one)."""
-    import tempfile
-    import weakref
-    from pathlib import Path
-    from fractrade_hl_simple.mcp_server.state import SharedState
-    folder = tempfile.mkdtemp()
-    state = SharedState(Path(folder) / "state")
-    state.start()
-    import shutil
-    weakref.finalize(state, shutil.rmtree, folder, True)
-    return state
-
-
 class TestTwoServersOfOneConfig:
     """Two chats, two servers, one account: they share the halt, the order rate and the
     cloids (state.py). Each has its own SharedState on one folder, as two processes do."""
@@ -1646,20 +1793,25 @@ class TestTwoServersOfOneConfig:
         assert not two.one("buy", {"symbol": "BTC", "size": 0.001})[0]
         assert one.code("buy", {"symbol": "BTC", "size": 0.001}) == "GUARD_BLOCKED"
 
-    def test_two_chats_ordering_at_once_the_second_sees_the_first_ones_margin(self):
+    @pytest.mark.parametrize("rests", [False, True], ids=["filled", "resting"])
+    def test_two_chats_ordering_at_once_the_second_sees_the_first_ones_margin(self, rests):
         # max_total_margin_pct 3 of 1000: 30 of margin. Each order: 0.002 at 50000 (100, the
         # config's max_order_usd) at 5x, 20 of margin. Without the shared lock both would read
         # 0 in use and both pass.
         import threading
         one, two = self.servers("max_total_margin_pct = 3")
-        margin, sending, finish = [Decimal(0)], threading.Event(), threading.Event()
+        margin, pending, sending, finish = [Decimal(0)], [], threading.Event(), threading.Event()
         for session in (one, two):
             session.trader.get_account_summary = lambda: SimpleNamespace(account_value=Decimal(1000),
                                                                          margin_used=margin[0])
+            session.trader.info.frontend_open_orders.side_effect = lambda *a, **k: list(pending)
 
         def slow_fill(*args, **kwargs):  # chat one's order is on its way
             sending.set()
             finish.wait(5)
+            if rests:
+                pending.append(TestPendingEntryMargin.entry())
+                return RESTING
             margin[0] += 20
             return FILLED
 
@@ -1678,7 +1830,7 @@ class TestTwoServersOfOneConfig:
         second.join(5)
         assert not results["one"][0]
         is_error, body = results["two"]
-        assert is_error and "margin in use with this order 40 USD is above 3 %" in body["error"]["message"]
+        assert is_error and "projected margin with this order 40 USD is above 3 %" in body["error"]["message"]
         two.trader.exchange.order.assert_not_called()
 
     def test_an_order_is_counted_before_it_is_sent(self):
@@ -2096,3 +2248,182 @@ class TestMaxRiskPctThroughTheTools:
         session.trader.exchange.order.side_effect = None
         session.trader.exchange.order.return_value = filled(5, "0.001")
         assert not session.one("sell", {"symbol": "BTC", "size": 0.001, "reduce_only": True})[0]
+
+
+class TestIocLimitProtection:
+    @pytest.mark.parametrize("side", ["long", "short"])
+    @pytest.mark.parametrize("fill", ["0.001", "0.0006"])
+    def test_the_price_cap_and_every_level_survive_full_or_partial_fills(self, side, fill):
+        session = TestOpenPosition().session(fills=fill, legs=[resting(i) for i in range(4, 8)])
+        is_long = side == "long"
+        session.trader.info.user_state.return_value = state(("BTC", fill if is_long else "-" + fill))
+        stops, profits = ([80000, 79000], [90000, 91000]) if is_long else ([90000, 91000], [80000, 79000])
+        args = {"symbol": "BTC", "side": side, "size": 0.001, "limit_price": 86000 if is_long else 84000,
+                "time_in_force": "Ioc", "stop_losses": [{"price": p, "fraction": 0.5} for p in stops],
+                "take_profits": [{"price": p, "fraction": 0.5} for p in profits]}
+        error, body = session.one("open_position", args)
+        assert not error, body
+        orders = TestOpenPosition().orders(session)
+        assert orders[0]["limit_px"] == args["limit_price"]
+        assert orders[0]["order_type"] == {"limit": {"tif": "Ioc"}}
+        assert [(o["order_type"]["trigger"]["triggerPx"], o["sz"]) for o in orders[1:]] == [
+            (p, float(Decimal(fill) / 2)) for p in stops + profits]
+        assert len(body["data"]["stop_losses"]) == len(body["data"]["take_profits"]) == 2
+        assert "attached" not in body["data"]
+        session.trader.exchange.bulk_orders.assert_not_called()
+
+    def test_an_ioc_stop_is_checked_against_the_mid_not_the_price_cap(self):
+        session = TestOpenPosition().session()
+        args = {**TestOpenPosition.ARGS, "limit_price": 88000, "time_in_force": "Ioc",
+                "stop_losses": [{"price": 86000, "fraction": 1}]}
+        assert session.code("open_position", args) == "INVALID_ARGUMENT"
+        session.trader.exchange.order.assert_not_called()
+
+    def test_a_missing_level_after_an_ioc_fill_is_reported_for_recovery(self):
+        session = TestOpenPosition().session(legs=[resting(4), InvalidArgumentException("bad level")])
+        error, body = session.one("open_position", {**TestOpenPosition.ARGS, "limit_price": 86000,
+                                                   "time_in_force": "Ioc"})
+        assert error and body["error"]["code"] == "PROTECTION_NOT_PLACED"
+        assert session.trader.exchange.order.call_count == 3  # entry, first stop, failed second stop
+        assert "stop_loss_2" in str(body["error"]["details"])
+
+    def test_time_in_force_needs_an_explicit_limit(self):
+        session = TestOpenPosition().session()
+        assert session.code("open_position", {**TestOpenPosition.ARGS, "time_in_force": "Ioc"}) == "INVALID_ARGUMENT"
+        session.trader.exchange.order.assert_not_called()
+
+
+class TestExecutionPreview:
+    ARGS = TestOpenPosition.ARGS
+
+    def session(self, extra="max_order_usd = 1000", pending=None):
+        session = TestOpenPosition().session(extra)
+        reader = session.registry.read_client(session.target)
+        for client in (reader, session.trader):
+            client.get_account_summary = MagicMock(return_value=SimpleNamespace(
+                account_value=Decimal(1000), margin_used=Decimal(100), dexes=[]))
+            client.get_fee_rates = MagicMock(return_value=SimpleNamespace(taker=Decimal("0.00045"), maker=Decimal("0.00015")))
+            client.get_order_book = MagicMock(return_value={
+                "bids": [{"price": "84990", "size": "10"}], "asks": [{"price": "85010", "size": "10"}]})
+            client.info.frontend_open_orders.return_value = pending or []
+        return session
+
+    def plan(self, session, args=None):
+        args = dict(args or self.ARGS)
+        if "limit_price" in args:
+            args["entry_price"] = args.pop("limit_price")
+        error, body = session.one("plan_trade", args)
+        assert not error, body
+        return body["data"]["execution"]
+
+    @pytest.mark.parametrize("extra, rule", [
+        ('max_order_usd = 80', "order_notional"),
+        ('max_order_usd = 1000\nsymbols = ["ETH"]', "symbol_allowed"),
+        ('max_order_usd = 1000\ncheck_order_leverage = true', "leverage"),
+        ('max_order_usd = 1000\nisolated_only = true', "isolated_only"),
+        ('max_order_usd = 1000\nmax_margin_pct = 1', "max_margin_pct"),
+        ('max_order_usd = 1000\nmax_total_margin_pct = 12', "max_total_margin_pct"),
+        ('max_order_usd = 1000\nmax_risk_pct = 0.1', "max_risk_pct"),
+        ('max_order_usd = 1000\nmax_total_notional_x = 0.05\nmax_total_notional_mode = "block"', "max_total_notional_x"),
+    ])
+    def test_preview_and_submission_have_identical_guard_results(self, extra, rule):
+        session = self.session(extra, pending=[TestPendingEntryMargin.entry()])
+        if rule == "leverage":
+            for client in (session.registry.read_client(session.target), session.trader):
+                client.info.post.side_effect = lambda path, payload: {"leverage": {"type": "cross", "value": 10}} \
+                    if payload["type"] == "activeAssetData" else ANSWERS[payload["type"]]
+        preview = self.plan(session)
+        assert preview["eligible"] is False, preview
+        error, body = session.one("open_position", self.ARGS)
+        assert error and body["error"]["code"] == "GUARD_BLOCKED", body
+        expected = body["error"]["details"]["checks"]
+        assert [c for c in preview["checks"] if c["rule"] not in {"entry_and_protection", "kill_switch"}] == expected
+        assert any(c["rule"] == rule and not c["passed"] for c in expected)
+        session.trader.exchange.order.assert_not_called()
+
+    def test_warning_rules_do_not_block_and_the_same_warning_is_returned_on_submission(self):
+        session = self.session('max_order_usd = 1000\nmax_total_notional_x = 0.05\nmax_total_notional_mode = "warn"')
+        preview = self.plan(session)
+        assert preview["eligible"] is True
+        warning = next(c for c in preview["checks"] if c.get("mode") == "warn" and not c["passed"])
+        error, body = session.one("open_position", preview["arguments"])
+        assert not error, body
+        assert {"rule": warning["rule"], "detail": warning["detail"]} in body["warnings"]
+
+    def test_margin_uses_remaining_entries_and_the_prepared_market_price(self):
+        pending = {**TestPendingEntryMargin.entry(), "sz": "0.001"}
+        session = self.session("max_order_usd = 1000\nmax_total_margin_pct = 50", [pending])
+        preview = self.plan(session)
+        assert preview["eligible"] is True
+        assert {k: Decimal(v) for k, v in preview["margin"].items()} == {
+            "used": Decimal(100), "pending": Decimal(10), "proposed": Decimal("17.34"),
+            "total": Decimal("127.34"), "max_total_margin_pct": Decimal(50)}
+        assert preview["prepared_entry"]["limit_price"] == 86700
+        reader = session.registry.read_client(session.target)
+        reader.get_account_summary.assert_called_with(address=OWN)
+        assert preview["observed_at"].endswith("Z") and preview["perp_dexs"] == [""]
+
+    @pytest.mark.parametrize("tif, eligible", [("Gtc", False), ("Ioc", True)])
+    def test_a_laddered_limit_is_executable_only_when_ioc_is_explicit(self, tif, eligible):
+        session = self.session()
+        preview = self.plan(session, {**self.ARGS, "limit_price": 86000, "time_in_force": tif})
+        assert preview["eligible"] is eligible
+        if eligible:
+            assert preview["prepared_entry"]["protection"] == "after_fill"
+            assert preview["arguments"]["time_in_force"] == "Ioc"
+            assert not session.one("open_position", preview["arguments"])[0]
+        else:
+            assert "resting limit" in preview["error"]["message"]
+            session.trader.exchange.order.assert_not_called()
+
+    def test_preview_neither_signs_nor_writes_state_and_later_state_is_rechecked(self):
+        session = self.session("max_order_usd = 1000\nmax_orders_per_hour = 1")
+        folder = session.registry._state.folder
+        before = {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+        preview = self.plan(session)
+        assert preview["eligible"] is True
+        assert before == {p: p.read_bytes() for p in folder.rglob("*") if p.is_file()}
+        session.registry.read_client(session.target).info.user_role.assert_not_called()
+        session.trader.exchange.order.assert_not_called()
+        session.registry.count_risk_order(session.target)
+        assert self.plan(session)["eligible"] is False
+        assert session.code("open_position", preview["arguments"]) == "GUARD_BLOCKED"
+
+    def test_halt_blocks_the_preview_and_submission(self):
+        session = self.session()
+        session.registry.halt(session.target)
+        assert self.plan(session)["eligible"] is False
+        assert session.code("open_position", self.ARGS) == "KILL_SWITCH_ENGAGED"
+
+    def test_an_unavailable_guard_read_is_unknown_and_does_not_lose_the_plan(self):
+        session = self.session("max_order_usd = 1000\nmax_total_margin_pct = 50")
+        reader = session.registry.read_client(session.target)
+        reader.info.frontend_open_orders.side_effect = NetworkException("offline")
+        preview = self.plan(session)
+        assert preview["eligible"] is None and preview["margin"] is None
+        assert preview["error"]["code"] == "GUARD_BLOCKED"
+        session.trader.exchange.order.assert_not_called()
+
+    def test_a_read_only_server_can_preview_without_a_key_or_creating_shared_state(self, tmp_path):
+        from fractrade_hl_simple.mcp_server.state import SharedState
+        from fractrade_hl_simple.mcp_server.tools.risk import risk_tools
+        session = self.session("max_order_usd = 1000\nmax_orders_per_hour = 1")
+        reader = session.registry.read_client(session.target)
+
+        def unsigned(base_url, account, default_slippage, perp_dexs):
+            assert account is None
+            return reader
+
+        registry = AccountRegistry(session.registry._config, {}, unsigned, SharedState(tmp_path / "absent"))
+        tool = next(t for t in risk_tools(registry) if t.name == "plan_trade")
+        preview = tool.run(self.ARGS)["data"]["execution"]
+        assert preview["eligible"] is True and preview["trading_enabled"] is False
+        assert not (tmp_path / "absent").exists()
+        assert registry._traders == {}
+
+    def test_unknown_halt_state_does_not_claim_eligibility(self):
+        session = self.session()
+        session.registry._state = None
+        preview = self.plan(session)
+        assert preview["eligible"] is None
+        assert "shared halt" in preview["error"]["message"]

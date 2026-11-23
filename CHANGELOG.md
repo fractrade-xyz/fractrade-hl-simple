@@ -4,10 +4,69 @@ All notable changes to fractrade-hl-simple will be documented in this file.
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-11-23
+
+This release includes the library and MCP
+changes recorded under [0.4.0rc1](#040rc1---2026-11-20), plus the improvements below,
+previously verified in the unpublished 0.4.0rc2 build. Coming from 0.3, read
+[Behaviour changes to check in your code](#behaviour-changes-to-check-in-your-code)
+before upgrading. Installation is described in the
+[README](README.md#installation--updates).
+
+- **Account and risk reads identify observation time and scope.** `get_account`,
+  `get_positions`, `get_open_orders`, `get_position_risk`, `get_account_risk`, `plan_trade`
+  and `get_changes` report read-completion time and actual perp scope/filter metadata.
+  The planner's narrower account scope and the change feed's broader history scope are
+  explicit. Source timestamps, nulls and existing data fields are preserved. `get_changes`
+  now timestamps read completion rather than call start; an empty interval with no fresh
+  snapshot returns null `observed_at` and `scope`, keeping its cursor unchanged. No extra
+  requests, automatic refresh or trading changes.
+
+- **`get_changes` explains protection-size mismatches.** Coverage rows now report stop
+  shortfalls and informational notices when remaining fixed-size stops or targets exceed
+  the live position, with quantities, order IDs and review hints. Multiple levels and
+  intentional overlaps remain supported; whole-position TP/SL are excluded from fixed-size
+  excess checks. This is reporting only, using the existing reads with no order changes.
+
+- **MCP IOC limit entries support multiple stops and targets.** Pass `time_in_force: "Ioc"`
+  with `open_position.limit_price` (or `plan_trade.entry_price`). The unfilled remainder
+  is canceled and protection uses the actual fill. The default Gtc attached-bracket
+  behavior is unchanged.
+- **`plan_trade` previews submission checks.** `data.execution` reports rounded arguments,
+  preparation/guard results, eligibility, used/pending/proposed margin and observation time
+  in the account's trading scope. It shares preparation and guard logic with submission,
+  requires no signing key and writes no shared state. Unknown eligibility is explicit;
+  signer authorization and exchange acceptance remain execution-time checks. Protected
+  MCP entries below the $10 minimum are now rejected locally before submission.
+
+- **Account-risk margin reports include pending entries.** `get_account_risk` now uses
+  the same pending-margin calculation and total-margin check as submission, and reports
+  the used/pending total, configured limit and remaining policy budget. Failed pending
+  estimates are unknown with warnings. Exchange free-margin figures remain separate.
+
+- **MCP kill switch cancels every non-reduce-only perp order**, including orders opposing a
+  position, which can reverse it. Cancellation no longer needs a position read. Independent
+  reduce-only protection and spot orders are preserved.
+- **MCP total-margin checks include pending entries.** `max_total_margin_pct` now adds the
+  remaining non-reduce-only perp orders at each market's leverage to used position margin
+  and the proposed order or batch. Modifying an order replaces its previous contribution;
+  reduce-only protection adds none. Missing required data blocks new exposure. Some entries
+  accepted by `0.4.0rc1` are now refused because earlier resting entries consume the budget.
+- **New MCP `refresh_market_specs` tool** reloads metadata for the selected network's reader
+  and existing trading clients, so new listings can be traded without restarting. Replacements
+  are published together; failure keeps the existing clients usable. It works without trading
+  enabled and preserves dex scope, limits, halts, order counts and used client order IDs.
+  `UNKNOWN_SYMBOL` hints now explain when to refresh and when to enable another dex instead.
+- **Two-connector workflow and contributor guides** cover Fractrade research, Hyperliquid
+  account checks, planning, execution, protection checks and recovery, plus development and
+  verification commands. Ruff and mypy are declared as development dependencies; the test
+  workflow and CI are unchanged.
+
 ## [0.4.0rc1] - 2026-11-20
 
-The release candidate of 0.4.0. It is not on PyPI: install it from the tag `v0.4.0rc1` on GitHub
-([README](README.md#installation--updates)).
+The earlier release candidate, tagged `v0.4.0rc1` on GitHub. Its changes are included in
+0.4.0; use the [current installation instructions](README.md#installation--updates)
+for the final version.
 
 Orders you can rely on: no order is sent twice, the exchange's answer to every signed action is checked, and the library's errors are documented exceptions. Many fixes change what a call returns or raises, so read "Behaviour changes to check in your code" before you upgrade. The methods are described in the [README](README.md), the MCP server in [docs/mcp.md](docs/mcp.md).
 

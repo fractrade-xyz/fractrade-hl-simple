@@ -2,7 +2,8 @@
 written out here; the server checks the arguments exactly (no type coercion, no unknown
 parameters). Tools about one wallet read it through the client without a key of its
 base_url, passing the address, and answer in the common envelope (`account`, `address`, `base_url`).
-enable_perp_dexs is here too: it changes which HIP-3 dexes are read, not what is traded."""
+Local metadata tools live here too: enable_perp_dexs changes the dex scope, while
+refresh_market_specs reloads metadata within the existing scope."""
 
 from __future__ import annotations
 
@@ -44,6 +45,9 @@ MARKET_KIND = {"type": "string", "enum": ["perp", "spot"], "default": "perp",
                               "pairs with another quote (HYPE/USDT0)."}
 FILLS_LIMIT = 500
 RECENT_FILLS = 2000      # userFills returns at most the 2000 most recent fills
+OBSERVATION_TEXT = (" Returns observed_at (UTC completion of the reads, not an atomic exchange snapshot) and "
+                    "scope: perp_dexs actually read (empty string means native perps) and the symbol filter "
+                    "or null. Scope does not imply data outside it is absent; null figures remain unknown.")
 
 
 def read_tools(config: Config, registry: AccountRegistry) -> list[ToolSpec]:
@@ -51,6 +55,7 @@ def read_tools(config: Config, registry: AccountRegistry) -> list[ToolSpec]:
     return [
         _list_accounts(config, registry),
         _enable_perp_dexs(registry),
+        _refresh_market_specs(registry),
         _get_account(registry),
         _get_positions(registry),
         _get_open_orders(registry),
@@ -99,6 +104,19 @@ def _wallet_tool(registry: AccountRegistry, name: str, description: str, propert
         return {"account": target.name, "address": target.address, "base_url": target.base_url, **result}
 
     return ToolSpec(name=name, description=description, input_schema=_schema(properties, required), run=run)
+
+
+def _observation(client: Any, *, symbol: Optional[str] = None,
+                 perp_dexs: Optional[Iterable[str]] = None) -> dict[str, Any]:
+    """Metadata after a report's reads. Use its actual client, not current registry config:
+    a refresh may have replaced it, and a planner may use a narrower account client.
+
+    perp_dexs describes the perp account context read, not all possible data sources (for
+    example collateral, fees or wallet-wide history). symbol describes the output filter.
+    A tool reading only one dex, or spot orders only, supplies that scope explicitly.
+    """
+    return {"observed_at": _iso(int(time.time() * 1000)),
+            "scope": {"perp_dexs": list(client.perp_dexs if perp_dexs is None else perp_dexs), "symbol": symbol}}
 
 
 def _listed(items: list[Any], total: Optional[int] = None) -> dict[str, Any]:
@@ -252,6 +270,34 @@ def _enable_perp_dexs(registry: AccountRegistry) -> ToolSpec:
     )
 
 
+# ── refresh_market_specs ──────────────────────────────────────────────
+
+
+def _refresh_market_specs(registry: AccountRegistry) -> ToolSpec:
+    def run(arguments: dict[str, Any]) -> dict[str, Any]:
+        base_url = arguments.get("base_url", TOOL_BASE_URLS[0])
+        result = registry.refresh_market_specs(base_url)
+        return {"base_url": base_url, "observed_at": _iso(int(time.time() * 1000)), **result}
+
+    return ToolSpec(
+        name="refresh_market_specs",
+        description=(
+            "Refresh market metadata and SDK symbol tables from Hyperliquid, bypassing the metadata cache, "
+            "for this server's reader and existing trading clients at base_url (default mainnet). Use after "
+            "a new listing is visible in list_markets but an order reports UNKNOWN_SYMBOL. All replacements "
+            "are published together; a failure keeps the previous clients usable, and calls already running "
+            "may finish on them. Later lazy clients use fresh metadata too. Returns observed_at, dexes_read "
+            "(including default), perp_markets (count), and trading_clients (account, dexes_traded, perp_markets). "
+            "Sends no signed action and works with trading disabled. Does not enable dexes or change limits, "
+            "halts, order counts or used client order ids. For another dex use enable_perp_dexs. Another chat "
+            "runs its own server and may need its own refresh."
+        ),
+        input_schema={"type": "object", "properties": {"base_url": MARKET_BASE_URL},
+                      "required": [], "additionalProperties": False},
+        run=run, read_only=False, destructive=False, idempotent=True,
+    )
+
+
 # ── get_account ───────────────────────────────────────────────────────
 
 
@@ -260,7 +306,7 @@ def _get_account(registry: AccountRegistry) -> ToolSpec:
         summary: AccountSummary = client.get_account_summary(address=target.address)
         orders = [o for o in client.get_open_orders(address=target.address) if o.market in PERP_MARKETS]
         positions = [p for dex in summary.dexes for p in dex.positions if p.size != 0]
-        return {"data": {
+        return {**_observation(client), "data": {
             "mode": summary.mode,
             "account_value": summary.account_value,
             "available_to_trade": summary.available_to_trade,
@@ -281,7 +327,7 @@ def _get_account(registry: AccountRegistry) -> ToolSpec:
         "enabled HIP-3 dexes; others are not read): each dex, the open positions and the number of open perp "
         "orders. A figure that is not "
         "established for the mode is null; sources says how each one was computed and what is left out. The "
-        "figures come from separate requests a moment apart.",
+        "figures come from separate requests a moment apart." + OBSERVATION_TEXT,
         None, read)
 
 
@@ -306,14 +352,14 @@ def _get_positions(registry: AccountRegistry) -> ToolSpec:
                      if p.size != 0 and (symbol is None or p.symbol == symbol)]
         if not positions:
             _check_unmatched_symbol(client, symbol)
-        return _listed([_position(p) for p in positions])
+        return {**_observation(client, symbol=symbol), **_listed([_position(p) for p in positions])}
 
     return _wallet_tool(
         registry, "get_positions",
         "Open perp positions of a wallet, on Hyperliquid's own perps and the enabled HIP-3 dexes (see "
         "enable_perp_dexs): symbol, side (long/short), "
         "size in base units, entry price, notional, unrealized PnL, return on equity, leverage and margin "
-        "mode, liquidation price, margin used, funding since open.",
+        "mode, liquidation price, margin used, funding since open." + OBSERVATION_TEXT,
         {"symbol": SYMBOL}, read)
 
 
@@ -323,13 +369,19 @@ def _get_positions(registry: AccountRegistry) -> ToolSpec:
 def _get_open_orders(registry: AccountRegistry) -> ToolSpec:
     def read(client: Any, target: Target, arguments: dict[str, Any]) -> dict[str, Any]:
         symbol = arguments.get("symbol")
-        if arguments.get("market", "perp") == "spot":
+        market = arguments.get("market", "perp")
+        dexes: list[str]
+        if market == "spot":
             orders = client.get_spot_open_orders(symbol, address=target.address)
+            dexes = []
         else:  # the default dex's open orders include the spot and outcome ones
             orders = [o for o in client.get_open_orders(symbol, address=target.address) if o.market in PERP_MARKETS]
             if not orders:
                 _check_unmatched_symbol(client, symbol)
-        return _listed([_order(o) for o in orders])
+            dexes = [_dex(symbol) or ""] if symbol is not None else client.perp_dexs
+        observation = _observation(client, symbol=symbol, perp_dexs=dexes)
+        observation["scope"]["market"] = market
+        return {**observation, **_listed([_order(o) for o in orders])}
 
     return _wallet_tool(
         registry, "get_open_orders",
@@ -342,7 +394,7 @@ def _get_open_orders(registry: AccountRegistry) -> ToolSpec:
         "limit and trigger price, reduce-only, time in force, created at. For a reduce-only order with less open "
         "than placed, Hyperliquid may have shrunk it to the position: filled_size is then null and reduced_size "
         "the size no longer open. market: perp (default, every enabled dex) or spot (symbol is then a token, "
-        "e.g. HYPE).",
+        "e.g. HYPE)." + OBSERVATION_TEXT + " scope.market is perp or spot; spot orders have no perp_dexs.",
         {"symbol": SYMBOL, "market": MARKET_KIND},
         read)
 

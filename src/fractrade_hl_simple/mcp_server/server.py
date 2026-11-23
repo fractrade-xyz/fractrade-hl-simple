@@ -59,8 +59,8 @@ Trade tools trade real money for `account`, or without it the only account that 
 (never the default account), within its limits. Orders without limit_price are market \
 orders. On OUTCOME_UNKNOWN never call again: follow the hint; an order not found by its cloid \
 can still arrive. After a trade call without an answer, check \
-positions, open orders and fills first. kill_switch halts trading, cancels entry orders (with \
-stops attached to them) and keeps stop losses."""
+positions, open orders and fills first. kill_switch halts trading and cancels non-reduce-only \
+perp orders and their attached stops; other reduce-only orders stay."""
 
 
 @dataclass(frozen=True)
@@ -96,12 +96,13 @@ class ToolSpec:
 
 
 def make_client(base_url: str, account: Optional[HyperliquidAccount], default_slippage: Optional[float],
-                perp_dexs: tuple[str, ...]) -> HyperliquidClient:
+                perp_dexs: tuple[str, ...], *, cache_market_specs: bool = True) -> HyperliquidClient:
     """The client factory of the account registry: nothing comes from the environment."""
     if default_slippage is None:  # a client without a key places no orders
-        return HyperliquidClient(account=account, base_url=base_url, trust_env=False, perp_dexs=list(perp_dexs))
+        return HyperliquidClient(account=account, base_url=base_url, trust_env=False, perp_dexs=list(perp_dexs),
+                                 cache_market_specs=cache_market_specs)
     return HyperliquidClient(account=account, base_url=base_url, trust_env=False, perp_dexs=list(perp_dexs),
-                             default_slippage=default_slippage)
+                             default_slippage=default_slippage, cache_market_specs=cache_market_specs)
 
 
 def to_json(data: Any) -> str:

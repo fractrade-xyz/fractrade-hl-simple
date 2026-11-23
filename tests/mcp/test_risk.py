@@ -11,7 +11,8 @@ pytest.importorskip("mcp")  # the server needs the [mcp] extra
 import anyio  # noqa: E402
 from mcp import Client  # noqa: E402
 
-from fractrade_hl_simple.mcp_server import risk  # noqa: E402
+from fractrade_hl_simple.exceptions import NetworkException  # noqa: E402
+from fractrade_hl_simple.mcp_server import guards, risk  # noqa: E402
 from fractrade_hl_simple.mcp_server.accounts import AccountRegistry  # noqa: E402
 from fractrade_hl_simple.mcp_server.config import parse_config  # noqa: E402
 from fractrade_hl_simple.mcp_server.server import build_server  # noqa: E402
@@ -246,7 +247,16 @@ class FakeClient:
         self.perp_dexs, self.market_specs = [""], {"ICP": {"size_decimals": 1}, "BTC": {"size_decimals": 5}}
 
     def prepare_order(self, symbol, size, is_buy, limit_price=None, slippage=None):
-        return size, float(f"{limit_price:.5g}")  # 5 significant figures, as Hyperliquid
+        if limit_price is None:
+            limit_price = self._mid_price(symbol) * (1 + (slippage or 0.02) * (1 if is_buy else -1))
+        return size, self._format_price(symbol, limit_price)
+
+    def _format_price(self, symbol, price):
+        return float(f"{price:.5g}")  # 5 significant figures, as Hyperliquid
+
+    def _mid_price(self, symbol):
+        book = self.answers["get_order_book"]
+        return (float(book["bids"][0]["price"]) + float(book["asks"][0]["price"])) / 2
 
     def get_markets(self):
         from types import SimpleNamespace
@@ -255,7 +265,10 @@ class FakeClient:
     def __getattr__(self, method):
         def call(*args, **kwargs):
             self.calls.append(method)
-            return self.answers[method]
+            answer = self.answers[method]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer(*args, **kwargs) if callable(answer) else answer
         return call
 
 
@@ -356,6 +369,118 @@ def account_answers(**changes):
 
 
 class TestGetAccountRisk:
+    @pytest.mark.parametrize("pending", [150, 200, 250])
+    def test_pending_margin_and_policy_budget_match_submission(self, pending):
+        summary = AccountSummary(mode="unified", account_value=D(1000), available_to_trade=D(900),
+                                 margin_used=D(100), balances=[], dexes=[], sources={})
+        entry = icp_order(9, "limit", "100", str(pending / 20), reduce_only=False)
+        reads = []
+
+        def orders(*, address):
+            assert address == MAIN
+            reads.append("orders")
+            return [entry]
+
+        def account(address):
+            assert address == MAIN
+            reads.append("summary")
+            return summary
+
+        is_error, body = run("get_account_risk", {}, account_answers(
+            get_open_orders=orders, get_account_summary=account), config_text=CONFIG + "max_total_margin_pct = 30\n")
+
+        assert not is_error, body
+        margin = body["data"]["margin"]
+        assert D(margin["pending_margin"]) == pending
+        assert D(margin["total_margin"]) == 100 + pending
+        assert D(margin["margin_limit"]) == 300
+        assert D(margin["remaining_margin_budget"]) == 200 - pending
+        assert margin["max_total_margin_pct"] == "30"
+        assert margin["free_margin"] == "900"  # exchange balance, not the policy budget
+        check = guards.total_margin(D(100), D(pending), D(0), D(1000), D(30), "open orders")
+        warnings = [w for w in body["data"]["warnings"] if "max_total_margin_pct" in w]
+        assert bool(warnings) is (not check.passed)
+        if warnings:
+            assert check.detail in warnings[0]
+        assert reads.index("orders") < reads.index("summary")
+
+    def test_pending_margin_uses_remaining_size_each_markets_leverage_and_sell_mid(self):
+        buy = icp_order(9, "limit", "100", "10", reduce_only=False)
+        buy.filled_size = D(4)  # only six remain: 6 * 100 / 5 = 120
+        sell = icp_order(10, "limit", "90", "2", is_buy=False, reduce_only=False)  # 2 * 110 / 5 = 44
+        trigger = icp_order(11, "trigger_entry", "120", "2", reduce_only=False)
+        trigger.symbol, trigger.limit_price = "xyz:NVDA", D(130)  # 2 * 130 / 10 = 26
+        trigger.market = "hip3_perp"
+        protection = icp_order(12, "stop_loss", "80", "500")
+        spot = icp_order(13, "limit", "100", "500", reduce_only=False)
+        spot.symbol, spot.market = "@1", "spot"
+        looked_up = []
+
+        def leverage(symbol, *, address):
+            assert address == MAIN
+            looked_up.append(symbol)
+            return Leverage(type="cross", value=D({"ICP": 5, "xyz:NVDA": 10}[symbol]))
+
+        is_error, body = run("get_account_risk", {}, account_answers(
+            get_positions=[], get_open_orders=[buy, sell, trigger, protection, spot],
+            get_leverage=leverage, get_price={"ICP": 110.0}))
+
+        assert not is_error, body
+        assert D(body["data"]["margin"]["pending_margin"]) == 190
+        assert looked_up == ["ICP", "xyz:NVDA"]
+
+    @pytest.mark.parametrize("missing", ["leverage", "mid", "mid_request"])
+    def test_unavailable_pending_inputs_keep_the_report_but_never_show_zero_budget_use(self, missing):
+        changes = {"get_open_orders": [icp_order(9, "limit", "2.30", "100", is_buy=False, reduce_only=False)],
+                   "get_price": {"ICP": 2.54}}
+        if missing == "leverage":
+            changes["get_leverage"] = NetworkException("unavailable")
+        elif missing == "mid_request":
+            changes["get_price"] = NetworkException("unavailable")
+        else:
+            changes["get_price"] = {}
+        is_error, body = run("get_account_risk", {}, account_answers(**changes),
+                             config_text=CONFIG + "max_total_margin_pct = 50\nmax_total_notional_x = 3\n")
+
+        assert not is_error, body
+        assert body["data"]["positions"]  # the useful account report survives an optional estimate failure
+        margin = body["data"]["margin"]
+        assert margin["pending_margin"] is None and margin["total_margin"] is None
+        assert margin["remaining_margin_budget"] is None and margin["margin_limit"] == "750"
+        assert any("pending entry margin" in w for w in body["data"]["warnings"])
+        assert any("max_total_margin_pct cannot be checked" in w for w in body["data"]["warnings"])
+        if missing != "leverage":
+            assert any("total notional cannot be checked" in w for w in body["data"]["warnings"])
+        else:
+            assert not any("total notional cannot be checked" in w for w in body["data"]["warnings"])
+
+    def test_no_pending_entries_need_no_leverage_or_mid_reads(self):
+        protection = icp_order(1, "stop_loss", "2.62", "1301.6")
+        spot = icp_order(2, "limit", "100", "500", reduce_only=False)
+        spot.symbol, spot.market = "@1", "spot"
+        is_error, body = run("get_account_risk", {}, account_answers(
+            get_open_orders=[protection, spot], get_leverage=AssertionError("unneeded leverage read"),
+            get_price=AssertionError("unneeded mid read")))
+
+        assert not is_error, body
+        margin = body["data"]["margin"]
+        assert margin["pending_margin"] == "0" and margin["total_margin"] == "650"
+        assert margin["margin_limit"] is None and margin["remaining_margin_budget"] is None
+        assert margin["max_total_margin_pct"] is None
+
+    @pytest.mark.parametrize("missing", ["account_value", "margin_used"])
+    def test_unknown_account_figures_leave_the_policy_budget_unknown(self, missing):
+        summary = AccountSummary(mode="portfolio_margin", account_value=D(1000), available_to_trade=None,
+                                 margin_used=D(100), balances=[], dexes=[], sources={})
+        setattr(summary, missing, None)
+        is_error, body = run("get_account_risk", {}, account_answers(get_positions=[], get_open_orders=[],
+                             get_account_summary=summary), config_text=CONFIG + "max_total_margin_pct = 30\n")
+
+        assert not is_error, body
+        margin = body["data"]["margin"]
+        assert margin["pending_margin"] == "0" and margin["remaining_margin_budget"] is None
+        assert any("max_total_margin_pct cannot be checked" in w for w in body["data"]["warnings"])
+
     def test_every_position_with_its_protection_and_the_totals(self):
         is_error, body = run("get_account_risk", {}, account_answers())
         data = body["data"]
@@ -367,7 +492,8 @@ class TestGetAccountRisk:
         assert (data["totals"]["short_notional"], data["totals"]["net_notional"], data["totals"]["unprotected_positions"]) \
             == ("3290.00", "-3290.00", 1)
         assert data["margin"] == {"account_value": "1500", "margin_used": "650", "free_margin": "800",
-                                  "free_margin_percent": "53.33"}
+                                  "free_margin_percent": "53.33", "pending_margin": "46.00", "total_margin": "696.00",
+                                  "max_total_margin_pct": None, "margin_limit": None, "remaining_margin_budget": None}
         assert data["daily_loss"] == {"loss_24h": "50.00", "percent_of_account": "3.33", "max_daily_loss_pct": "10"}
         assert any(w.startswith("ICP: ") and "433.9 has no stop" in w for w in data["warnings"])
 
@@ -399,7 +525,7 @@ class TestGetAccountRisk:
         assert not is_error, body
         assert "ICP: not in the account's symbols" in warnings
         assert "ICP: leverage 5 is above max_leverage 3" in warnings
-        assert any("margin in use 43.33 % is above max_total_margin_pct" in w for w in warnings)
+        assert any("696 USD is above 40 %" in w and "max_total_margin_pct" in w for w in warnings)
         assert any("free margin is 6.67 %" in w for w in warnings)
 
     def test_with_beta_each_position_and_the_weighted_net_notional(self):
@@ -456,6 +582,7 @@ class TestPlanTrade:
     def test_a_given_size(self):
         is_error, body = run("plan_trade", {"symbol": "ICP", "side": "long", "stop_loss": 2.40, "size": 100})
         assert not is_error and body["data"]["size"] == "100.0" and body["data"]["risk_budget"] is None
+        assert body["data"]["execution"]["eligible"] is None  # watch-only account: no trading policy
 
     @pytest.mark.parametrize("arguments, says", [
         ({"side": "long", "stop_loss": 2.60, "size": 100}, "must be below the entry"),
@@ -467,6 +594,7 @@ class TestPlanTrade:
         ({"side": "long", "stop_loss": 2.40}, "exactly one of size, risk_usd and risk_pct"),
         ({"side": "long", "stop_loss": 2.40, "size": 100, "risk_usd": 10}, "exactly one of"),
         ({"side": "long", "stop_loss": 2.40, "size": 0.01}, "rounds to 0"),
+        ({"side": "long", "stop_loss": 2.40, "size": 100, "time_in_force": "Ioc"}, "requires entry_price"),
     ])
     def test_invalid_plans_are_refused(self, arguments, says):
         is_error, body = run("plan_trade", {"symbol": "ICP", **arguments})
@@ -475,6 +603,15 @@ class TestPlanTrade:
     def test_an_order_below_the_minimum_is_named(self):
         is_error, body = run("plan_trade", {"symbol": "ICP", "side": "long", "stop_loss": 2.40, "size": 3})
         assert not is_error and any("below Hyperliquid's minimum order" in w for w in body["data"]["warnings"])
+        assert body["data"]["execution"]["eligible"] is False
+
+    def test_an_ioc_plan_uses_taker_fees_even_when_its_limit_cannot_fill_now(self):
+        error, body = run("plan_trade", {"symbol": "ICP", "side": "long", "size": 100,
+                                        "entry_price": 2.50, "time_in_force": "Ioc", "stop_loss": 2.40})
+        assert not error, body
+        assert body["data"]["entry"] == "limit (taker)"
+        assert body["data"]["fees"]["entry_fee"] == "0.11"
+        assert any("partly or not at all" in w for w in body["data"]["warnings"])
 
     def test_a_limit_entry_is_planned_at_its_price_as_a_maker(self):
         is_error, body = run("plan_trade", {"symbol": "ICP", "side": "long", "entry_price": 2.50,
@@ -558,3 +695,60 @@ class TestPartialFillsNeverLoseMore:
         losses = [self.lost(n, book, stops) for n in range(1, int(sum(level[1] for level in bids)) + 1)]
         known = [loss for loss in losses if loss is not None]
         assert all(a <= b for a, b in zip(known, known[1:]))
+
+
+class TestObservationMetadata:
+    @pytest.mark.parametrize("name, arguments", [
+        ("get_position_risk", {"symbol": "ICP"}),
+        ("get_account_risk", {}),
+        ("plan_trade", {"symbol": "ICP", "side": "long", "size": 100, "stop_loss": 2.4}),
+    ])
+    def test_scope_and_timestamp_cover_all_risk_reads(self, monkeypatch, name, arguments):
+        from fractrade_hl_simple.mcp_server.tools import read
+        from fractrade_hl_simple.mcp_server.convert import iso
+        clock = [1_795_000_000.0]
+        original = FakeClient.__getattr__
+
+        def delayed(self, method):
+            call = original(self, method)
+
+            def finish(*args, **kwargs):
+                answer = call(*args, **kwargs)
+                clock[0] += 1
+                return answer
+            return finish
+
+        monkeypatch.setattr(FakeClient, "__getattr__", delayed)
+        monkeypatch.setattr(read.time, "time", lambda: clock[0])
+        error, body = run(name, arguments, account_answers() if name == "get_account_risk" else None)
+        assert not error, body
+        assert body["observed_at"] == iso(int(clock[0] * 1000))
+        assert clock[0] > 1_795_000_000.0
+        assert body["scope"] == {"perp_dexs": [""], "symbol": arguments.get("symbol")}
+        if name == "plan_trade":
+            assert body["observed_at"] == body["data"]["execution"]["observed_at"]
+
+    def test_planning_scope_uses_the_account_reader_not_the_broader_network_reader(self):
+        from fractrade_hl_simple.mcp_server.tools.risk import risk_tools
+        conf = parse_config('''
+[accounts.main]
+address = "0x1111111111111111111111111111111111111111"
+[accounts.other]
+address = "0x2222222222222222222222222222222222222222"
+perp_dexs = ["xyz"]
+''', "scope.toml")
+        scopes = []
+
+        def factory(base_url, account, default_slippage, perp_dexs):
+            assert account is None
+            client = FakeClient(answers())
+            client.perp_dexs = ["", *perp_dexs]
+            scopes.append(client.perp_dexs)
+            return client
+
+        registry = AccountRegistry(conf, {}, factory)
+        tool = next(t for t in risk_tools(registry) if t.name == "plan_trade")
+        body = tool.run({"account": "main", "symbol": "ICP", "side": "long", "size": 100, "stop_loss": 2.4})
+        assert scopes == [["", "xyz"], [""]]
+        assert body["scope"] == {"perp_dexs": [""], "symbol": "ICP"}
+        assert registry._traders == {}

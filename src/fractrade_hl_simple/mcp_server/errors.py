@@ -28,7 +28,7 @@ from ..exceptions import (
     HyperliquidException, MakerOrderIncompleteException, OrderOutcomeUnknownException, OrdersNotCanceledException,
     PositionNotClosedException, ProtectionOrderException, ProtectionReplacementIncompleteException,
     ProtectionSyncIncompleteException,
-    ServerErrorException, UnsupportedAccountModeException,
+    ServerErrorException, UnknownSymbolException, UnsupportedAccountModeException,
 )
 from ..models import Order, Position
 from . import convert, keys
@@ -73,9 +73,13 @@ DETAILS: tuple[tuple[type[HyperliquidException], tuple[str, ...]], ...] = (
     (UnsupportedAccountModeException, ("mode",)),
 )
 
-# What to do after an error whose outcome is unknown, most specific first; for a
-# library exception, which has no hint of its own.
+# Recovery hints for library exceptions, which have no hint of their own.
+# More specific exception types come before their base classes.
 HINTS: tuple[tuple[type[HyperliquidException], str], ...] = (
+    (UnknownSymbolException,
+     "check the exact symbol with list_markets; for a newly listed market, call refresh_market_specs with "
+     "the same base_url. Refresh affects this server only and does not enable a dex; use enable_perp_dexs "
+     "for that"),
     (OrderOutcomeUnknownException,
      "do not place the order again: look it up with get_order_status_by_cloid (details.cloid); an order "
      "not found yet can still arrive"),

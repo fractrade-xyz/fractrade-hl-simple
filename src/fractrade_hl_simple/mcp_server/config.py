@@ -71,7 +71,7 @@ class AccountConfig:
     perp_dexs: tuple[str, ...] = ()
     # Risk guardrails (None / False: not checked). Percentages of the account value.
     max_margin_pct: Optional[Decimal] = None         # one new order's margin
-    max_total_margin_pct: Optional[Decimal] = None   # margin in use with the new order
+    max_total_margin_pct: Optional[Decimal] = None   # used margin plus pending entries and the new order
     max_daily_loss_pct: Optional[Decimal] = None     # loss over the last 24 h, then no new risk
     isolated_only: bool = False                      # new risk only with isolated margin
     max_orders_per_hour: Optional[int] = None        # orders that add risk, per hour

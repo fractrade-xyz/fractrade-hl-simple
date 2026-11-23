@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "fractrade-hl-simple"
-version = "0.4.0rc1"
+version = "0.4.0"
 description = "Python client for Hyperliquid perpetual futures, with an MCP server for Claude Code and Claude Desktop"
 authors = ["crjameson <93468664+crjameson@users.noreply.github.com>"]
 license = "MIT"
@@ -42,6 +42,8 @@ fractrade-hl-mcp = "fractrade_hl_simple.mcp_server.__main__:main"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.2.0"
+ruff = "^0.17.5"
+mypy = "^2.4.1"
 
 [tool.poetry.group.test.dependencies]
 requests-mock = "^1.12.1"

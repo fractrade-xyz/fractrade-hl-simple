@@ -219,6 +219,9 @@ class TestReported:
         coverage = Feed(wallet).call()["protection"]["coverage"]
         # The position as read first, none of it under a stop by the latest read.
         assert [(c["size"], c["stop_size"], c["unprotected_size"]) for c in coverage] == [("4", "0", "4")]
+        warning, = coverage[0]["warnings"]
+        assert warning["code"] == "STOP_COVERAGE_GAP" and warning["unprotected_size"] == "4"
+        assert warning["order_ids"] == []
 
     @pytest.mark.parametrize("fills, second_open, reported", [
         ([], "191", ("0", "9")),                                                     # shrunk by Hyperliquid
@@ -239,3 +242,147 @@ class TestReported:
         else:  # a full list of recent orders that does not reach back to the interval's start
             wallet.listed = [order(i, status="filled", status_time=END - i) for i in range(changes.HISTORICAL_ORDERS_LIMIT)]
         assert [gap["what"] for gap in Feed(wallet).call()["gaps"]] == [cut]
+
+
+class TestProtectionWarnings:
+    @pytest.mark.parametrize("is_long", [True, False], ids=["long", "short"])
+    def test_reduction_leaves_both_ladders_larger_than_the_position(self, wallet, is_long):
+        wallet.positions = [position("BTC", "0.6" if is_long else "-0.6")]
+        wallet.fills = [fill(END - 10, side="A" if is_long else "B", size="0.4", start="1" if is_long else "-1")]
+        wallet.fills[0].direction = "Close Long" if is_long else "Close Short"
+        wallet.open = [[
+            order(1, size="0.5", kind="stop_loss", price="90", is_buy=not is_long),
+            order(2, size="0.5", kind="stop_loss", price="80", is_buy=not is_long),
+            order(3, size="0.5", kind="take_profit", price="110", is_buy=not is_long),
+            order(4, size="0.5", kind="take_profit", price="120", is_buy=not is_long),
+        ]]
+        body = Feed(wallet).call()
+        row = body["protection"]["coverage"][0]
+        assert (row["size"], row["stop_size"], row["take_profit_size"], row["unprotected_size"]) == (
+            "0.6", "1.0", "1.0", "0")
+        warnings = {w["code"]: w for w in row["warnings"]}
+        assert set(warnings) == {"STOP_SIZE_EXCEEDS_POSITION", "TAKE_PROFIT_SIZE_EXCEEDS_POSITION"}
+        for code, ids in (("STOP_SIZE_EXCEEDS_POSITION", [1, 2]), ("TAKE_PROFIT_SIZE_EXCEEDS_POSITION", [3, 4])):
+            warning = warnings[code]
+            assert (warning["symbol"], warning["position_size"], warning["order_size"], warning["excess_size"]) == (
+                "BTC", "0.6", "1.0", "0.4")
+            assert warning["order_ids"] == ids and warning["severity"] == "info"
+            assert "intentional" in warning["message"] and "sync_protection" in warning["hint"]
+
+    @pytest.mark.parametrize("stop_size", ["0", "0.6"])
+    def test_missing_stop_coverage_names_the_uncovered_amount(self, wallet, stop_size):
+        wallet.positions = [position("BTC", "1")]
+        wallet.open = [[order(1, size=stop_size, kind="stop_loss", price="90")]] if stop_size != "0" else [[]]
+        row = Feed(wallet).call()["protection"]["coverage"][0]
+        warning, = row["warnings"]
+        assert warning["code"] == "STOP_COVERAGE_GAP" and warning["severity"] == "warning"
+        assert Decimal(warning["unprotected_size"]) == Decimal(1) - Decimal(stop_size)
+        assert warning["unprotected_size"] == row["unprotected_size"]
+        assert warning["order_ids"] == ([1] if stop_size != "0" else [])
+        assert "sync_protection" in warning["hint"]
+
+    @pytest.mark.parametrize("targets", [[], ["0.2", "0.3"], ["0.4", "0.6"]], ids=["none", "partial", "full"])
+    def test_multiple_levels_and_partial_or_absent_targets_are_valid(self, wallet, targets):
+        wallet.positions = [position("BTC", "1")]
+        wallet.open = [[order(1, size="0.4", kind="stop_loss", price="90"),
+                        order(2, size="0.6", kind="stop_loss", price="80"),
+                        *[order(i + 3, size=size, kind="take_profit", price=str(110 + i))
+                          for i, size in enumerate(targets)]]]
+        row = Feed(wallet).call()["protection"]["coverage"][0]
+        assert row["warnings"] == [] and row["unprotected_size"] == "0"
+        assert Decimal(row["take_profit_size"]) == sum(map(Decimal, targets), Decimal(0))
+
+    def test_whole_position_orders_with_partial_exits_do_not_create_false_excess(self, wallet):
+        wallet.positions = [position("BTC", "0.6")]
+        whole = [order(i, size="0", kind=kind) for i, kind in enumerate(
+            ["stop_loss", "stop_loss", "take_profit", "take_profit"], 1)]
+        for o in whole:
+            o.is_position_tpsl = True
+        wallet.open = [[*whole, order(5, size="0.3", kind="stop_loss"), order(6, size="0.2", kind="take_profit")]]
+        row = Feed(wallet).call()["protection"]["coverage"][0]
+        assert (row["stop_size"], row["take_profit_size"], row["unprotected_size"]) == ("1.5", "1.4", "0")
+        assert row["warnings"] == []
+
+    def test_a_custom_sized_native_stop_is_fixed_and_the_hint_does_not_promise_to_resize_it(self, wallet):
+        wallet.positions = [position("BTC", "0.6")]
+        native = order(1, size="1", kind="stop_loss")
+        native.is_position_tpsl = True
+        wallet.open = [[native]]
+        warning, = Feed(wallet).call()["protection"]["coverage"][0]["warnings"]
+        assert warning["code"] == "STOP_SIZE_EXCEEDS_POSITION" and warning["order_ids"] == [1]
+        assert "Native position TP/SL" in warning["hint"] and "left untouched" in warning["hint"]
+
+    def test_remaining_sizes_are_used_after_partial_fills_or_exchange_shrinks(self, wallet):
+        wallet.positions = [position("BTC", "0.6")]
+        wallet.open = [[order(1, size="1", open_size="0.6", kind="stop_loss"),
+                        order(2, size="1", open_size="0.4", kind="take_profit")]]
+        row = Feed(wallet).call()["protection"]["coverage"][0]
+        assert wallet.reads == 2  # existing confirmation of reduced orders, no extra reads
+        assert row["warnings"] == []
+        assert row["stop_size"] == "0.6" and row["take_profit_size"] == "0.4"
+
+    def test_only_closing_reduce_only_exits_of_this_symbol_count(self, wallet):
+        wallet.positions = [position("xyz:NVDA", "0.6")]
+        wallet.open = [[order(1, symbol="xyz:NVDA", size="0.6", kind="stop_loss"),
+                        order(2, symbol="xyz:NVDA", size="0.4", kind="limit"),
+                        order(3, symbol="xyz:NVDA", size="0.4", kind="take_profit"),
+                        order(4, symbol="xyz:NVDA", size="5", kind="stop_loss", is_buy=True),
+                        order(5, symbol="xyz:NVDA", size="5", kind="take_profit", reduce_only=False),
+                        order(6, symbol="BTC", size="5", kind="stop_loss")]]
+        warning, = Feed(wallet).call()["protection"]["coverage"][0]["warnings"]
+        assert warning["code"] == "TAKE_PROFIT_SIZE_EXCEEDS_POSITION"
+        assert warning["symbol"] == "xyz:NVDA" and warning["order_ids"] == [2, 3]
+        assert warning["order_size"] == "0.8" and warning["excess_size"] == "0.2"
+
+    def test_fixed_overlapping_stops_are_a_review_notice_and_nothing_is_changed(self, wallet, monkeypatch):
+        from copy import deepcopy
+        wallet.positions = [position("BTC", "1")]
+        wallet.open = [[order(1, size="1", kind="stop_loss", price="90"),
+                        order(2, size="1", kind="stop_loss", price="80")]]
+        before = deepcopy((wallet.positions, wallet.open))
+
+        def forbidden(*args, **kwargs):
+            pytest.fail("get_changes must never change protection")
+
+        for method in ("create_order", "cancel_order", "modify_order", "resize_protection"):
+            monkeypatch.setattr(wallet, method, forbidden, raising=False)
+        warning, = Feed(wallet).call()["protection"]["coverage"][0]["warnings"]
+        assert warning["severity"] == "info" and "Overlap may be intentional" in warning["message"]
+        assert (wallet.positions, wallet.open) == before and wallet.reads == 1
+
+    def test_an_attached_child_waiting_for_its_entry_is_not_counted(self, wallet):
+        wallet.positions = [position("BTC", "0.6")]
+        entry = order(1, size="1", reduce_only=False)
+        entry.children = [{"oid": 2, "isTrigger": True, "reduceOnly": True, "sz": "1", "orderType": "Stop Market"}]
+        wallet.open = [[entry]]
+        warning, = Feed(wallet).call()["protection"]["coverage"][0]["warnings"]
+        assert warning["code"] == "STOP_COVERAGE_GAP" and warning["order_ids"] == []
+        assert warning["unprotected_size"] == "0.6"
+
+
+class TestObservationMetadata:
+    def test_completion_time_does_not_change_history_boundaries_or_event_times(self, wallet, monkeypatch):
+        from fractrade_hl_simple.mcp_server.tools import read
+        completed = NOW + 2_000
+        monkeypatch.setattr(read.time, "time", lambda: completed / 1000)
+        wallet.fills = [fill(END - 100, symbol="para:ABC")]
+        body = Feed(wallet).call()
+        assert body["observed_at"] == iso(completed)
+        assert body["interval"] == {"from": iso(START), "to": iso(END)}
+        assert body["cursor"] == iso(END + 1)
+        assert body["fills"][0]["last_time"] == iso(END - 100)
+        assert body["scope"] == {"perp_dexs": ["", "xyz"], "symbol": None, "history_all_perp_dexs": True}
+        assert body["positions"][0]["now_read"] is False and body["positions"][0]["now"] is None
+
+    def test_an_empty_interval_does_not_claim_a_fresh_empty_account_snapshot(self, wallet):
+        wallet.positions = [position("BTC", "1")]
+        feed = Feed(wallet)
+        first = feed.call()
+        count = wallet.reads
+        repeated = feed.call()  # interval still ends before the cursor; no account reads
+        assert repeated["observed_at"] is None and repeated["scope"] is None
+        assert repeated["cursor"] == first["cursor"] and wallet.reads == count
+        assert "no fresh" in repeated["note"]
+        later = feed.call(at=NOW + 10_000, symbol="BTC")
+        assert later["observed_at"] is not None and later["scope"]["symbol"] == "BTC"
+        assert later["protection"]["coverage"][0]["size"] == "1"

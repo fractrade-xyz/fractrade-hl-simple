@@ -22,7 +22,7 @@ from ..accounts import AccountRegistry, Target
 from ..convert import dex as _dex, iso as _iso, order as _order, side as _side
 from ..errors import ToolError
 from ..server import ToolSpec
-from .read import SYMBOL, TIME, _check_unmatched_symbol, _ms, _wallet_tool
+from .read import OBSERVATION_TEXT, SYMBOL, TIME, _check_unmatched_symbol, _ms, _observation, _wallet_tool
 from .risk import _exits
 
 MARGIN_MS = 5_000             # the interval ends this long before the call
@@ -72,14 +72,16 @@ def _get_changes(registry: AccountRegistry) -> ToolSpec:
             start = cursors.get(key, now - FIRST_LOOK_MS)
         end = now - MARGIN_MS
         if start > end:  # called again within seconds: nothing to read yet
-            return {"interval": {"from": _iso(start), "to": _iso(end)}, "observed_at": _iso(now),
+            return {"interval": {"from": _iso(start), "to": _iso(end)}, "observed_at": None, "scope": None,
                     "cursor": _iso(start), **_nothing(),
                     "note": f"the interval is empty: it ends {MARGIN_MS // 1000} seconds before the call; call "
-                            "again later"}
+                            "again later; no fresh positions or protection snapshot was read"}
         changes = _read_changes(client, target.address, symbol, start, end, now)
         # Never moved back: an older interval read again would report its events twice.
         cursors[key] = max(cursors.get(key, 0), changes["next"])
-        return {"interval": {"from": _iso(start), "to": _iso(changes["next"] - 1)}, "observed_at": _iso(now),
+        observation = _observation(client, symbol=symbol)
+        observation["scope"]["history_all_perp_dexs"] = True
+        return {**observation, "interval": {"from": _iso(start), "to": _iso(changes["next"] - 1)},
                 "cursor": _iso(changes["next"]), **{k: v for k, v in changes.items() if k != "next"}}
 
     return _wallet_tool(
@@ -89,14 +91,22 @@ def _get_changes(registry: AccountRegistry) -> ToolSpec:
         "Hyperliquid removed, e.g. reduceOnlyCanceled), the positions that changed (before, after, now), and "
         "protection: stops and take profits Hyperliquid removed or shrank, and each open position's size under "
         "stops and take profits (positions now and the protection snapshot are as of the call, not the interval's "
-        "end). Pass the returned cursor as since next time; without since, it continues where "
+        "end). Each protection.coverage row has warnings: STOP_COVERAGE_GAP for missing stop coverage; "
+        "STOP_SIZE_EXCEEDS_POSITION / TAKE_PROFIT_SIZE_EXCEEDS_POSITION are informational review notices "
+        "when remaining fixed-size exits exceed the position, with quantities and order ids. Overlap can be "
+        "intentional; whole-position TP/SL are excluded from fixed-size excess checks, and absent or partial "
+        "take profits are valid. Review intended levels before using sync_protection; this tool changes no "
+        "orders. Pass the returned cursor as since next time; without since, it continues where "
         "this server's last call for the wallet ended (the first call: the last hour). The interval ends 5 seconds "
         "before the call; events after it come next time. gaps lists where Hyperliquid's limits may have cut the "
         f"history (it keeps 10000 fills and lists {HISTORICAL_ORDERS_LIMIT} recent orders); more: true when the answer "
         f"stopped at about {MAX_EVENTS} events, call again with cursor. Each call reads fills (with Hyperliquid's "
         "completeness checks), historical orders, positions and open orders: about 60 to 80 + 22 per enabled dex of "
         "Hyperliquid's 1200 per minute, plus 1 per 20 items returned. Call it when needed (after a trade, at the "
-        "start of a turn), not in a loop.",
+        "start of a turn), not in a loop." + OBSERVATION_TEXT +
+        " scope.perp_dexs covers the current position/protection context; history_all_perp_dexs is true because "
+        "fills and order history cover every perp dex (still filtered by symbol when given). An empty interval "
+        "reads no fresh snapshot: observed_at and scope are null; keep the cursor and look again later.",
         {"since": SINCE, "symbol": SYMBOL}, read)
 
 
@@ -289,13 +299,48 @@ def _filled(fills: list[Fill], earlier: Optional[dict[str, Any]], truncated: boo
 
 def _coverage(position: Any, orders: list[Order]) -> dict[str, Any]:
     """The size of an open position under its stops and under its take profits (the risk
-    tools' reading: a TP/SL for the whole position covers all of it)."""
+    tools' reading: a TP/SL for the whole position covers all of it), with size warnings.
+
+    Keep the coverage totals unchanged. Only fixed-size exits count toward an excess:
+    a zero-size position TP/SL follows the live position, so its overlap is not a sizing
+    mismatch. A position TP/SL with its own positive size stays fixed, as in _exits.
+    Warnings describe this observation, not its cause or whether an overlap was intended.
+    """
     size = abs(position.size)
-    exits, _ = _exits([o for o in orders if o.symbol == position.symbol], position.is_long, size)
+    related = [o for o in orders if o.symbol == position.symbol]
+    exits, _ = _exits(related, position.is_long, size)
     stops = sum((e.size for e in exits if e.kind == "stop_loss"), Decimal(0))
     profits = sum((e.size for e in exits if e.kind == "take_profit"), Decimal(0))
+    unprotected = max(Decimal(0), size - stops)
+    warnings: list[dict[str, Any]] = []
+    hint = ("Review the intended levels against the live position before using sync_protection to resize "
+            "supported exits. Native position TP/SL and orders with attached children are left untouched.")
+    if unprotected > 0:
+        warnings.append({
+            "code": "STOP_COVERAGE_GAP", "severity": "warning", "symbol": position.symbol,
+            "position_size": size, "order_size": stops, "unprotected_size": unprotected,
+            "order_ids": [e.order_id for e in exits if e.kind == "stop_loss" and e.size > 0],
+            "message": f"Counted stop losses cover {stops} of the position's {size}; "
+                       f"{unprotected} has no counted stop coverage.",
+            "hint": hint,
+        })
+    whole_position = {o.order_id for o in related if o.is_position_tpsl and o.remaining_size == 0}
+    for kind, code in (("stop_loss", "STOP_SIZE_EXCEEDS_POSITION"),
+                       ("take_profit", "TAKE_PROFIT_SIZE_EXCEEDS_POSITION")):
+        fixed = [e for e in exits if e.kind == kind and e.order_id not in whole_position and e.size > 0]
+        total = sum((e.size for e in fixed), Decimal(0))
+        if total > size:
+            warnings.append({
+                "code": code, "severity": "info", "symbol": position.symbol,
+                "position_size": size, "order_size": total, "excess_size": total - size,
+                "order_ids": [e.order_id for e in fixed],
+                "message": f"Remaining fixed-size {kind.replace('_', ' ')} orders total {total} "
+                           f"for a position of {size}. Overlap may be intentional; review quantities "
+                           "and the allocation across levels.",
+                "hint": hint,
+            })
     return {"symbol": position.symbol, "side": "long" if position.is_long else "short", "size": size,
-            "stop_size": stops, "take_profit_size": profits, "unprotected_size": max(Decimal(0), size - stops)}
+            "stop_size": stops, "take_profit_size": profits, "unprotected_size": unprotected, "warnings": warnings}
 
 
 def _gaps(history: Any, listed: list[Order], start: int, end: int) -> list[dict[str, Any]]:

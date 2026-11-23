@@ -169,7 +169,14 @@ class SharedState:
     def risk_orders_last_hour(self, key: Key) -> int:
         """Only reads: the file is pruned when an order is counted."""
         with self.account_lock(key):
-            return len(_recent(_times(self.folder / f"{_name(key)}.orders"), time.time(), ORDER_WINDOW))
+            return self.peek_risk_orders_last_hour(key)
+
+    def peek_risk_orders_last_hour(self, key: Key) -> int:
+        """Read the last atomic file replacement, without creating a lock or state folder.
+
+        For a preview only: submission checks again while holding the account lock.
+        """
+        return len(_recent(_times(self.folder / f"{_name(key)}.orders"), time.time(), ORDER_WINDOW))
 
     # ── client order ids ────────────────────────────────────────────
 

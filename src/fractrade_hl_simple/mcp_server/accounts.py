@@ -4,8 +4,8 @@ the kill switch's halt.
 
 Reads of every wallet go through one client without a key per API URL, passing the address
 on each call (library `address=`). Each trading account has its own client with its
-key, for trades only. No network access here: clients come from the factory passed in, on
-first use.
+key, for trades only. Clients come from the injected factory, on first use or when explicitly
+refreshing metadata or enabling dexes.
 """
 
 from __future__ import annotations
@@ -13,7 +13,7 @@ from __future__ import annotations
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Optional, Protocol
 
 from eth_account import Account
 
@@ -23,11 +23,14 @@ from .config import ADDRESS, TOOL_BASE_URLS, AccountConfig, Config
 from .errors import ToolError
 from .state import SharedState
 
-ClientFactory = Callable[[str, Optional[HyperliquidAccount], Optional[float], tuple[str, ...]], Any]
-"""Makes a client from (base_url, account or None for a client without a key, default slippage
-or None for the library's, the HIP-3 dexes it covers besides Hyperliquid's own perps). The
-server's factory is HyperliquidClient(account=..., base_url=..., trust_env=False,
-perp_dexs=[...], default_slippage=...)."""
+class ClientFactory(Protocol):
+    """Build an independent client, without reading credentials from the environment.
+    `cache_market_specs=False` forces fresh metadata and updates the library's shared cache,
+    so later lazy clients use fresh metadata too (or fetch it for a different dex scope).
+    """
+
+    def __call__(self, base_url: str, account: Optional[HyperliquidAccount], default_slippage: Optional[float],
+                 perp_dexs: tuple[str, ...], *, cache_market_specs: bool = True) -> Any: ...
 
 
 def _dexes(own: Sequence[str], session: Sequence[str]) -> tuple[str, ...]:
@@ -261,12 +264,13 @@ class AccountRegistry:
                         self._traders.pop(config.name, None)
         return wanted, added
 
-    def _new_reader(self, base_url: str, dexes: tuple[str, ...]) -> Any:
+    def _new_reader(self, base_url: str, dexes: tuple[str, ...], *, cache_market_specs: bool = True) -> Any:
         """A read client of `dexes`. For a dex the network does not have, the library names
         its own get_perp_dexs(); an agent gets the network's dexes instead, read with a client
         of Hyperliquid's own perps (the configured dexes may be the wrong ones)."""
+        options = {} if cache_market_specs else {"cache_market_specs": False}
         try:
-            return self._make_client(base_url, None, None, dexes)
+            return self._make_client(base_url, None, None, dexes, **options)
         except InvalidArgumentException:
             listed = [dex["name"] for dex in self._make_client(base_url, None, None, ()).get_perp_dexs()]
             missing = [dex for dex in dexes if dex not in listed]
@@ -287,21 +291,60 @@ class AccountRegistry:
         return self._kept(self._readers, base_url,
                           lambda: self._make_client(base_url, None, None, self.perp_dexs(base_url)))
 
+    def planning_client(self, target: Target) -> Any:
+        """An unsigned reader with the account's trading dex scope, for submission previews.
+
+        Reuse the network reader when scopes match. Otherwise build a scoped reader using
+        the library's metadata cache; no additional cached client to refresh or invalidate.
+        Pass the target address explicitly on account reads.
+        """
+        if target.account is None:
+            return self.read_client(target)
+        dexes = self.account_perp_dexs(target.account)
+        if dexes == self.perp_dexs(target.base_url):
+            return self.read_client(target)
+        return self._new_reader(target.base_url, dexes)
+
     def trade_client(self, target: Target) -> Any:
         """The client that signs for `target`, a trading account from `resolve_trade`."""
         config = target.account
         if config is None or config.name not in self._keys:
             raise ToolError("TRADING_DISABLED", f"{target.name or target.address} is not enabled for trading")
 
-        def make() -> Any:
-            account = HyperliquidAccount(private_key=self._keys[config.name], public_address=config.address,
-                                         is_vault=config.vault)
-            # A market order without slippage, and close_all_positions (which takes none),
-            # use the client's default: the account's cap.
-            return self._make_client(config.base_url, account, float(config.max_slippage),
-                                     self.account_perp_dexs(config))
+        return self._kept(self._traders, config.name, lambda: self._new_trader(config))
 
-        return self._kept(self._traders, config.name, make)
+    def _new_trader(self, config: AccountConfig, *, cache_market_specs: bool = True) -> Any:
+        account = HyperliquidAccount(private_key=self._keys[config.name], public_address=config.address,
+                                     is_vault=config.vault)
+        # Market orders and closes use the account's slippage cap as the default.
+        options = {} if cache_market_specs else {"cache_market_specs": False}
+        return self._make_client(config.base_url, account, float(config.max_slippage),
+                                 self.account_perp_dexs(config), **options)
+
+    def refresh_market_specs(self, base_url: str) -> dict[str, Any]:
+        """Replace this network's reader and existing traders with freshly built clients.
+
+        Build everything before publishing: a failure leaves existing references usable.
+        In-flight calls can finish on old clients. Creation and dex changes share this lock.
+        No account lock is acquired and no state lock is held during network reads, so the
+        immediate halt stays independent.
+        """
+        with self._create_lock:
+            dexes = self.perp_dexs(base_url)
+            with self._state_lock:
+                accounts = [config for config in self._config.accounts.values()
+                            if config.base_url == base_url and config.name in self._traders]
+            reader = self._new_reader(base_url, dexes, cache_market_specs=False)
+            traders = {config.name: self._new_trader(config, cache_market_specs=False) for config in accounts}
+            result = {"dexes_read": ["default", *dexes], "perp_markets": len(reader.market_specs),
+                      "trading_clients": [{"account": config.name,
+                                           "dexes_traded": ["default", *self.account_perp_dexs(config)],
+                                           "perp_markets": len(traders[config.name].market_specs)}
+                                          for config in accounts]}
+            with self._state_lock:
+                self._readers[base_url] = reader
+                self._traders.update(traders)
+        return result
 
     def _kept(self, clients: dict[str, Any], key: str, make: Callable[[], Any]) -> Any:
         """clients[key], made on first use; a client that fails to be made is not kept. Read
@@ -404,6 +447,15 @@ class AccountRegistry:
         """The orders that added risk on `target`'s exchange account in the last hour, from
         every server of the config (orders from the app or bots are not counted)."""
         return self._shared().risk_orders_last_hour(target.key)
+
+    def peek_risk_orders_last_hour(self, target: Target) -> int:
+        """Preview the shared count without starting state, creating locks or counting orders."""
+        return self._shared().peek_risk_orders_last_hour(target.key)
+
+    def preview_halted(self, target: Target) -> bool:
+        """Like is_halted, but unknown shared state must not look like a passed preview."""
+        self._shared()
+        return self.is_halted(target)
 
     # ── trade lock and halt ─────────────────────────────────────────
 

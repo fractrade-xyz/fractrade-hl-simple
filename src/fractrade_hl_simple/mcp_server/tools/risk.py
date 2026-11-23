@@ -17,12 +17,13 @@ from zoneinfo import ZoneInfoNotFoundError
 from ...exceptions import InvalidArgumentException, PositionNotFoundException
 from ..._inputs import MIN_ORDER_USD
 from ..._protection import split_size
+from ...models import PERP_MARKETS, Order
 from .. import guards, risk
 from ..accounts import AccountRegistry, Target
 from ..convert import decimal as _decimal, iso
-from ..errors import ToolError
+from ..errors import ToolError, error_body
 from ..server import ToolSpec
-from .read import SYMBOL, _wallet_tool
+from .read import OBSERVATION_TEXT, SYMBOL, _observation, _wallet_tool
 
 PRICE = {"type": "number", "exclusiveMinimum": 0}
 
@@ -50,7 +51,7 @@ def _get_position_risk(registry: AccountRegistry) -> ToolSpec:
             account_value=_account_value(client, target), liquidation_price=position.liquidation_price,
             max_daily_loss_pct=_daily_loss(target))
         result["warnings"].extend(skipped)
-        return {"data": {"symbol": symbol, "unrealized_pnl": position.unrealized_pnl,
+        return {**_observation(client, symbol=symbol), "data": {"symbol": symbol, "unrealized_pnl": position.unrealized_pnl,
                          "liquidation_price": position.liquidation_price,
                          "leverage": position.leverage.value, "margin_mode": position.leverage.type, **result}}
 
@@ -61,7 +62,7 @@ def _get_position_risk(registry: AccountRegistry) -> ToolSpec:
         "take profit fills (in USD and % of the account), risk/reward, break-even win rate, the size without "
         "a stop, and warnings (no stop, a stop beyond liquidation or already crossed, the daily loss limit). "
         "PnL from the entry price. Use it rather than computing outcomes yourself: it includes fees and "
-        "slippage. Read only. No position: POSITION_NOT_FOUND.",
+        "slippage. Read only. No position: POSITION_NOT_FOUND." + OBSERVATION_TEXT,
         {"symbol": {**SYMBOL, "description": "The position's market, exactly as Hyperliquid names it."}},
         read, required=["symbol"])
 
@@ -127,15 +128,18 @@ def _get_account_risk(registry: AccountRegistry) -> ToolSpec:
                 "risk_reward": result["risk_reward"], "unprotected_size": result["unprotected_size"],
                 **({"beta_btc": beta} if btc is not None else {}), "warnings": row_warnings})
             warnings.extend(f"{symbol}: {w}" for w in row_warnings)
-        margin, margin_warnings = _margin(summary, account_value)
+        pending, mids, pending_warnings = _pending_margin(client, target, orders)
+        maximum = None if account is None else account.max_total_margin_pct
+        margin, margin_warnings = _margin(summary, account_value, pending, maximum)
+        warnings.extend(pending_warnings)
         warnings.extend(margin_warnings)
         portfolio = client.get_portfolio(target.address)
         change, capital = guards.portfolio_day_change(portfolio)
         loss = None if change is None else max(Decimal(0), -change)
-        warnings.extend(_account_breaks(account, account_value, summary.margin_used, change, capital, to_stops))
+        warnings.extend(_account_breaks(account, account_value, change, capital, to_stops))
         today = _today(portfolio, account, arguments)
-        warnings.extend(_limit_breaks(account, portfolio, summary, orders, account_value, client))
-        return {"data": {
+        warnings.extend(_limit_breaks(account, portfolio, summary, orders, account_value, mids))
+        return {**_observation(client), "data": {
             "positions": rows,
             "totals": {
                 # As per position: the stops' percent_of_account is the loss (positive), the take profits' the gain.
@@ -155,7 +159,8 @@ def _get_account_risk(registry: AccountRegistry) -> ToolSpec:
             "warnings": warnings,
             "notes": "PnL after fees and estimated slippage, per position as get_position_risk. Notional at the "
                      "mark price, in each market's collateral counted as USD. Positions of every dex this server "
-                     "reads.",
+                     "reads. Margin totals and budget cover those dexes; submission checks the account's traded "
+                     "dexes. The remaining margin budget is a policy limit, not an exchange balance or a reservation.",
         }}
 
     return _wallet_tool(
@@ -164,14 +169,19 @@ def _get_account_risk(registry: AccountRegistry) -> ToolSpec:
         "in the Hyperliquid app): per position its outcomes at its stop losses and take profits after fees and "
         "slippage (as get_position_risk), unprotected size, margin, liquidation price and distance from the "
         "mark; in total the loss if every stop fills and the gain if every take profit does (USD and % of the "
-        "account), long, short and net notional, margin used and free, the last 24 hours' loss against "
+        "account), long, short and net notional, margin used and free, estimated pending entry margin and "
+        "their total, the max_total_margin_pct budget and its remainder (negative when exceeded; null when "
+        "unconfigured or unknown), the last 24 hours' loss against "
         "max_daily_loss_pct, today's loss (day_loss: since Hyperliquid's last record before the trading day's start, "
         "against the account value then), and warnings: no stop, a stop beyond liquidation, free margin below 10 %, "
         "and any position that breaks the account's guardrails (symbols, max_leverage, max_risk_pct, "
         "max_total_margin_pct, max_daily_loss_pct, also if every stop fills, max_day_loss_pct and "
         "max_total_notional_x in warn or block mode, by the config's day start). with_beta: also each "
         "position's BTC beta from 30 days of hourly candles and the BTC-beta-weighted net notional (one more "
-        "request per position other than BTC, and one for BTC). Positions of every dex this server reads. Read only.",
+        "request per position other than BTC, and one for BTC). Pending margin uses the submission calculation: "
+        "remaining non-reduce-only perp orders at each market's current leverage; unavailable inputs leave it "
+        "null with a warning. One leverage read per pending market, plus mid prices for pending sells. "
+        "Positions and margin estimates of every dex this server reads. Read only." + OBSERVATION_TEXT,
         {"with_beta": {"type": "boolean", "default": False,
                        "description": "Also the BTC beta of each position (30 days of hourly candles)."},
          "day_start": {"type": "string", "pattern": "^([01][0-9]|2[0-3]):[0-5][0-9]$",
@@ -183,10 +193,33 @@ def _get_account_risk(registry: AccountRegistry) -> ToolSpec:
         read)
 
 
-def _margin(summary: Any, account_value: Optional[Decimal]) -> tuple[dict[str, Any], list[str]]:
+def _pending_margin(client: Any, target: Target, orders: list[Order]
+                    ) -> tuple[Optional[Decimal], dict[str, Decimal], list[str]]:
+    """The submission calculation, without a proposed order. Reuse sell mids for the notional audit.
+    A failed extra read must not turn unknown exposure into zero or discard the position report.
+    """
+    pending = [order for order in orders if not order.reduce_only and order.market in PERP_MARKETS]
+    mids: dict[str, Decimal] = {}
+    try:
+        if any(not order.is_buy for order in pending):
+            mids = {symbol: _decimal(price) for symbol, price in client.get_price().items()}
+        leverages = {symbol: client.get_leverage(symbol, address=target.address)
+                     for symbol in dict.fromkeys(order.symbol for order in pending)}
+        value = guards.pending_margin(pending, leverages, mids)
+    except Exception as error:
+        code = error_body(error)["error"]["code"]
+        return None, mids, [f"pending entry margin could not be established ({code})"]
+    if not value.is_finite():
+        return None, mids, ["pending entry margin could not be established: an order's value or leverage is unknown"]
+    return value, mids, []
+
+
+def _margin(summary: Any, account_value: Optional[Decimal], pending: Optional[Decimal],
+            maximum: Optional[Decimal]) -> tuple[dict[str, Any], list[str]]:
     """Margin used and free, by the account mode: a unified account's USDC available to trade;
     a standard account's withdrawable per dex (its spot balance backs no perp position)."""
-    margin_used = summary.margin_used if isinstance(summary.margin_used, Decimal) else None
+    margin_used = summary.margin_used if isinstance(summary.margin_used, Decimal) \
+        and summary.margin_used.is_finite() and summary.margin_used >= 0 else None
     warnings: list[str] = []
     dexes: Optional[list[dict[str, Any]]] = None
     free: Optional[Decimal]
@@ -211,6 +244,15 @@ def _margin(summary: Any, account_value: Optional[Decimal]) -> tuple[dict[str, A
                         f"{LOW_FREE_MARGIN_PCT} %")
     margin: dict[str, Any] = {"account_value": account_value, "margin_used": margin_used, "free_margin": free,
               "free_margin_percent": None if free is None or not base else risk.percent(free / base)}
+    total = None if margin_used is None or pending is None else margin_used + pending
+    limit = account_value * maximum / 100 if maximum is not None and account_value is not None \
+        and account_value.is_finite() and account_value > 0 else None
+    margin.update(pending_margin=pending, total_margin=total, max_total_margin_pct=maximum, margin_limit=limit,
+                  remaining_margin_budget=None if limit is None or total is None else limit - total)
+    if maximum is not None:
+        check = guards.total_margin(margin_used, pending, Decimal(0), account_value, maximum, "open orders")
+        if not check.passed:
+            warnings.append(f"{check.detail} (max_total_margin_pct)")
     if dexes is not None:
         margin["dexes"] = dexes
     return margin, warnings
@@ -237,18 +279,13 @@ def _breaks(account: Any, position: Any, stops: Optional[dict[str, Any]], accoun
     return found
 
 
-def _account_breaks(account: Any, account_value: Optional[Decimal], margin_used: Any, change: Optional[Decimal],
+def _account_breaks(account: Any, account_value: Optional[Decimal], change: Optional[Decimal],
                     capital: Optional[Decimal], to_stops: Decimal) -> list[str]:
-    """The account-wide guardrails broken: margin in use, the last 24 hours' loss, and that loss
+    """The account-wide loss limits broken: the last 24 hours' loss, and that loss
     if every stop filled now (the PnL from now to the stops, gains of the day included)."""
     if account is None:
         return []
     found = []
-    if account.max_total_margin_pct is not None and account_value and isinstance(margin_used, Decimal):
-        used = margin_used * 100 / account_value
-        if used > account.max_total_margin_pct:
-            found.append(f"margin in use {risk.percent(used / 100)} % is above max_total_margin_pct "
-                         f"({account.max_total_margin_pct} %)")
     if account.max_daily_loss_pct is not None and change is not None and capital and capital > 0:
         loss_pct = max(Decimal(0), -change) * 100 / capital
         projected = max(Decimal(0), -(change + to_stops)) * 100 / capital
@@ -278,7 +315,7 @@ def _today(portfolio: Any, account: Any, arguments: dict[str, Any]) -> dict[str,
 
 
 def _limit_breaks(account: Any, portfolio: Any, summary: Any, orders: list[Any],
-                  account_value: Optional[Decimal], client: Any) -> list[str]:
+                  account_value: Optional[Decimal], mids: dict[str, Decimal]) -> list[str]:
     """max_day_loss_pct (by the config's day start) and max_total_notional_x broken now, in
     warn or block mode: trades made in the Hyperliquid app are not checked when made. The
     positions are the summary's, read after the open orders: an order that fills in between
@@ -292,9 +329,6 @@ def _limit_breaks(account: Any, portfolio: Any, summary: Any, orders: list[Any],
         if not check.passed:
             found.append(f"{check.detail} (max_day_loss_pct, {account.max_day_loss_mode})")
     if account.max_total_notional_x is not None and account.max_total_notional_mode != "off":
-        # A pending sell is valued at the mid when that is higher, as the trading guard values it.
-        mids = {symbol: _decimal(price) for symbol, price in client.get_price().items()} \
-            if any(not o.is_buy and not o.reduce_only for o in orders) else {}
         state = guards.RiskState(open_notional=guards.open_notional(summary, orders, mids), account_value=account_value)
         check = guards.total_notional(state, Decimal(0), account.max_total_notional_x, account.max_total_notional_mode,
                                       what=None)
@@ -354,7 +388,11 @@ def _exits(orders: list[Any], is_long: bool, size: Decimal) -> tuple[list[risk.E
 
 
 def _plan_trade(registry: AccountRegistry) -> ToolSpec:
+    from .trade import ENTRY_TIF
+
     def read(client: Any, target: Target, arguments: dict[str, Any]) -> dict[str, Any]:
+        from .trade import preview_open_position
+        client = registry.planning_client(target)
         symbol, is_long = arguments["symbol"], arguments["side"] == "long"
         side = arguments["side"]
         if ("stop_loss" in arguments) == ("stop_losses" in arguments):
@@ -374,7 +412,10 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
         mid = book.mid
         if mid is None:
             raise InvalidArgumentException(f"{symbol} has no order book on both sides: nothing to plan against")
-        reference = limit if limit is not None else mid
+        tif = arguments.get("time_in_force", "Gtc" if limit is not None else "Ioc")
+        if "time_in_force" in arguments and limit is None:
+            raise InvalidArgumentException("time_in_force requires entry_price")
+        reference = limit if limit is not None and tif != "Ioc" else mid
         for price, _ in stops:
             if (price >= reference) if is_long else (price <= reference):
                 raise InvalidArgumentException(f"stop loss {price} must be {'below' if is_long else 'above'} the "
@@ -387,7 +428,8 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
             if sum((fraction for _, fraction in levels), Decimal(0)) > 1:
                 raise InvalidArgumentException(f"the {what}' fractions add up to more than 1")
         # A limit entry on the passive side of the book rests (maker); else it executes now.
-        resting = limit is not None and ((limit < book.asks[0][0]) if is_long else (limit > book.bids[0][0]))
+        resting = tif != "Ioc" and limit is not None and (
+            (limit < book.asks[0][0]) if is_long else (limit > book.bids[0][0]))
         account_value = _account_value(client, target)
         decimals = int(client.market_specs[symbol]["size_decimals"])
         step = Decimal(1).scaleb(-decimals)
@@ -449,9 +491,23 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
             if loss is None or loss > account_value * allowed / 100:
                 result["warnings"].append(f"the loss at the stop losses is above the account's max_risk_pct ({allowed} "
                                           "%), or not estimable: open_position would refuse it")
-        return {"data": {
+        opening: dict[str, Any] = {"symbol": symbol, "side": side, "size": float(size),
+                                   "stop_losses": raw_stops}
+        if target.name is not None:
+            opening["account"] = target.name
+        for key in ("take_profits", "time_in_force", "slippage"):
+            if key in arguments:
+                opening[key] = arguments[key]
+        if limit is not None:
+            opening["limit_price"] = float(limit)
+        execution = preview_open_position(registry, client, target, opening)
+        if tif == "Ioc" and limit is not None:
+            result["warnings"].append("IOC limit estimates assume the requested size fills at the limit price; "
+                                      "the entry may fill partly or not at all. Protection uses the filled size.")
+        return {**_observation(client, symbol=symbol), "data": {
             "symbol": symbol,
             "entry": "limit (maker)" if resting else "limit (taker)" if limit is not None else "market (taker)",
+            "execution": execution,
             "risk_budget": None if risk_budget is None else risk.usd(risk_budget),
             "notional": risk.usd(notional),
             "margin": risk.usd(notional / leverage.value), "leverage": leverage.value, "margin_mode": leverage.type,
@@ -467,7 +523,16 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
         "account has on the market, and warnings (orders below "
         "the 10 USD minimum, the daily loss limit). Use it rather than computing a size yourself. Read only: it "
         "places nothing; open it with open_position and the size it returns: its levels are sized the same "
-        "way.",
+        "way. data.execution previews the same local preparation and account guards as submission, with "
+        "rounded open_position arguments, prepared entry, checks, used/pending/proposed margin, traded dex scope "
+        "and observed_at (reads completed, not an atomic snapshot). eligible is true when local checks pass, "
+        "false for a known blocker, null when not established or no trading policy applies. Warn-only failures "
+        "do not block. trading_enabled reports this server's execution switch; a read-only server can still "
+        "preview configured policy. No signer authorization or exchange acceptance is checked; submission "
+        "rechecks and reserves nothing here. Multiple stops/targets work for market or Ioc limit entries; "
+        "Gtc limits require a single full-size bracket. IOC estimates use the limit and taker fees for the "
+        "requested size; the actual fill may be smaller or zero." + OBSERVATION_TEXT +
+        " The top-level scope is the planner's actual account client, which can be narrower than account reports.",
         {"symbol": {**SYMBOL, "description": "The market, exactly as Hyperliquid names it."},
          "side": {"type": "string", "enum": ["long", "short"]},
          "stop_loss": {**PRICE, "description": "The stop loss's trigger price, for the whole size. Or stop_losses."},
@@ -485,6 +550,9 @@ def _plan_trade(registry: AccountRegistry) -> ToolSpec:
                                          "description": "The share of the size it closes (0.5: half)."}}},
              "description": "Take profits, each closing a share of the size; the shares add up to at most 1."},
          "entry_price": {**PRICE, "description": "A limit entry at this price; without it a market entry."},
+         "time_in_force": ENTRY_TIF,
+         "slippage": {"type": "number", "exclusiveMinimum": 0, "maximum": 0.5,
+                      "description": "Market-entry price tolerance, as in open_position; defaults to the account cap."},
          "size": {**PRICE, "description": "The size in base units, never USD. Or risk_usd / risk_pct."},
          "risk_usd": {**PRICE, "description": "Size the trade so it loses at most this at the stop."},
          "risk_pct": {"type": "number", "exclusiveMinimum": 0, "maximum": 100,

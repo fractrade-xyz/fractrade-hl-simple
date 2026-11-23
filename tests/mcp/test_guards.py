@@ -142,7 +142,7 @@ trading = true
 max_leverage = 20
 max_total_margin_pct = 80
 ''', "test.toml").accounts["main"]
-        state = risk(20, account_value=Decimal(1000), margin_used=Decimal(0))
+        state = risk(20, account_value=Decimal(1000), margin_used=Decimal(0), pending_margin=Decimal(0))
         report = guards.check_order(own, "BTC", 0.2, 80000.0, is_buy=True, reduce_only=False, market=False, risk=state)
         assert report.passed  # $16000 at 20x: $800 of margin, 80 % of $1000
         assert "max_margin_pct" not in rules(report) and "order_notional" not in rules(report)
@@ -172,6 +172,18 @@ max_total_margin_pct = 80
         report = guards.check_order(account("max_margin_pct = 5\nisolated_only = true"), "BTC", 1.0, 85000.0,
                                     is_buy=True, reduce_only=True, market=False)
         assert report.passed and set(rules(report)) == {"perp_only"}
+
+    @pytest.mark.parametrize("pending", [None, D("NaN"), D("Infinity"), D(-1)])
+    def test_total_margin_requires_an_established_pending_margin(self, pending):
+        state = risk(5, account_value=D(1000), margin_used=D(0), pending_margin=pending)
+        assert not risky("max_total_margin_pct = 30", 0.001, 85000.0, state).passed
+
+    def test_total_margin_at_the_cap_passes_and_explains_all_components(self):
+        check = guards.total_margin(D(10), D(15), D(5), D(1000), D(3))
+        assert check.passed
+        assert "projected margin with this order 30 USD is within 3 % of the account value (30 USD)" in check.detail
+        assert "used 10 USD, pending entries 15 USD, proposed 5 USD" in check.detail
+        assert not guards.total_margin(D(10), D(15), D("5.01"), D(1000), D(3)).passed
 
 class TestRiskDataThatCannotPass:
     """A guardrail passes only on finite figures: Infinity, NaN, a negative margin in use or
