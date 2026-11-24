@@ -129,6 +129,25 @@ class TestErrorContract:
             client_with_retry._with_retry(fn)
         assert fn.call_count == 4 and error.value.status_code == 200
 
+    # Once, Hyperliquid's metaAndAssetCtxs for dex xyz listed a market more than it sent
+    # figures for; seconds later the two lists matched again.
+    MISMATCHED = [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40},
+                                {"name": "NEW", "szDecimals": 2, "maxLeverage": 10}]}, [{"markPx": "85000"}]]
+    MATCHED = [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]}, [{"markPx": "85000"}]]
+
+    def test_markets_without_their_figures_are_retried(self, client_with_retry):
+        client_with_retry.info.post.side_effect = [self.MISMATCHED, self.MATCHED, []]  # []: perpsAtOpenInterestCap
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'):
+            [market] = client_with_retry.get_markets()
+        assert market.symbol == "BTC" and str(market.mark_price) == "85000"
+
+    def test_markets_that_stay_without_their_figures_are_a_server_error(self, client_with_retry):
+        client_with_retry.info.post.return_value = self.MISMATCHED
+        with patch('fractrade_hl_simple.hyperliquid.time.sleep'), \
+             pytest.raises(ServerErrorException, match="^metaAndAssetCtxs: 2 markets but 1 contexts$") as error:
+            client_with_retry.get_markets()
+        assert error.value.retryable
+
     def test_other_transport_errors_are_not_retried(self, client_with_retry):
         fn = MagicMock(side_effect=requests.exceptions.ChunkedEncodingError("connection broken"))
         with pytest.raises(NetworkException):

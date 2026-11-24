@@ -1079,14 +1079,6 @@ class TestMarkets:
             if payload["type"] == "metaAndAssetCtxs" else ["xyz:GOLD"])
         assert not mock_client.get_markets()[0].at_open_interest_cap  # another dex's GOLD
 
-    def test_a_context_missing_for_a_market_is_an_error(self, mock_client):
-        # Hyperliquid documents one context per market; a mismatch is an API change, not hidden.
-        mock_client.info.post.side_effect = lambda path, payload: (
-            [{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 40}]}, []]
-            if payload["type"] == "metaAndAssetCtxs" else [])
-        with pytest.raises(ValueError):
-            mock_client.get_markets()
-
 
 # ── Account modes and balances ─────────────────────────────────────────
 # Shapes as returned on 2026-11-13, amounts invented. In the unified account the default dex

@@ -179,7 +179,9 @@ def _fields(error: BaseException, depth: int, within: frozenset[int]) -> dict[st
         # Log records, tracebacks included, are scrubbed by the filter the server installs on
         # its stderr handler.
         logger.error("unexpected error in a tool call", exc_info=error)
-        error = ToolError("INTERNAL", f"unexpected error ({type(error).__name__}); the details are in the server log")
+        text = str(error)
+        error = ToolError("INTERNAL", f"unexpected error ({type(error).__name__}{': ' + text if text else ''}); "
+                                      "the traceback is in the server log")
     hint = getattr(error, "hint", None)
     if hint is None:
         hint = next((text for kind, text in HINTS if isinstance(error, kind)), None)

@@ -511,8 +511,19 @@ class HyperliquidClient:
                                ) -> Tuple[Dict[str, Any], List[Tuple[Dict[str, Any], Dict[str, Any]]]]:
         """The meta of `dex` and (market, context) for each of its markets, in Hyperliquid's
         order, from one metaAndAssetCtxs request. Failures (after the retries) and answers that
-        are not in the documented format ([meta, one context per market]) are raised as they are."""
-        meta, contexts = self._with_retry(info.post, "/info", {"type": "metaAndAssetCtxs", "dex": dex})
+        are not in the documented format ([meta, one context per market]) are raised as they are,
+        except one with more or fewer contexts than markets: Hyperliquid sent that for a moment,
+        so it is retried, and after the retries raised as ServerErrorException. The contexts carry
+        no market name; only their position pairs them with the markets."""
+        def request() -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
+            meta, contexts = info.post("/info", {"type": "metaAndAssetCtxs", "dex": dex})
+            markets = meta["universe"]
+            if isinstance(markets, list) and isinstance(contexts, list) and len(markets) != len(contexts):
+                raise ServerErrorException(f"metaAndAssetCtxs{f' for dex {dex}' if dex else ''}: "
+                                           f"{len(markets)} markets but {len(contexts)} contexts", 200)
+            return meta, contexts
+
+        meta, contexts = self._with_retry(request)
         return meta, list(zip(meta["universe"], contexts, strict=True))
 
     def _fetch_market_specs(self, info: Optional[Info] = None, spot_meta: Any = None) -> Dict[str, Dict]:

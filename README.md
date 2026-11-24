@@ -751,7 +751,7 @@ The library's own exceptions are `HyperliquidException`s, each with a fixed `cod
 | `RateLimitException` | `RATE_LIMITED` | yes | | Hyperliquid's rate limit, after the retries |
 | `NetworkException` | `NETWORK_ERROR` | yes | `requests.ConnectionError` | Hyperliquid could not be reached, after the retries |
 | `TimeoutException` | `TIMEOUT` | yes | `requests.Timeout` | Hyperliquid did not answer in time, after the retries |
-| `ServerErrorException` | `SERVER_ERROR` | yes | the SDK's `ServerError` | a server error or a response that is not JSON, after the retries |
+| `ServerErrorException` | `SERVER_ERROR` | yes | the SDK's `ServerError` | a server error, a response that is not JSON, or market data whose markets and figures do not match, after the retries |
 | `ClientErrorException` | `REQUEST_REJECTED` | no | the SDK's `ClientError` | Hyperliquid rejected the request (an HTTP 4xx other than the rate limit) |
 | `UnsupportedAccountModeException` | `UNSUPPORTED_ACCOUNT_MODE` | no | | no single balance for portfolio-margin accounts and unknown account modes |
 | `PositionNotFoundException` | `POSITION_NOT_FOUND` | no | | no position for the symbol |

@@ -950,7 +950,7 @@ retryable) and the server's own. The ones to know here:
 | `POSITION_NOT_CLOSED`, `CLOSE_POSITIONS_INCOMPLETE`, `PROTECTION_NOT_PLACED`, `PROTECTION_REPLACEMENT_INCOMPLETE`, `PROTECTION_SYNC_INCOMPLETE`, `ORDERS_NOT_CANCELED` | partly done; `details` says what happened |
 | `ORDER_ERROR` | a cancel the exchange did not confirm; check the open orders |
 | `BUSY` | `get_changes` is still running for the same wallet and `symbol` (retryable) |
-| `INTERNAL` | a halt that reached this server only (the message says so); anything else is a bug, with the details in the server log only |
+| `INTERNAL` | a halt that reached this server only (the message says so); anything else is a bug: the message names the error, its traceback is in the server log only |
 
 `details` holds what a partial outcome did, so it can be acted on without parsing text:
 the orders placed or canceled, the size `remaining`, the levels `missing` (each with

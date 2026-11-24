@@ -831,7 +831,6 @@ class TestMarketSpecsRefresh:
     @pytest.mark.parametrize("response, error", [
         ({"unexpected": "shape"}, ValueError),                         # not [meta, contexts]
         ([{"universe": [{"name": "BTC", "maxLeverage": 50}]}, [{}]], KeyError),  # no szDecimals
-        ([{"universe": [{"name": "BTC", "szDecimals": 5, "maxLeverage": 50}]}, []], ValueError),  # contexts missing
     ])
     def test_a_malformed_response_shows_as_itself_and_changes_nothing(self, mock_client, response, error):
         # It used to fall back to meta() or to invented defaults (3 size decimals).

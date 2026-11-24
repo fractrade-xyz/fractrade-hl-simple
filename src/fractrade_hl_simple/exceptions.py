@@ -66,11 +66,12 @@ class RateLimitException(HyperliquidException):
         super().__init__(message)
 
 class ServerErrorException(HyperliquidException, ServerError):
-    """Hyperliquid answered with a server error (HTTP 5xx), or with a body that is not JSON,
-    after the library's retries. Also the SDK's ``ServerError`` it replaces.
+    """Hyperliquid answered with a server error (HTTP 5xx), with a body that is not JSON, or
+    with market data whose markets and figures do not match, after the library's retries.
+    Also the SDK's ``ServerError`` it replaces.
 
     Attributes:
-        status_code: The HTTP status (200 for a body that is not JSON), or None.
+        status_code: The HTTP status (200 for an answer that is not JSON or does not match), or None.
     """
     code = "SERVER_ERROR"
     retryable = True

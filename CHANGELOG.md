@@ -4,6 +4,11 @@ All notable changes to fractrade-hl-simple will be documented in this file.
 
 ## [Unreleased]
 
+### Bug Fixes
+
+- **Market data whose markets and figures did not match failed at once with a `ValueError`**: Hyperliquid's `metaAndAssetCtxs` for the xyz dex once listed one market more than it sent figures for, and seconds later matched again. Creating a client, `refresh_market_specs()`, `get_markets()` and the mark-price check of `trigger_order()` then raised a plain `ValueError`, which the MCP server reported as `INTERNAL`, not retryable. Such an answer is now retried like a server error, and after the retries raises `ServerErrorException` (`SERVER_ERROR`, retryable), e.g. "metaAndAssetCtxs for dex xyz: 53 markets but 52 contexts".
+- **MCP: an unexpected error now names its text** in the message ("unexpected error (ValueError: ...)"), redacted and cut like every message; the traceback stays in the server log.
+
 ## [0.4.0] - 2026-11-23
 
 This release includes the library and MCP

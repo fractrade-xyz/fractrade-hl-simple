@@ -164,10 +164,11 @@ class TestErrors:
         is_error, text = call(probe_server(), "not_a_number", {})
         assert is_error and json.loads(text)["error"]["code"] == "INTERNAL"
 
-    def test_anything_else_is_internal_without_details(self):
+    def test_anything_else_is_internal_with_its_text_but_not_its_traceback(self):
         is_error, text = call(probe_server(), "broken", {})
         error = json.loads(text)["error"]
-        assert is_error and error["code"] == "INTERNAL" and "internal detail" not in text
+        assert is_error and error["code"] == "INTERNAL" and "KeyError: 'internal detail'" in error["message"]
+        assert "Traceback" not in text
 
     def test_tool_names_are_unique(self):
         spec = ToolSpec("echo", "Echo.", ECHO_SCHEMA, lambda arguments: None)

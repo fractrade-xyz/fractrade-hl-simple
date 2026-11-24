@@ -193,17 +193,18 @@ def test_an_unknown_code_is_a_programming_error():
                          ids=lambda e: type(e).__name__)
 def test_anything_that_is_not_a_library_exception_is_internal(error):
     body = error_body(error)["error"]
-    assert (body["code"], body["retryable"]) == ("INTERNAL", False) and type(error).__name__ in body["message"]
+    assert (body["code"], body["retryable"]) == ("INTERNAL", False)
+    assert body["message"] == f"unexpected error ({type(error).__name__}: {error}); the traceback is in the server log"
 
 
-def test_unexpected_errors_go_to_the_log_not_to_the_client(caplog):
+def test_an_unexpected_error_names_its_text_and_logs_its_traceback(caplog):
     try:
         {}["missing"]
     except KeyError as raised:
         error = raised
     with caplog.at_level(logging.ERROR):
         text = error_json(error)
-    assert "missing" not in text
+    assert "KeyError: 'missing'" in text and "Traceback" not in text
     (record,) = caplog.records
     assert record.exc_info[0] is KeyError and record.exc_info[2] is not None  # with its traceback
 
